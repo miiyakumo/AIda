@@ -258,36 +258,36 @@ Codex 的主循环位于 `turn.rs:252`，包含：
 ```mermaid
 sequenceDiagram
     actor 用户
-    participant Loop as AgentLoop
+    participant Agent as AgentLoop
     participant Prompt as PromptBuilder
     participant Model as LLM Provider
     participant Tools as ToolRegistry
     participant Alda as alda CLI
 
-    用户->>Loop: "写一首C大调圆舞曲"
-    Loop->>Loop: 追加 User 消息到 history
-    Loop->>Prompt: build(system, history, tools)
-    Prompt-->>Loop: ChatRequest
+    用户->>Agent: "写一首C大调圆舞曲"
+    Agent->>Agent: 追加 User 消息到 history
+    Agent->>Prompt: build(system, history, tools)
+    Prompt-->>Agent: ChatRequest
 
     loop Turn 内的每个迭代
-        Loop->>Model: stream(request)
-        Model-->>Loop: TextDelta: "好的，我先写乐谱..."
+        Agent->>Model: stream(request)
+        Model-->>Agent: TextDelta: "好的，我先写乐谱..."
 
         alt 模型返回 tool_call
-            Model-->>Loop: ToolCallDone { name: "write_score", args: "{...}" }
-            Loop->>Tools: dispatch("write_score", args)
+            Model-->>Agent: ToolCallDone { name: "write_score", args: "{...}" }
+            Agent->>Tools: dispatch("write_score", args)
             Tools->>Alda: alda parse score.alda
             Alda-->>Tools: parse 失败 "第 3 行语法错误"
-            Tools-->>Loop: ToolOutput { success: false, text: "Error: ..." }
-            Loop->>Loop: 追加 Tool 消息，设置 follow_up = true
-            Note over Loop: 继续循环，模型看到错误后修正
+            Tools-->>Agent: ToolOutput { success: false, text: "Error: ..." }
+            Agent->>Agent: 追加 Tool 消息，设置 follow_up = true
+            Note over Agent: 继续循环，模型看到错误后修正
         else 模型结束
-            Model-->>Loop: Done { stop_reason: EndTurn }
-            Loop->>Loop: follow_up = false，跳出内层循环
+            Model-->>Agent: Done { stop_reason: EndTurn }
+            Agent->>Agent: follow_up = false，跳出内层循环
         end
     end
 
-    Loop-->>用户: 最终乐谱文本 + "已保存到 score.alda"
+    Agent-->>用户: 最终乐谱文本 + "已保存到 score.alda"
 ```
 
 > 本节对应设计文档 §3, 调研 codex-agent-loop.md §2-§3
@@ -406,14 +406,14 @@ fn spec_write_score() -> ToolSpec {
 ```mermaid
 sequenceDiagram
     participant Model as 模型
-    participant Loop as AgentLoop
+    participant Agent as AgentLoop
     participant Reg as ToolRegistry
     participant Tool as write_score Handler
     participant Alda as alda CLI
     participant FS as 文件系统
 
-    Model->>Loop: ToolCallDone { name: "write_score", args: "{...}" }
-    Loop->>Reg: dispatch("write_score", args)
+    Model->>Agent: ToolCallDone { name: "write_score", args: "{...}" }
+    Agent->>Reg: dispatch("write_score", args)
     Reg->>Tool: handle(args, session)
 
     Tool->>FS: 写入 score.alda
@@ -426,14 +426,14 @@ sequenceDiagram
         Tool-->>Reg: ToolError::RespondToModel("alda parse 失败: ...")
     end
 
-    Reg-->>Loop: Result<ToolOutput, ToolError>
-    Loop->>Loop: 格式化为模型可读文本
-    Loop->>Loop: 追加 Message::Tool 到历史
+    Reg-->>Agent: Result<ToolOutput, ToolError>
+    Agent->>Agent: 格式化为模型可读文本
+    Agent->>Agent: 追加 Message::Tool 到历史
 
     alt 成功
-        Loop->>Loop: follow_up 可能为 false（取决于模型意图）
+        Agent->>Agent: follow_up 可能为 false（取决于模型意图）
     else 失败 (RespondToModel)
-        Loop->>Loop: follow_up = true，下轮模型会看到错误并自修正
+        Agent->>Agent: follow_up = true，下轮模型会看到错误并自修正
     end
 ```
 

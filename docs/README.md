@@ -6,6 +6,8 @@
 
 | 范围 | 状态 | 含义 |
 |---|---|---|
+| 产品需求 | Draft | 已定义产品目标、P0–P2 范围和验收场景，待决策项尚未冻结 |
+| MVP 概要设计 | 已批准进入切片 A | 已冻结正式 MVP 范围、统一 Local Service、协议与验收边界；后续决策按截止点冻结 |
 | Alda / Codex 源码调研 | 第一轮完成，快照已核验 | 结论可追溯到仓库内固定快照，外部链接未在线探测 |
 | 基础 Harness 设计 | 已完成 | Agent Loop、Provider、工具、Session、压缩与评测已有设计 |
 | 基础实施路线 | 已完成 | M0–M5 可按日推进，但仓库尚无 `alda-agent/` 代码 |
@@ -62,6 +64,10 @@ CreativeBrief → ConstraintSet → ScoreRevision → RenderArtifact
 
 ## 文档地图
 
+### 需求
+
+- [产品需求文档](requirements/product-requirements.md)
+
 ### 研究
 
 - [Harness Engineering 综述](research/harness-engineering.md)
@@ -74,10 +80,12 @@ CreativeBrief → ConstraintSet → ScoreRevision → RenderArtifact
 - [Alda Pipeline](research/alda-pipeline.md)
 - [Music Theory](research/music-theory.md)
 - [进阶能力调研](research/advanced-music-agent-capabilities.md)
+- [CLI、Web 与 App 多端架构调研](research/client-surface-architecture.md)
 - [进阶文档独立审议记录](reviews/advanced-docs-independent-review.md)
 
 ### 设计与路线
 
+- [MVP 概要设计](design/mvp-design.md)
 - [基础架构](design/harness-design.md)
 - [基础路线](design/implementation-roadmap.md)
 - [进阶架构](design/advanced-music-agent-architecture.md)
