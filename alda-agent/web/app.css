@@ -1,0 +1,5 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+main { max-width: 64rem; margin: 2rem auto; padding: 1rem; }
+section { border: 1px solid #888; margin: 1rem 0; padding: 1rem; }
+textarea, pre { display: block; width: 100%; min-height: 8rem; white-space: pre-wrap; }
+button { margin: .5rem .5rem .5rem 0; }
