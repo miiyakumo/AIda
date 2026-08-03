@@ -1,0 +1,4 @@
+interface:
+  display_name: "Simple Agent Workflow"
+  short_description: "Minimal collaborative planning, execution, and review"
+  default_prompt: "Use $simple-agent-workflow to clarify, execute, and review this task with the fewest useful agents."
