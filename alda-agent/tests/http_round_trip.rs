@@ -1,6 +1,8 @@
 use alda_agent::app_service::AppService;
+use alda_agent::app_service::QueryQueueCapacity;
 use alda_agent::app_service::QueueCapacity;
 use alda_agent::http::HttpAuth;
+use alda_agent::http::ProductionHttpHost;
 use alda_agent::protocol::ApprovalDecision;
 use alda_agent::protocol::ApprovalStatus;
 use alda_agent::protocol::ChoiceId;
@@ -18,6 +20,8 @@ use alda_agent::protocol::StreamCursor;
 use alda_agent::protocol::StreamKind;
 use alda_agent::protocol::TurnStatus;
 use reqwest::Client;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 async fn assert_request_guards(
     client: &Client,
@@ -104,7 +108,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
         axum::serve(listener, app).await.expect("test server");
     });
 
-    let endpoint = format!("{origin}/v1/commands");
+    let endpoint = format!("{origin}/v2/commands");
     let envelope = CommandEnvelope {
         protocol_version: PROTOCOL_VERSION,
         client_id: ClientId("http-test".to_owned()),
@@ -150,7 +154,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
     assert!(!service_worker.contains("\"/v1/"));
 
     let oversized_bootstrap = client
-        .post(format!("{origin}/v1/bootstrap"))
+        .post(format!("{origin}/v2/bootstrap"))
         .header(reqwest::header::ORIGIN, &origin)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(format!(r#"{{"code":"{}"}}"#, "x".repeat(1025)))
@@ -176,7 +180,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
     );
 
     let bootstrap_without_origin = client
-        .post(format!("{origin}/v1/bootstrap"))
+        .post(format!("{origin}/v2/bootstrap"))
         .json(&serde_json::json!({"code": bootstrap_code.clone()}))
         .send()
         .await
@@ -186,7 +190,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
         reqwest::StatusCode::FORBIDDEN
     );
     let bootstrap_wrong_host = client
-        .post(format!("{origin}/v1/bootstrap"))
+        .post(format!("{origin}/v2/bootstrap"))
         .header(reqwest::header::ORIGIN, &origin)
         .header(reqwest::header::HOST, "127.0.0.1:1")
         .json(&serde_json::json!({"code": bootstrap_code.clone()}))
@@ -198,7 +202,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
         reqwest::StatusCode::FORBIDDEN
     );
     let wrong_bootstrap = client
-        .post(format!("{origin}/v1/bootstrap"))
+        .post(format!("{origin}/v2/bootstrap"))
         .header(reqwest::header::ORIGIN, &origin)
         .json(&serde_json::json!({"code": "wrong"}))
         .send()
@@ -207,7 +211,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
     assert_eq!(wrong_bootstrap.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let bootstrap = client
-        .post(format!("{origin}/v1/bootstrap"))
+        .post(format!("{origin}/v2/bootstrap"))
         .header(reqwest::header::ORIGIN, &origin)
         .json(&serde_json::json!({"code": bootstrap_code.clone()}))
         .send()
@@ -237,7 +241,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
         .1
         .to_owned();
     let replay = client
-        .post(format!("{origin}/v1/bootstrap"))
+        .post(format!("{origin}/v2/bootstrap"))
         .header(reqwest::header::ORIGIN, &origin)
         .json(&serde_json::json!({"code": bootstrap_code}))
         .send()
@@ -247,7 +251,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
     assert_eq!(replay.headers()[reqwest::header::CACHE_CONTROL], "no-store");
     for _ in 0..3 {
         let rejected = client
-            .post(format!("{origin}/v1/bootstrap"))
+            .post(format!("{origin}/v2/bootstrap"))
             .header(reqwest::header::ORIGIN, &origin)
             .json(&serde_json::json!({"code": "wrong"}))
             .send()
@@ -256,7 +260,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
         assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
     let limited = client
-        .post(format!("{origin}/v1/bootstrap"))
+        .post(format!("{origin}/v2/bootstrap"))
         .header(reqwest::header::ORIGIN, &origin)
         .json(&serde_json::json!({"code": "wrong"}))
         .send()
@@ -653,7 +657,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
             && responder_client_id.0 == "http-test"
     ));
 
-    let artifact_url = format!("{origin}/v1/artifacts/{}", manifest.artifact_hash.hex());
+    let artifact_url = format!("{origin}/v2/artifacts/{}", manifest.artifact_hash.hex());
     let download = client
         .get(&artifact_url)
         .header(reqwest::header::ORIGIN, &origin)
@@ -824,7 +828,7 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
         );
     }
     let invalid_hash = client
-        .get(format!("{origin}/v1/artifacts/not-a-hash"))
+        .get(format!("{origin}/v2/artifacts/not-a-hash"))
         .bearer_auth("test-token")
         .header(reqwest::header::ORIGIN, &origin)
         .header("x-alda-project-id", &manifest.project_id.0)
@@ -872,4 +876,131 @@ async fn authenticated_http_command_round_trip_and_origin_rejection() {
     ));
 
     server.abort();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn c3_production_surface_durable_v2_routes_and_v1_fail_closed() {
+    let root = tempfile::tempdir().expect("创建 production data root");
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+        .expect("设置 production data root 权限");
+    let mut host = ProductionHttpHost::open(
+        root.path(),
+        QueueCapacity::new(8).expect("command 容量"),
+        QueryQueueCapacity::new(8).expect("query 容量"),
+    )
+    .expect("bind 前完成 durable preflight");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("preflight 后 bind");
+    let address = listener.local_addr().expect("listener 地址");
+    let origin = format!("http://{address}");
+    let app = host.router(HttpAuth::new(
+        "test-token",
+        origin.clone(),
+        address.to_string(),
+    ));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("production HTTP server");
+    });
+    let client = Client::new();
+    let envelope = CommandEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        client_id: ClientId("c3-http".to_owned()),
+        client_command_id: ClientCommandId("initialize-v2".to_owned()),
+        command: ClientCommand::Initialize,
+    };
+    let response = client
+        .post(format!("{origin}/v2/commands"))
+        .bearer_auth("test-token")
+        .header(reqwest::header::ORIGIN, &origin)
+        .json(&envelope)
+        .send()
+        .await
+        .expect("v2 command");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let reply: CommandReply = response.json().await.expect("v2 reply");
+    assert!(matches!(reply.outcome, CommandOutcome::Success { .. }));
+
+    let old_path = client
+        .post(format!("{origin}/v1/commands"))
+        .bearer_auth("test-token")
+        .header(reqwest::header::ORIGIN, &origin)
+        .json(&envelope)
+        .send()
+        .await
+        .expect("v1 path response");
+    assert_eq!(old_path.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let old_payload = client
+        .post(format!("{origin}/v2/commands"))
+        .bearer_auth("test-token")
+        .header(reqwest::header::ORIGIN, &origin)
+        .json(&CommandEnvelope {
+            protocol_version: 1,
+            client_command_id: ClientCommandId("initialize-v1".to_owned()),
+            ..envelope
+        })
+        .send()
+        .await
+        .expect("v1 payload response");
+    assert_eq!(old_payload.status(), reqwest::StatusCode::OK);
+    let old_reply: CommandReply = old_payload.json().await.expect("typed v1 rejection");
+    assert!(matches!(
+        old_reply.outcome,
+        CommandOutcome::Error { error }
+            if error.code == ProtocolErrorCode::InvalidProtocolVersion
+                && error.message.contains("upgrade")
+                && error.message.contains("reconnect")
+    ));
+
+    let reserved_reply: CommandReply = client
+        .post(format!("{origin}/v2/commands"))
+        .bearer_auth("test-token")
+        .header(reqwest::header::ORIGIN, &origin)
+        .json(&CommandEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            client_id: ClientId("__alda_internal_probe".to_owned()),
+            client_command_id: ClientCommandId("reserved-client".to_owned()),
+            command: ClientCommand::Initialize,
+        })
+        .send()
+        .await
+        .expect("reserved client response")
+        .json()
+        .await
+        .expect("reserved client typed reply");
+    assert!(matches!(
+        reserved_reply.outcome,
+        CommandOutcome::Error { error } if error.code == ProtocolErrorCode::InvalidRequest
+    ));
+
+    let running_health = client
+        .get(format!("{origin}/health"))
+        .send()
+        .await
+        .expect("Running health");
+    assert_eq!(running_health.status(), reqwest::StatusCode::OK);
+    host.shutdown();
+    let stopping_health = client
+        .get(format!("{origin}/health"))
+        .send()
+        .await
+        .expect("Stopping health");
+    assert_eq!(
+        stopping_health.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    host.shutdown_and_join().expect("join production actor");
+    server.abort();
+
+    let mut reopened = ProductionHttpHost::open(
+        root.path(),
+        QueueCapacity::new(2).expect("command 容量"),
+        QueryQueueCapacity::new(2).expect("query 容量"),
+    )
+    .expect("join 后同 root 重开");
+    reopened.shutdown_and_join().expect("重开实例 join");
 }

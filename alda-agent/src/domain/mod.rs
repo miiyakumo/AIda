@@ -1,4 +1,4 @@
-//! Pure B1 domain values and facts. These types are not wire DTOs.
+//! 纯 B1 domain value 与事实；这些类型不是 wire DTO。
 #![allow(
     clippy::missing_errors_doc,
     reason = "constructors consistently return the module's typed DomainError"

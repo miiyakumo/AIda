@@ -1,10 +1,44 @@
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "Rustdoc 依照仓库语言规范使用中文“错误”标题"
+)]
+
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const SESSION_STREAM_EPOCH: u64 = 1;
 pub const EVENT_PAGE_LIMIT: usize = 256;
+
+#[allow(
+    dead_code,
+    reason = "C1a1 先冻结由后续 durable planner 消费的命令摘要契约"
+)]
+#[derive(Debug, Error)]
+#[error("canonical command serialization failed")]
+pub(crate) struct CanonicalCommandError(#[source] serde_json::Error);
+
+#[allow(
+    dead_code,
+    reason = "C1a1 先冻结由后续 durable planner 消费的命令摘要契约"
+)]
+pub(crate) fn external_command_payload_digest(
+    protocol_version: u32,
+    command: &ClientCommand,
+) -> Result<String, CanonicalCommandError> {
+    external_command_payload_digest_from_serializable(protocol_version, command)
+}
+
+fn external_command_payload_digest_from_serializable<T: Serialize + ?Sized>(
+    protocol_version: u32,
+    command: &T,
+) -> Result<String, CanonicalCommandError> {
+    let canonical =
+        serde_json::to_vec(&(protocol_version, command)).map_err(CanonicalCommandError)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -287,12 +321,12 @@ impl std::fmt::Display for ArtifactHashParseError {
 impl std::error::Error for ArtifactHashParseError {}
 
 impl ArtifactHash {
-    /// Parses a canonical content hash.
+    /// 解析 canonical content hash。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns [`ArtifactHashParseError`] unless the value is `sha256:`
-    /// followed by exactly 64 lowercase hexadecimal characters.
+    /// 除非输入由 `sha256:` 加恰好 64 个小写十六进制字符组成，否则返回
+    /// [`ArtifactHashParseError`]。
     pub fn parse(value: &str) -> Result<Self, ArtifactHashParseError> {
         let Some(hex) = value.strip_prefix("sha256:") else {
             return Err(ArtifactHashParseError);
@@ -344,6 +378,7 @@ pub enum ArtifactProducer {
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactDurability {
     ProcessLifetimeFixture,
+    DurableLocal,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -551,8 +586,7 @@ impl CommandReply {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-// Stable wire DTOs intentionally remain direct enum payloads; serde does not
-// expose Rust representation size on the wire.
+// stable wire DTO 有意保持为直接 enum payload；serde 不会在线路上暴露 Rust 表示大小。
 #[allow(clippy::large_enum_variant)]
 pub enum CommandOutcome {
     Success { result: CommandResult },
@@ -652,4 +686,78 @@ pub enum ProtocolErrorCode {
     UnsupportedStreamKind,
     Overloaded,
     ServiceUnavailable,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::ser::Error as _;
+
+    use super::*;
+
+    #[test]
+    fn command_digest_matches_the_frozen_initialize_vector() {
+        let canonical =
+            serde_json::to_vec(&(1_u32, &ClientCommand::Initialize)).expect("序列化固定命令向量");
+        assert_eq!(canonical, br#"[1,{"type":"initialize"}]"#);
+        assert_eq!(
+            external_command_payload_digest(1, &ClientCommand::Initialize)
+                .expect("计算固定命令摘要"),
+            "sha256:bbc84e52448ca1368c8642238783b130d5bef4ad49c41ec5106fc7c3e42e28ca"
+        );
+    }
+
+    #[test]
+    fn command_digest_changes_only_with_protocol_or_command_payload() {
+        let first = CommandEnvelope {
+            protocol_version: 1,
+            client_id: ClientId("client-first".to_owned()),
+            client_command_id: ClientCommandId("command-first".to_owned()),
+            command: ClientCommand::Initialize,
+        };
+        let second = CommandEnvelope {
+            protocol_version: 1,
+            client_id: ClientId("client-second".to_owned()),
+            client_command_id: ClientCommandId("command-second".to_owned()),
+            command: ClientCommand::Initialize,
+        };
+        let first_digest = external_command_payload_digest(first.protocol_version, &first.command)
+            .expect("计算第一条命令摘要");
+        let second_digest =
+            external_command_payload_digest(second.protocol_version, &second.command)
+                .expect("计算第二条命令摘要");
+        assert_eq!(first_digest, second_digest);
+        assert_ne!(
+            first_digest,
+            external_command_payload_digest(2, &ClientCommand::Initialize)
+                .expect("计算不同协议版本摘要")
+        );
+        assert_ne!(
+            first_digest,
+            external_command_payload_digest(
+                1,
+                &ClientCommand::ProjectCreate {
+                    name: "练习曲".to_owned(),
+                },
+            )
+            .expect("计算不同命令摘要")
+        );
+    }
+
+    #[test]
+    fn command_digest_propagates_serialization_errors() {
+        struct SerializationFailure;
+
+        impl Serialize for SerializationFailure {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(S::Error::custom("注入序列化失败"))
+            }
+        }
+
+        assert!(
+            external_command_payload_digest_from_serializable(1, &SerializationFailure).is_err()
+        );
+    }
 }

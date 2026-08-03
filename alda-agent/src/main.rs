@@ -1,11 +1,14 @@
 use std::env;
+use std::future::IntoFuture;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
-use alda_agent::app_service::AppService;
 use alda_agent::app_service::QueryQueueCapacity;
 use alda_agent::app_service::QueueCapacity;
 use alda_agent::http::HttpAuth;
+use alda_agent::http::ProductionHttpHost;
+use alda_agent::production_runtime::ActorLifecycle;
 use alda_agent::protocol::ApprovalDecision;
 use alda_agent::protocol::ApprovalId;
 use alda_agent::protocol::ApprovalSubjectDigest;
@@ -31,7 +34,8 @@ use clap::Subcommand;
 
 const SESSION_TOKEN_ENV: &str = "ALDA_AGENT_SESSION_TOKEN";
 const DEFAULT_SERVER: &str = "http://127.0.0.1:37891";
-const DEVELOPMENT_STATUS: &str = "PWA bootstrap and WebSocket streaming are available; state is process-local and in memory, and persistence is not implemented";
+const PRODUCTION_STATUS: &str =
+    "durable v2 Local Service is ready; clients using v1 must upgrade and reconnect";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,8 +49,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the development Local Service on a loopback address.
+    /// 在回环地址运行 durable v2 Local Service。
     Serve {
+        #[arg(long)]
+        data_root: PathBuf,
         #[arg(long, default_value = "127.0.0.1:37891")]
         listen: SocketAddr,
         #[arg(long, default_value_t = 64)]
@@ -54,7 +60,7 @@ enum Command {
         #[arg(long, default_value_t = 32)]
         query_queue_capacity: usize,
     },
-    /// Operate on projects through the Local Service protocol.
+    /// 通过 durable v2 Local Service 协议操作 Project。
     Project {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
@@ -63,7 +69,7 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
-    /// Read the in-memory B1 Revision projection through stable wire DTOs.
+    /// 通过 durable v2 Local Service 协议读取 Revision 投影。
     Revision {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
@@ -72,7 +78,7 @@ enum Command {
         #[command(subcommand)]
         command: RevisionCommand,
     },
-    /// Operate on sessions through the Local Service protocol.
+    /// 通过 durable v2 Local Service 协议操作 Session。
     Session {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
@@ -81,7 +87,7 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
-    /// Operate on turns through the Local Service protocol.
+    /// 通过 durable v2 Local Service 协议操作 Turn。
     Turn {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
@@ -90,7 +96,7 @@ enum Command {
         #[command(subcommand)]
         command: TurnCommand,
     },
-    /// Resume structured events through the Local Service protocol.
+    /// 通过 durable v2 Local Service 协议恢复结构化事件流。
     Event {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
@@ -99,7 +105,7 @@ enum Command {
         #[command(subcommand)]
         command: EventCommand,
     },
-    /// Respond to structured questions through the Local Service protocol.
+    /// 通过 durable v2 Local Service 协议回答结构化 Question。
     Question {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
@@ -108,7 +114,7 @@ enum Command {
         #[command(subcommand)]
         command: QuestionCommand,
     },
-    /// Respond to effect approvals through the Local Service protocol.
+    /// 通过 durable v2 Local Service 协议响应 effect Approval。
     Approval {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
@@ -117,7 +123,7 @@ enum Command {
         #[command(subcommand)]
         command: ApprovalCommand,
     },
-    /// Query Artifact metadata without writing local files.
+    /// 通过 durable v2 Local Service 协议查询 Artifact 元数据，不写入本地文件。
     Artifact {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
@@ -130,21 +136,21 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
-    /// Create a project through the Local Service.
+    /// 通过 durable v2 Local Service 创建 Project。
     Create {
         #[arg(long)]
         command_id: String,
         #[arg(long)]
         name: String,
     },
-    /// Read the current in-memory project snapshot.
+    /// 读取当前持久化 Project snapshot。
     Snapshot {
         #[arg(long)]
         command_id: String,
         #[arg(long)]
         project_id: String,
     },
-    /// Read the versioned B1 project-domain projection.
+    /// 读取带版本的 Project domain projection。
     DomainSnapshot {
         #[arg(long)]
         command_id: String,
@@ -155,14 +161,14 @@ enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 enum RevisionCommand {
-    /// List immutable revisions for a project.
+    /// 列出 Project 的不可变 Revision。
     List {
         #[arg(long)]
         command_id: String,
         #[arg(long)]
         project_id: String,
     },
-    /// Read one immutable revision.
+    /// 读取一项不可变 Revision。
     Read {
         #[arg(long)]
         command_id: String,
@@ -175,14 +181,14 @@ enum RevisionCommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
-    /// Start an in-memory session for an existing project.
+    /// 为已有 Project 启动持久化 Session。
     Start {
         #[arg(long)]
         command_id: String,
         #[arg(long)]
         project_id: String,
     },
-    /// Read a session snapshot and its covered stream sequence.
+    /// 读取 Session snapshot 及其覆盖的 stream sequence。
     Snapshot {
         #[arg(long)]
         command_id: String,
@@ -193,7 +199,7 @@ enum SessionCommand {
 
 #[derive(Debug, Subcommand)]
 enum TurnCommand {
-    /// Start a Fake Turn that remains running until explicitly cancelled.
+    /// 启动 Fake Turn，并保持运行直到显式取消。
     Start {
         #[arg(long)]
         command_id: String,
@@ -202,7 +208,7 @@ enum TurnCommand {
         #[arg(long)]
         prompt: String,
     },
-    /// Request cancellation and complete the Fake Turn as cancelled.
+    /// 请求取消，并以 cancelled 状态完成 Fake Turn。
     Cancel {
         #[arg(long)]
         command_id: String,
@@ -215,7 +221,7 @@ enum TurnCommand {
 
 #[derive(Debug, Subcommand)]
 enum EventCommand {
-    /// Resume a Session Rollout after a sequence number.
+    /// 从指定 sequence number 后恢复 Session Rollout。
     Resume {
         #[arg(long)]
         command_id: String,
@@ -230,7 +236,7 @@ enum EventCommand {
 
 #[derive(Debug, Subcommand)]
 enum QuestionCommand {
-    /// Choose one of the question's advertised choice IDs.
+    /// 从 Question 公布的 choice ID 中选择一项。
     Respond {
         #[arg(long)]
         command_id: String,
@@ -251,7 +257,7 @@ enum CliApprovalDecision {
 
 #[derive(Debug, Subcommand)]
 enum ApprovalCommand {
-    /// Decide an approval after echoing its complete subject digest.
+    /// 回显完整 subject digest 后决定 Approval。
     Respond {
         #[arg(long)]
         command_id: String,
@@ -272,7 +278,7 @@ enum ApprovalCommand {
 
 #[derive(Debug, Subcommand)]
 enum ArtifactCommand {
-    /// Read an occurrence manifest through the command protocol.
+    /// 通过命令协议读取 occurrence manifest。
     Manifest {
         #[arg(long)]
         command_id: String,
@@ -288,10 +294,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve {
+            data_root,
             listen,
             queue_capacity,
             query_queue_capacity,
-        } => serve(listen, queue_capacity, query_queue_capacity).await,
+        } => serve(data_root, listen, queue_capacity, query_queue_capacity).await,
         Command::Project {
             server,
             client_id,
@@ -360,6 +367,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(
+    data_root: PathBuf,
     listen: SocketAddr,
     queue_capacity: usize,
     query_queue_capacity: usize,
@@ -373,6 +381,7 @@ async fn serve(
     let capacity = QueueCapacity::new(queue_capacity)?;
     let query_capacity = QueryQueueCapacity::new(query_queue_capacity)?;
     let token = session_token()?;
+    let mut production = ProductionHttpHost::open(&data_root, capacity, query_capacity)?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("failed to bind Local Service at {listen}"))?;
@@ -380,20 +389,43 @@ async fn serve(
         .local_addr()
         .context("failed to read listen address")?;
     let origin = format!("http://{local_addr}");
-    let (service, runner) = AppService::build_with_capacities(capacity, query_capacity);
-    tokio::spawn(runner.run());
     let auth = HttpAuth::new(token, origin, local_addr.to_string());
     let bootstrap_code = auth.bootstrap_code_for_terminal();
-    let app = alda_agent::http::router(service, auth);
+    let app = production.router(auth);
+    let mut lifecycle = production.subscribe_lifecycle();
 
-    eprintln!("Alda Agent development Local Service listening at http://{local_addr}");
+    eprintln!("Alda Agent durable Local Service listening at http://{local_addr}");
     eprintln!("One-time browser bootstrap code (expires in 5 minutes): {bootstrap_code}");
-    eprintln!("{DEVELOPMENT_STATUS}");
+    eprintln!("{PRODUCTION_STATUS}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("Local Service failed")
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            wait_for_actor_shutdown(&mut lifecycle).await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    let serve_result = tokio::select! {
+        result = &mut server => result,
+        () = shutdown_signal() => {
+            production.shutdown();
+            server.await
+        }
+    };
+    production.shutdown();
+    let join_result = production.shutdown_and_join();
+    serve_result.context("Local Service failed")?;
+    join_result.context("durable actor failed while serving")
+}
+
+async fn wait_for_actor_shutdown(lifecycle: &mut tokio::sync::watch::Receiver<ActorLifecycle>) {
+    loop {
+        if *lifecycle.borrow() != ActorLifecycle::Running {
+            return;
+        }
+        if lifecycle.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 fn project_command(command: ProjectCommand) -> (ClientCommandId, ClientCommand) {
@@ -639,7 +671,7 @@ fn command_endpoint(server: &str) -> anyhow::Result<reqwest::Url> {
     if !url.username().is_empty() || url.password().is_some() {
         bail!("--server must not contain user information");
     }
-    url.set_path("/v1/commands");
+    url.set_path("/v2/commands");
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
@@ -734,7 +766,7 @@ mod tests {
             command_endpoint("http://127.0.0.1:37891/base?secret=value")
                 .expect("explicit loopback URL")
                 .as_str(),
-            "http://127.0.0.1:37891/v1/commands"
+            "http://127.0.0.1:37891/v2/commands"
         );
     }
 
@@ -743,7 +775,7 @@ mod tests {
         let endpoint = command_endpoint("http://127.0.0.1:37891/base?secret=value#fragment")
             .expect("explicit loopback URL");
 
-        assert_eq!(endpoint.as_str(), "http://127.0.0.1:37891/v1/commands");
+        assert_eq!(endpoint.as_str(), "http://127.0.0.1:37891/v2/commands");
         assert_eq!(
             endpoint.origin().ascii_serialization(),
             "http://127.0.0.1:37891"
@@ -751,20 +783,29 @@ mod tests {
     }
 
     #[test]
-    fn development_status_matches_the_a4_runtime_surface() {
-        assert!(DEVELOPMENT_STATUS.contains("PWA bootstrap"));
-        assert!(DEVELOPMENT_STATUS.contains("WebSocket streaming are available"));
-        assert!(DEVELOPMENT_STATUS.contains("state is process-local and in memory"));
-        assert!(DEVELOPMENT_STATUS.contains("persistence is not implemented"));
-        assert!(!DEVELOPMENT_STATUS.contains("WebSocket streaming are not implemented"));
-        assert!(!DEVELOPMENT_STATUS.contains("PWA bootstrap is not implemented"));
+    fn c3_production_surface_status_declares_durable_v2() {
+        assert!(PRODUCTION_STATUS.contains("durable v2"));
+        assert!(PRODUCTION_STATUS.contains("upgrade and reconnect"));
+        assert!(!PRODUCTION_STATUS.contains("process-local"));
     }
 
     #[tokio::test]
-    async fn serve_rejects_port_zero_before_binding() {
-        let error = serve("127.0.0.1:0".parse().expect("socket address"), 64, 32)
-            .await
-            .expect_err("port zero must be rejected");
+    async fn c3_production_surface_serve_rejects_port_zero_before_opening() {
+        let error = serve(
+            PathBuf::from("/unused-for-port-zero"),
+            "127.0.0.1:0".parse().expect("socket address"),
+            64,
+            32,
+        )
+        .await
+        .expect_err("port zero must be rejected");
         assert!(error.to_string().contains("port 0"));
+    }
+
+    #[test]
+    fn c3_production_surface_data_root_is_required_by_cli() {
+        let error =
+            Cli::try_parse_from(["alda-agent", "serve"]).expect_err("serve 必须显式要求 data root");
+        assert!(error.to_string().contains("--data-root"));
     }
 }

@@ -1,8 +1,7 @@
-//! B3b Session Rollout persistence foundation.
+//! B3b Session Rollout 持久化基础。
 //!
-//! This module deliberately does not connect to the production `AppService`.
-//! Stored JSON is decoded into primitive-only DTOs and then reconstructed
-//! through the validated reducer below.
+//! 本模块有意不连接 production `AppService`。stored JSON 先解码成只含 primitive 的 DTO，
+//! 再通过下方经过验证的 reducer 重建。
 
 #![allow(
     dead_code,
@@ -16,6 +15,8 @@
     reason = "the stored whitelist and ownership-preserving typestates are intentionally explicit"
 )]
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::CStr;
 use std::fs::File;
@@ -28,12 +29,14 @@ use rustix::fs::{Dir, Mode, OFlags, fsync, openat, renameat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::control_store::SessionAllocationCatalogContext;
 use crate::protocol::{
     ApprovalDecision, ApprovalId, ApprovalPayload, ApprovalStatus, ApprovalSubjectDigest, ChoiceId,
-    ClientCommandId, ClientId, CommandOutcome, CommandReply, CommandResult, EventPage,
-    PendingApproval, PendingQuestion, ProjectId, QuestionAnswer, QuestionChoice, QuestionId,
-    QuestionStatus, SESSION_STREAM_EPOCH, SessionEvent, SessionEventKind, SessionId,
-    SessionSnapshot, StreamKind, TurnId, TurnSnapshot, TurnStatus,
+    ClientCommand, ClientCommandId, ClientId, CommandOutcome, CommandReply, CommandResult,
+    EventPage, PROTOCOL_VERSION, PendingApproval, PendingQuestion, ProjectId, ProtocolErrorCode,
+    QuestionAnswer, QuestionChoice, QuestionId, QuestionStatus, SESSION_STREAM_EPOCH, SessionEvent,
+    SessionEventKind, SessionId, SessionSnapshot, StreamKind, TurnId, TurnSnapshot, TurnStatus,
+    external_command_payload_digest,
 };
 
 #[cfg(test)]
@@ -55,6 +58,21 @@ const MAX_CHOICES: usize = 64;
 const MAX_EGRESS_FIELDS: usize = 64;
 const MAX_SESSIONS: usize = 100_000;
 const ID_ALLOCATION_ATTEMPTS: usize = 32;
+
+#[cfg(test)]
+thread_local! {
+    static SESSION_CHECKPOINT_LOAD_OBSERVED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_checkpoint_load_observed() {
+    SESSION_CHECKPOINT_LOAD_OBSERVED.set(false);
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_load_observed() -> bool {
+    SESSION_CHECKPOINT_LOAD_OBSERVED.get()
+}
 pub(crate) const INTERNAL_CLIENT_PREFIX: &str = "__alda_internal_";
 pub(crate) const INTERNAL_RESTART_CLIENT_ID: &str = "__alda_internal_restart_v1";
 
@@ -90,7 +108,7 @@ fn allocate_typed_id_with(
     Err(StateStoreError::IdempotencyConflict)
 }
 
-/// Validated in-process event vocabulary. It is never deserialized directly.
+/// 已验证的进程内事件 vocabulary；绝不直接反序列化。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SessionRolloutEvent {
     SessionStarted {
@@ -108,8 +126,8 @@ pub(crate) enum SessionRolloutEvent {
         turn_id: TurnId,
         status: TurnStatus,
     },
-    /// Authoritative budget-exhaustion fact. This is distinct from accepting an
-    /// arbitrary stored `TurnCompleted(BudgetExceeded)` assertion.
+    /// 权威 budget-exhaustion 事实；它不同于接受任意 stored
+    /// `TurnCompleted(BudgetExceeded)` 断言。
     TurnBudgetExceeded {
         turn_id: TurnId,
     },
@@ -680,6 +698,192 @@ pub(crate) struct SessionRolloutProjection {
     head_sequence: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublishedSessionBatchHead {
+    last_sequence: u64,
+    checksum: String,
+}
+
+/// 只能由 live Ready writer 导出的不可变 Session 查询状态。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PublishedSessionReadState {
+    expected_session_id: SessionId,
+    projection: SessionRolloutProjection,
+    events: Vec<SessionRolloutEvent>,
+    restart_authorizations: BTreeMap<u64, RestartAuthorizationV1>,
+    batch_heads: Vec<PublishedSessionBatchHead>,
+    last_sequence: u64,
+    last_checksum: String,
+    snapshot: SessionSnapshot,
+}
+
+impl PublishedSessionReadState {
+    fn from_recovered(state: &RecoveredSessionState) -> Result<Self, StateStoreError> {
+        let last_checksum = state
+            .last_checksum
+            .clone()
+            .ok_or(StateStoreError::ChecksumChainMismatch)?;
+        let published = Self {
+            expected_session_id: state.expected_session_id.clone(),
+            projection: state.projection.clone(),
+            events: state.events.clone(),
+            restart_authorizations: state.restart_authorizations.clone(),
+            batch_heads: state.batch_heads.clone(),
+            last_sequence: state.last_sequence,
+            last_checksum,
+            snapshot: state.projection.snapshot()?,
+        };
+        published.validate()?;
+        Ok(published)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), StateStoreError> {
+        validate_sha256(&self.last_checksum)?;
+        let event_count =
+            u64::try_from(self.events.len()).map_err(|_| StateStoreError::BatchTooLarge)?;
+        if event_count != self.last_sequence
+            || self.batch_heads.is_empty()
+            || self.batch_heads.last().is_none_or(|head| {
+                head.last_sequence != self.last_sequence || head.checksum != self.last_checksum
+            })
+        {
+            return Err(StateStoreError::ChecksumChainMismatch);
+        }
+        let mut previous_sequence = 0;
+        for head in &self.batch_heads {
+            validate_sha256(&head.checksum)?;
+            if head.last_sequence < previous_sequence || head.last_sequence > self.last_sequence {
+                return Err(StateStoreError::SequenceMismatch);
+            }
+            previous_sequence = head.last_sequence;
+        }
+
+        let mut replayed = SessionRolloutProjection::default();
+        let mut used_authorizations = BTreeSet::new();
+        for (index, event) in self.events.iter().enumerate() {
+            if let Some(authorization) = self.restart_authorizations.get(&replayed.head_sequence) {
+                if authorization.pre_head_sequence != replayed.head_sequence
+                    || !used_authorizations.insert(replayed.head_sequence)
+                {
+                    return Err(StateStoreError::ProjectionRejected);
+                }
+                replayed.authorize_restart(authorization)?;
+            }
+            let sequence = u64::try_from(index)
+                .map_err(|_| StateStoreError::BatchTooLarge)?
+                .checked_add(1)
+                .ok_or(StateStoreError::SequenceMismatch)?;
+            replayed.apply(sequence, event)?;
+        }
+        if used_authorizations.len() != self.restart_authorizations.len()
+            || replayed != self.projection
+            || replayed.head_sequence != self.last_sequence
+        {
+            return Err(StateStoreError::ProjectionRejected);
+        }
+        let snapshot = replayed.snapshot()?;
+        if snapshot != self.snapshot
+            || snapshot.session_id != self.expected_session_id
+            || snapshot.covered_through_sequence != self.last_sequence
+        {
+            return Err(StateStoreError::StreamMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn head(&self) -> (u64, &str) {
+        (self.last_sequence, self.last_checksum.as_str())
+    }
+
+    pub(crate) fn snapshot(&self) -> &SessionSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn turn_ids(&self) -> impl Iterator<Item = &str> {
+        self.snapshot
+            .turns
+            .iter()
+            .map(|turn| turn.turn_id.0.as_str())
+    }
+
+    pub(crate) fn question_ids(&self) -> impl Iterator<Item = &str> {
+        self.snapshot
+            .questions
+            .iter()
+            .map(|question| question.question_id.0.as_str())
+    }
+
+    pub(crate) fn approval_ids(&self) -> impl Iterator<Item = &str> {
+        self.snapshot
+            .approvals
+            .iter()
+            .map(|approval| approval.approval_id.0.as_str())
+    }
+
+    pub(crate) fn canonical_prompt(&self, turn_id: &TurnId) -> Option<&str> {
+        self.projection.canonical_prompt(turn_id)
+    }
+
+    fn page(&self, after_sequence: u64) -> Result<EventPage, StateStoreError> {
+        if after_sequence > self.last_sequence {
+            return Err(StateStoreError::SequenceMismatch);
+        }
+        let events = self
+            .events
+            .iter()
+            .enumerate()
+            .skip(usize::try_from(after_sequence).map_err(|_| StateStoreError::SequenceMismatch)?)
+            .take(crate::protocol::EVENT_PAGE_LIMIT)
+            .map(|(index, event)| {
+                Ok(event_to_wire(
+                    u64::try_from(index).map_err(|_| StateStoreError::SequenceMismatch)? + 1,
+                    event,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_after_sequence = events.last().map_or(after_sequence, |event| event.sequence);
+        Ok(EventPage {
+            stream_kind: StreamKind::SessionRollout,
+            stream_id: self.expected_session_id.0.clone(),
+            epoch: SESSION_STREAM_EPOCH,
+            head_sequence: self.last_sequence,
+            events,
+            next_after_sequence,
+        })
+    }
+
+    pub(crate) fn resume(
+        &self,
+        cursor: &crate::protocol::StreamCursor,
+    ) -> Result<EventPage, SessionCursorError> {
+        if cursor.stream_kind != StreamKind::SessionRollout {
+            return Err(SessionCursorError::UnsupportedStreamKind);
+        }
+        if cursor.stream_id != self.expected_session_id.0 {
+            return Err(SessionCursorError::SessionMismatch);
+        }
+        if cursor.epoch != SESSION_STREAM_EPOCH {
+            return Err(SessionCursorError::EpochMismatch {
+                expected_epoch: SESSION_STREAM_EPOCH,
+                actual_epoch: cursor.epoch,
+                head_sequence: self.last_sequence,
+            });
+        }
+        self.page(cursor.after_sequence)
+            .map_err(|_| SessionCursorError::Future {
+                head_sequence: self.last_sequence,
+            })
+    }
+}
+
+impl std::ops::Deref for PublishedSessionReadState {
+    type Target = SessionSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        self.snapshot()
+    }
+}
+
 impl SessionRolloutProjection {
     pub(crate) fn snapshot(&self) -> Result<SessionSnapshot, StateStoreError> {
         Ok(SessionSnapshot {
@@ -861,7 +1065,7 @@ impl SessionRolloutProjection {
                         current == TurnStatus::Running
                             && eligibility == Some(TerminalEligibility::RestartAuthorized)
                     }
-                    // The current B3b whitelist has no authoritative budget-exhaustion fact.
+                    // 当前 B3b whitelist 不含权威 budget-exhaustion 事实。
                     TurnStatus::BudgetExceeded => false,
                     _ => false,
                 };
@@ -1225,8 +1429,22 @@ pub(crate) struct RestartPlan {
     authorization: Option<RestartAuthorizationV1>,
 }
 
-/// A restart obligation whose identity is closed over the control and Session
-/// logs. Every field is derived from one pre-reconciliation projection.
+#[cfg(test)]
+impl RestartPlan {
+    /// 仅供跨模块持久化测试把 trusted planner 结果写入真实 Session log。
+    pub(crate) fn into_append_request(self) -> SessionAppendRequest {
+        SessionAppendRequest {
+            transaction_id: self.transaction_id,
+            command_record: None,
+            events: self.events,
+            restart_authorization: self.authorization,
+            command_only_authorization: None,
+        }
+    }
+}
+
+/// identity 在 control 与 Session log 上闭合的 restart obligation；每个字段都源自同一份
+/// reconciliation 前 projection。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CoordinatedRestartPlan {
     pub intent: String,
@@ -1245,6 +1463,7 @@ impl CoordinatedRestartPlan {
             command_record: Some(self.command_record.clone()),
             events: self.events.clone(),
             restart_authorization: self.authorization.clone(),
+            command_only_authorization: None,
         }
     }
 }
@@ -1327,9 +1546,8 @@ pub(crate) fn plan_restart_reconciliation(
     }))
 }
 
-/// Plans the B4 control-coordinated form of restart reconciliation. Unlike the
-/// legacy planner above, this always carries the reserved command identity and
-/// a canonical reply containing the resulting Session snapshot.
+/// 规划由 B4 control 协调的 restart reconciliation。不同于上方 legacy planner，
+/// 该形式始终携带预留 command identity，以及包含最终 Session snapshot 的 canonical reply。
 pub(crate) fn plan_coordinated_restart_reconciliation(
     instance_id: &str,
     projection: &SessionRolloutProjection,
@@ -1411,6 +1629,37 @@ fn restart_global_tx_id(payload_digest: &str) -> Result<String, StateStoreError>
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct StoredCommandOnlyAuthorizationV1 {
+    schema_version: u32,
+    protocol_version: u32,
+    command: ClientCommand,
+    reason: CommandOnlyReasonV1,
+}
+
+impl StoredCommandOnlyAuthorizationV1 {
+    pub(crate) const fn new(command: ClientCommand, reason: CommandOnlyReasonV1) -> Self {
+        Self {
+            schema_version: 1,
+            protocol_version: PROTOCOL_VERSION,
+            command,
+            reason,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommandOnlyReasonV1 {
+    TurnAlreadyTerminal,
+    QuestionAlreadyResolved,
+    ApprovalAlreadyResolved,
+    TurnOwnershipMismatch,
+    QuestionOwnershipMismatch,
+    ApprovalOwnershipMismatch,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StoredSessionBatchV1 {
     schema_version: u32,
     session_id: String,
@@ -1422,6 +1671,8 @@ struct StoredSessionBatchV1 {
     last_sequence: u64,
     command_record: Option<StoredCommandRecordV1>,
     restart_authorization: Option<StoredRestartAuthorizationV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_only_authorization: Option<StoredCommandOnlyAuthorizationV1>,
     events: Vec<StoredSessionEventV1>,
     previous_batch_checksum: Option<String>,
     batch_checksum: String,
@@ -1461,6 +1712,8 @@ struct RecoveredSessionState {
     last_checksum: Option<String>,
     projection: SessionRolloutProjection,
     events: Vec<SessionRolloutEvent>,
+    restart_authorizations: BTreeMap<u64, RestartAuthorizationV1>,
+    batch_heads: Vec<PublishedSessionBatchHead>,
     commands: BTreeMap<(String, String), StoredCommandRecordV1>,
     transactions: BTreeMap<String, TransactionCommit>,
     valid_bytes: u64,
@@ -1471,6 +1724,7 @@ pub(crate) struct SessionAppendRequest {
     pub command_record: Option<StoredCommandRecordV1>,
     pub events: Vec<SessionRolloutEvent>,
     restart_authorization: Option<RestartAuthorizationV1>,
+    command_only_authorization: Option<StoredCommandOnlyAuthorizationV1>,
 }
 
 impl SessionAppendRequest {
@@ -1484,6 +1738,21 @@ impl SessionAppendRequest {
             command_record,
             events,
             restart_authorization: None,
+            command_only_authorization: None,
+        }
+    }
+
+    pub(crate) fn new_command_only(
+        transaction_id: String,
+        command_record: StoredCommandRecordV1,
+        authorization: StoredCommandOnlyAuthorizationV1,
+    ) -> Self {
+        Self {
+            transaction_id,
+            command_record: Some(command_record),
+            events: Vec::new(),
+            restart_authorization: None,
+            command_only_authorization: Some(authorization),
         }
     }
 
@@ -1512,12 +1781,13 @@ impl SessionAppendRequest {
             &self.transaction_id,
             self.command_record.as_ref(),
             authorization.as_ref(),
+            self.command_only_authorization.as_ref(),
             &events,
         )
     }
 }
 
-/// Primitive-only Session redo plan frozen in the control WAL.
+/// 冻结在 control WAL 中、只含 primitive 的 Session redo plan。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredSessionPlanV1 {
@@ -1529,6 +1799,8 @@ pub(crate) struct StoredSessionPlanV1 {
     transaction_id: String,
     command_record: Option<StoredCommandRecordV1>,
     restart_authorization: Option<StoredRestartAuthorizationV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_only_authorization: Option<StoredCommandOnlyAuthorizationV1>,
     events: Vec<StoredSessionEventV1>,
     canonical_plan_digest: String,
 }
@@ -1563,6 +1835,7 @@ impl StoredSessionPlanV1 {
             transaction_id: request.transaction_id.clone(),
             command_record: request.command_record.clone(),
             restart_authorization,
+            command_only_authorization: request.command_only_authorization.clone(),
             events: request
                 .events
                 .iter()
@@ -1602,10 +1875,8 @@ impl StoredSessionPlanV1 {
         self.command_record.as_ref()
     }
 
-    /// Returns whether this is a structurally valid control-coordinated
-    /// restart plan. Any use of the reserved internal prefix that is not the
-    /// exact restart identity is rejected instead of being classified as an
-    /// external command.
+    /// 判断该值是否为结构有效的 control-coordinated restart plan。凡使用预留内部前缀但不
+    /// 精确匹配 restart identity 的输入都会被拒绝，不会被归类为 external command。
     pub(crate) fn validate_coordinated_restart_identity(&self) -> Result<bool, StateStoreError> {
         let Some(command) = &self.command_record else {
             return Ok(false);
@@ -1696,6 +1967,7 @@ impl StoredSessionPlanV1 {
                 .map(StoredSessionEventV1::into_live)
                 .collect::<Result<Vec<_>, _>>()?,
             restart_authorization,
+            command_only_authorization: self.command_only_authorization,
         };
         if request.canonical_plan_digest(&session_id)? != self.canonical_plan_digest {
             return Err(StateStoreError::ChecksumMismatch);
@@ -1704,7 +1976,11 @@ impl StoredSessionPlanV1 {
     }
 
     fn validate_shape(&self) -> Result<(), StateStoreError> {
-        if self.schema_version != 1 || self.transaction_id.is_empty() || self.events.is_empty() {
+        if self.schema_version != 1
+            || self.transaction_id.is_empty()
+            || self.events.is_empty() != self.command_only_authorization.is_some()
+            || (self.command_only_authorization.is_some() && self.restart_authorization.is_some())
+        {
             return Err(StateStoreError::IncompatibleSchema);
         }
         validate_id(self.session_id.clone())?;
@@ -1740,15 +2016,169 @@ impl StoredSessionPlanV1 {
                     })
                 })
                 .transpose()?,
+            command_only_authorization: self.command_only_authorization.clone(),
         };
         if request.canonical_plan_digest(&SessionId(self.session_id.clone()))?
             != self.canonical_plan_digest
         {
             return Err(StateStoreError::ChecksumMismatch);
         }
+        validate_command_only_shape(
+            &SessionId(self.session_id.clone()),
+            self.expected_pre_sequence,
+            self.expected_pre_batch_checksum.as_deref(),
+            self.command_record.as_ref(),
+            self.restart_authorization.as_ref(),
+            &self.events,
+            self.command_only_authorization.as_ref(),
+        )?;
         self.validate_coordinated_restart_identity()?;
         Ok(())
     }
+}
+
+fn validate_command_only_shape(
+    session_id: &SessionId,
+    pre_sequence: u64,
+    pre_checksum: Option<&str>,
+    command_record: Option<&StoredCommandRecordV1>,
+    restart_authorization: Option<&StoredRestartAuthorizationV1>,
+    events: &[StoredSessionEventV1],
+    authorization: Option<&StoredCommandOnlyAuthorizationV1>,
+) -> Result<(), StateStoreError> {
+    let Some(authorization) = authorization else {
+        return if events.is_empty() {
+            Err(StateStoreError::IncompatibleSchema)
+        } else {
+            Ok(())
+        };
+    };
+    let command_record = command_record.ok_or(StateStoreError::IncompatibleSchema)?;
+    if !events.is_empty()
+        || restart_authorization.is_some()
+        || pre_sequence == 0
+        || pre_checksum.is_none()
+        || authorization.schema_version != 1
+        || authorization.protocol_version != PROTOCOL_VERSION
+        || command_record.client_id.starts_with(INTERNAL_CLIENT_PREFIX)
+        || external_command_payload_digest(authorization.protocol_version, &authorization.command)
+            .map_err(|_| StateStoreError::IncompatibleSchema)?
+            != command_record.payload_digest
+    {
+        return Err(StateStoreError::ProjectionRejected);
+    }
+    let (_raw, reply) = command_record.decode_reply_for_protocol(PROTOCOL_VERSION)?;
+    let shape_matches = match (authorization.reason, &authorization.command, &reply.outcome) {
+        (
+            CommandOnlyReasonV1::TurnAlreadyTerminal,
+            ClientCommand::TurnCancel {
+                session_id: requested,
+                turn_id,
+            },
+            CommandOutcome::Success {
+                result:
+                    CommandResult::TurnAlreadyTerminal {
+                        turn_id: reply_turn_id,
+                        ..
+                    },
+            },
+        ) => requested == session_id && reply_turn_id == turn_id,
+        (
+            CommandOnlyReasonV1::QuestionAlreadyResolved,
+            ClientCommand::QuestionRespond {
+                session_id: requested,
+                question_id,
+                ..
+            },
+            CommandOutcome::Success {
+                result: CommandResult::QuestionAlreadyResolved(question),
+            },
+        ) => {
+            requested == session_id
+                && question.question_id == *question_id
+                && question.session_id == *requested
+        }
+        (
+            CommandOnlyReasonV1::ApprovalAlreadyResolved,
+            ClientCommand::ApprovalRespond {
+                session_id: requested,
+                approval_id,
+                ..
+            },
+            CommandOutcome::Success {
+                result: CommandResult::ApprovalAlreadyResolved(approval),
+            },
+        ) => {
+            requested == session_id
+                && approval.approval_id == *approval_id
+                && approval.session_id == *requested
+        }
+        (
+            CommandOnlyReasonV1::TurnOwnershipMismatch,
+            ClientCommand::TurnCancel {
+                session_id: requested,
+                turn_id,
+            },
+            _,
+        ) => {
+            reply
+                == command_only_ownership_reply(
+                    command_record,
+                    ProtocolErrorCode::TurnOwnershipMismatch,
+                    format!(
+                        "turn `{}` does not belong to session `{}`",
+                        turn_id.0, requested.0
+                    ),
+                )?
+        }
+        (
+            CommandOnlyReasonV1::QuestionOwnershipMismatch,
+            ClientCommand::QuestionRespond {
+                session_id: requested,
+                ..
+            },
+            _,
+        ) => {
+            reply
+                == command_only_ownership_reply(
+                    command_record,
+                    ProtocolErrorCode::QuestionOwnershipMismatch,
+                    format!("question does not belong to session `{}`", requested.0),
+                )?
+        }
+        (
+            CommandOnlyReasonV1::ApprovalOwnershipMismatch,
+            ClientCommand::ApprovalRespond {
+                session_id: requested,
+                ..
+            },
+            _,
+        ) => {
+            reply
+                == command_only_ownership_reply(
+                    command_record,
+                    ProtocolErrorCode::ApprovalOwnershipMismatch,
+                    format!("approval does not belong to session `{}`", requested.0),
+                )?
+        }
+        _ => false,
+    };
+    if !shape_matches {
+        return Err(StateStoreError::ProjectionRejected);
+    }
+    Ok(())
+}
+
+fn command_only_ownership_reply(
+    command_record: &StoredCommandRecordV1,
+    code: ProtocolErrorCode,
+    message: String,
+) -> Result<CommandReply, StateStoreError> {
+    Ok(CommandReply::error(
+        ClientCommandId(validate_id(command_record.client_command_id.clone())?),
+        code,
+        message,
+    ))
 }
 
 struct SessionWriterLease {
@@ -1782,6 +2212,7 @@ pub(crate) struct ReadySessionWriter {
     session_dir: OwnedFd,
     file: File,
     state: RecoveredSessionState,
+    catalog_context: SessionAllocationCatalogContext,
     #[cfg(test)]
     failpoint: Option<AppendFailpoint>,
     #[cfg(test)]
@@ -1817,13 +2248,14 @@ pub(crate) struct PoisonedSessionWriter {
     lease: SessionWriterLease,
     session_dir: OwnedFd,
     session_id: SessionId,
+    catalog_context: SessionAllocationCatalogContext,
     #[cfg(test)]
     recovery_failpoint: Option<RecoveryFailpoint>,
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecoveryFailpoint {
+pub(crate) enum RecoveryFailpoint {
     FileSync,
 }
 
@@ -1840,6 +2272,7 @@ pub(crate) struct RepairRequiredSessionWriter {
     valid_bytes: u64,
     damaged_bytes: u64,
     tail_digest: String,
+    catalog_context: SessionAllocationCatalogContext,
     #[cfg(test)]
     repair_failpoint: Option<RepairFailpoint>,
 }
@@ -1851,12 +2284,26 @@ pub(crate) struct CorruptSessionWriter {
 }
 
 impl StateStore {
+    #[cfg(test)]
     pub(crate) fn open_session_writer(
         &self,
         session_id: SessionId,
     ) -> Result<OpenSessionWriter, StateStoreError> {
+        self.open_session_writer_with_catalog(
+            session_id,
+            SessionAllocationCatalogContext::for_test([]),
+        )
+    }
+
+    pub(crate) fn open_session_writer_with_catalog(
+        &self,
+        session_id: SessionId,
+        catalog_context: SessionAllocationCatalogContext,
+    ) -> Result<OpenSessionWriter, StateStoreError> {
         validate_id(session_id.0.clone())?;
         let key = session_key(&session_id);
+        #[cfg(test)]
+        self.record_writer_open(format!("session:{key}"));
         {
             let mut registry = self
                 .inner
@@ -1871,7 +2318,13 @@ impl StateStore {
             inner: Arc::clone(&self.inner),
             key: key.clone(),
         };
-        match open_session_writer_with_lease(lease, session_id, &key, self.init_failpoint) {
+        match open_session_writer_with_lease(
+            lease,
+            session_id,
+            &key,
+            self.init_failpoint,
+            catalog_context,
+        ) {
             Ok(writer) => Ok(writer),
             Err((lease, error)) => {
                 drop(lease);
@@ -1880,7 +2333,15 @@ impl StateStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn list_sessions(&self) -> Result<SessionCatalog, StateStoreError> {
+        self.list_sessions_with_catalog(&SessionAllocationCatalogContext::for_test([]))
+    }
+
+    pub(crate) fn list_sessions_with_catalog(
+        &self,
+        catalog_context: &SessionAllocationCatalogContext,
+    ) -> Result<SessionCatalog, StateStoreError> {
         let mut directory = Dir::read_from(&self.inner.sessions)
             .map_err(|source| io_error("list sessions", source))?;
         let mut catalog = SessionCatalog::default();
@@ -1905,22 +2366,30 @@ impl StateStore {
                 &mut file,
                 &expected,
                 &self.instance_id,
+                catalog_context,
             ) {
-                Ok(Some(state)) => match scan_session_log_from(&mut file, state)? {
-                    SessionScanOutcome::Clean(state) => state,
-                    SessionScanOutcome::Incomplete {
-                        state,
-                        damaged_bytes,
-                        ..
-                    } => {
-                        return Err(StateStoreError::RecoverableIncompleteTail {
-                            valid_bytes: state.valid_bytes,
+                Ok(Some(state)) => {
+                    match scan_session_log_from(&mut file, state, catalog_context)? {
+                        SessionScanOutcome::Clean(state) => state,
+                        SessionScanOutcome::Incomplete {
+                            state,
                             damaged_bytes,
-                        });
+                            ..
+                        } => {
+                            return Err(StateStoreError::RecoverableIncompleteTail {
+                                valid_bytes: state.valid_bytes,
+                                damaged_bytes,
+                            });
+                        }
                     }
-                },
+                }
                 Ok(None) | Err(_) => {
-                    match scan_session_log(&mut file, &expected, &self.instance_id)? {
+                    match scan_session_log(
+                        &mut file,
+                        &expected,
+                        &self.instance_id,
+                        catalog_context,
+                    )? {
                         SessionScanOutcome::Clean(state) => state,
                         SessionScanOutcome::Incomplete {
                             state,
@@ -1938,6 +2407,37 @@ impl StateStore {
             catalog.insert(&state)?;
         }
         Ok(catalog)
+    }
+
+    /// 仅比较受管目录名，不打开或重放 aggregate 日志。
+    pub(crate) fn validate_session_directory_catalog(
+        &self,
+        expected_session_ids: &BTreeSet<String>,
+        strict: bool,
+    ) -> Result<(), StateStoreError> {
+        let expected = expected_session_ids
+            .iter()
+            .map(|session_id| validate_id(session_id.clone()).map(|id| session_key(&SessionId(id))))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let mut actual = BTreeSet::new();
+        let mut directory = Dir::read_from(&self.inner.sessions)
+            .map_err(|source| io_error("list Session directory keys", source))?;
+        for entry in &mut directory {
+            let entry = entry.map_err(|source| io_error("read Session directory key", source))?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            if actual.len() >= MAX_SESSIONS
+                || !actual.insert(canonical_session_directory_name(name)?)
+            {
+                return Err(StateStoreError::ProjectionRejected);
+            }
+        }
+        if (strict && actual != expected) || (!strict && !actual.is_subset(&expected)) {
+            return Err(StateStoreError::StreamMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -2018,6 +2518,12 @@ impl ReadySessionWriter {
         self.state.projection.snapshot()
     }
 
+    pub(crate) fn published_read_state(
+        &self,
+    ) -> Result<PublishedSessionReadState, StateStoreError> {
+        PublishedSessionReadState::from_recovered(&self.state)
+    }
+
     pub(crate) fn probe_transaction(
         &self,
         transaction_id: &str,
@@ -2090,7 +2596,7 @@ impl ReadySessionWriter {
         mut self,
         request: SessionAppendRequest,
     ) -> Result<(Self, AppendOutcome), SessionAppendFailure> {
-        let prepared = match prepare_session_batch(&self.state, request) {
+        let prepared = match prepare_session_batch(&self.state, request, &self.catalog_context) {
             Ok(PreparedSessionAppend::Idempotent(outcome)) => return Ok((self, outcome)),
             Ok(PreparedSessionAppend::Batch(batch, next)) => (batch, next),
             Err(error) => {
@@ -2331,6 +2837,7 @@ impl ReadySessionWriter {
             lease: self.lease,
             session_dir: self.session_dir,
             session_id: self.state.expected_session_id,
+            catalog_context: self.catalog_context,
             #[cfg(test)]
             recovery_failpoint: None,
         }
@@ -2339,7 +2846,7 @@ impl ReadySessionWriter {
 
 impl PoisonedSessionWriter {
     #[cfg(test)]
-    fn set_recovery_failpoint(&mut self, failpoint: RecoveryFailpoint) {
+    pub(crate) fn set_recovery_failpoint(&mut self, failpoint: RecoveryFailpoint) {
         self.recovery_failpoint = Some(failpoint);
     }
 
@@ -2355,6 +2862,7 @@ impl PoisonedSessionWriter {
             self.lease,
             self.session_dir,
             self.session_id,
+            self.catalog_context,
             #[cfg(test)]
             self.recovery_failpoint,
         )
@@ -2384,20 +2892,24 @@ impl RepairRequiredSessionWriter {
         {
             return Err(self.into_corrupt());
         }
-        let scan =
-            match scan_session_log(&mut file, &self.session_id, &self.lease.inner.instance_id) {
-                Ok(SessionScanOutcome::Incomplete {
-                    state,
-                    damaged_bytes,
-                    tail_digest,
-                }) if state.valid_bytes == self.valid_bytes
-                    && damaged_bytes == self.damaged_bytes
-                    && tail_digest == self.tail_digest =>
-                {
-                    state
-                }
-                _ => return Err(self.into_corrupt()),
-            };
+        let scan = match scan_session_log(
+            &mut file,
+            &self.session_id,
+            &self.lease.inner.instance_id,
+            &self.catalog_context,
+        ) {
+            Ok(SessionScanOutcome::Incomplete {
+                state,
+                damaged_bytes,
+                tail_digest,
+            }) if state.valid_bytes == self.valid_bytes
+                && damaged_bytes == self.damaged_bytes
+                && tail_digest == self.tail_digest =>
+            {
+                state
+            }
+            _ => return Err(self.into_corrupt()),
+        };
         #[cfg(test)]
         if self.repair_failpoint == Some(RepairFailpoint::TruncateError) {
             return Err(self.into_corrupt());
@@ -2424,6 +2936,7 @@ impl RepairRequiredSessionWriter {
             session_dir: self.session_dir,
             file,
             state: scan,
+            catalog_context: self.catalog_context,
             #[cfg(test)]
             failpoint: None,
             #[cfg(test)]
@@ -2448,6 +2961,7 @@ enum PreparedSessionAppend {
 fn prepare_session_batch(
     state: &RecoveredSessionState,
     request: SessionAppendRequest,
+    catalog_context: &SessionAllocationCatalogContext,
 ) -> Result<PreparedSessionAppend, StateStoreError> {
     if request.events.len() > MAX_EVENTS {
         return Err(StateStoreError::BatchTooLarge);
@@ -2480,6 +2994,7 @@ fn prepare_session_batch(
         &request.transaction_id,
         request.command_record.as_ref(),
         stored_authorization.as_ref(),
+        request.command_only_authorization.as_ref(),
         &stored_events,
     )?;
     match probe_transaction_index(
@@ -2538,13 +3053,14 @@ fn prepare_session_batch(
         last_sequence,
         command_record: request.command_record,
         restart_authorization: stored_authorization,
+        command_only_authorization: request.command_only_authorization,
         events: stored_events,
         previous_batch_checksum: state.last_checksum.clone(),
         batch_checksum: String::new(),
     };
     batch.batch_checksum = session_batch_checksum(&batch)?;
     let mut next = state.clone();
-    apply_session_batch(&mut next, &batch)?;
+    apply_session_batch(&mut next, &batch, catalog_context)?;
     Ok(PreparedSessionAppend::Batch(batch, next))
 }
 
@@ -2561,16 +3077,19 @@ fn scan_session_log(
     file: &mut File,
     expected_session: &SessionId,
     state_instance_id: &str,
+    catalog_context: &SessionAllocationCatalogContext,
 ) -> Result<SessionScanOutcome, StateStoreError> {
     scan_session_log_from(
         file,
         empty_session_state(expected_session.clone(), state_instance_id.to_owned()),
+        catalog_context,
     )
 }
 
 fn scan_session_log_from(
     file: &mut File,
     mut state: RecoveredSessionState,
+    catalog_context: &SessionAllocationCatalogContext,
 ) -> Result<SessionScanOutcome, StateStoreError> {
     let mut offset = state.valid_bytes;
     file.seek(SeekFrom::Start(offset))
@@ -2604,7 +3123,7 @@ fn scan_session_log_from(
         line.pop();
         let batch: StoredSessionBatchV1 =
             serde_json::from_slice(&line).map_err(|_| StateStoreError::MiddleCorruption)?;
-        apply_session_batch(&mut state, &batch)?;
+        apply_session_batch(&mut state, &batch, catalog_context)?;
         offset = offset
             .checked_add(u64::try_from(count).map_err(|_| StateStoreError::BatchTooLarge)?)
             .ok_or(StateStoreError::BatchTooLarge)?;
@@ -2615,6 +3134,7 @@ fn scan_session_log_from(
 fn apply_session_batch(
     state: &mut RecoveredSessionState,
     batch: &StoredSessionBatchV1,
+    catalog_context: &SessionAllocationCatalogContext,
 ) -> Result<(), StateStoreError> {
     if batch.schema_version != 1 || batch.epoch != SESSION_STREAM_EPOCH {
         return Err(StateStoreError::IncompatibleSchema);
@@ -2658,6 +3178,17 @@ fn apply_session_batch(
         return Err(StateStoreError::ChecksumMismatch);
     }
 
+    validate_command_only_shape(
+        &state.expected_session_id,
+        state.last_sequence,
+        state.last_checksum.as_deref(),
+        batch.command_record.as_ref(),
+        batch.restart_authorization.as_ref(),
+        &batch.events,
+        batch.command_only_authorization.as_ref(),
+    )?;
+    validate_command_only_authorization(state, batch, catalog_context)?;
+
     let live_events = batch
         .events
         .iter()
@@ -2687,7 +3218,9 @@ fn apply_session_batch(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let authorized_turns = authorization.map_or_else(Vec::new, |value| value.turn_ids);
+    let authorized_turns = authorization
+        .as_ref()
+        .map_or_else(Vec::new, |value| value.turn_ids.clone());
     if aborted_turns != authorized_turns {
         return Err(StateStoreError::ProjectionRejected);
     }
@@ -2698,6 +3231,13 @@ fn apply_session_batch(
     {
         return Err(StateStoreError::StreamMismatch);
     }
+    if let Some(authorization) = authorization.as_ref()
+        && state
+            .restart_authorizations
+            .contains_key(&authorization.pre_head_sequence)
+    {
+        return Err(StateStoreError::ProjectionRejected);
+    }
     if let Some(command) = &batch.command_record {
         command.decode_reply()?;
         let key = (command.client_id.clone(), command.client_command_id.clone());
@@ -2707,6 +3247,15 @@ fn apply_session_batch(
         state.commands.insert(key, command.clone());
     }
     state.events.extend(live_events);
+    if let Some(authorization) = authorization {
+        state
+            .restart_authorizations
+            .insert(authorization.pre_head_sequence, authorization);
+    }
+    state.batch_heads.push(PublishedSessionBatchHead {
+        last_sequence: expected_last,
+        checksum: batch.batch_checksum.clone(),
+    });
     state.projection = projection;
     state.last_sequence = expected_last;
     state.last_checksum = Some(batch.batch_checksum.clone());
@@ -2715,6 +3264,7 @@ fn apply_session_batch(
         &batch.transaction_id,
         batch.command_record.as_ref(),
         batch.restart_authorization.as_ref(),
+        batch.command_only_authorization.as_ref(),
         &batch.events,
     )?;
     state.transactions.insert(
@@ -2728,44 +3278,283 @@ fn apply_session_batch(
     Ok(())
 }
 
+fn validate_command_only_authorization(
+    state: &RecoveredSessionState,
+    batch: &StoredSessionBatchV1,
+    catalog_context: &SessionAllocationCatalogContext,
+) -> Result<(), StateStoreError> {
+    let Some(authorization) = &batch.command_only_authorization else {
+        return Ok(());
+    };
+    let command_record = batch
+        .command_record
+        .as_ref()
+        .ok_or(StateStoreError::ProjectionRejected)?;
+    let actual_session = state
+        .projection
+        .session_id
+        .as_ref()
+        .ok_or(StateStoreError::ProjectionRejected)?;
+    let actual_project = state
+        .projection
+        .project_id
+        .as_ref()
+        .ok_or(StateStoreError::ProjectionRejected)?;
+    if actual_session != &state.expected_session_id
+        || catalog_context.project_id(actual_session) != Some(actual_project.0.as_str())
+    {
+        return Err(StateStoreError::ProjectionRejected);
+    }
+
+    let expected = match (authorization.reason, &authorization.command) {
+        (
+            CommandOnlyReasonV1::TurnAlreadyTerminal,
+            ClientCommand::TurnCancel {
+                session_id,
+                turn_id,
+            },
+        ) if session_id == actual_session => {
+            let turn = state
+                .projection
+                .turns
+                .get(&turn_id.0)
+                .ok_or(StateStoreError::ProjectionRejected)?;
+            if !turn.snapshot.status.is_terminal() {
+                return Err(StateStoreError::ProjectionRejected);
+            }
+            CommandReply::success(
+                ClientCommandId(command_record.client_command_id.clone()),
+                CommandResult::TurnAlreadyTerminal {
+                    turn_id: turn_id.clone(),
+                    terminal_status: turn.snapshot.status,
+                    terminal_sequence: turn
+                        .snapshot
+                        .terminal_sequence
+                        .ok_or(StateStoreError::ProjectionRejected)?,
+                },
+            )
+        }
+        (
+            CommandOnlyReasonV1::QuestionAlreadyResolved,
+            ClientCommand::QuestionRespond {
+                session_id,
+                question_id,
+                choice_id,
+            },
+        ) if session_id == actual_session => {
+            let question = state
+                .projection
+                .questions
+                .get(&question_id.0)
+                .ok_or(StateStoreError::ProjectionRejected)?;
+            if question.status != QuestionStatus::Answered
+                || question.session_id != *actual_session
+                || !question
+                    .choices
+                    .iter()
+                    .any(|choice| choice.choice_id == *choice_id)
+            {
+                return Err(StateStoreError::ProjectionRejected);
+            }
+            CommandReply::success(
+                ClientCommandId(command_record.client_command_id.clone()),
+                CommandResult::QuestionAlreadyResolved(question.clone()),
+            )
+        }
+        (
+            CommandOnlyReasonV1::ApprovalAlreadyResolved,
+            ClientCommand::ApprovalRespond {
+                session_id,
+                approval_id,
+                approval_subject_digest,
+                ..
+            },
+        ) if session_id == actual_session => {
+            let approval = state
+                .projection
+                .approvals
+                .get(&approval_id.0)
+                .ok_or(StateStoreError::ProjectionRejected)?;
+            if matches!(
+                approval.status,
+                ApprovalStatus::Pending | ApprovalStatus::OwnerTurnAborted
+            ) || approval.session_id != *actual_session
+                || approval.approval_subject_digest != *approval_subject_digest
+            {
+                return Err(StateStoreError::ProjectionRejected);
+            }
+            CommandReply::success(
+                ClientCommandId(command_record.client_command_id.clone()),
+                CommandResult::ApprovalAlreadyResolved(approval.clone()),
+            )
+        }
+        (
+            CommandOnlyReasonV1::TurnOwnershipMismatch,
+            ClientCommand::TurnCancel {
+                session_id,
+                turn_id,
+            },
+        ) => {
+            validate_mismatched_requested_session(catalog_context, actual_session, session_id)?;
+            if !state.projection.turns.contains_key(&turn_id.0) {
+                return Err(StateStoreError::ProjectionRejected);
+            }
+            command_only_ownership_reply(
+                command_record,
+                ProtocolErrorCode::TurnOwnershipMismatch,
+                format!(
+                    "turn `{}` does not belong to session `{}`",
+                    turn_id.0, session_id.0
+                ),
+            )?
+        }
+        (
+            CommandOnlyReasonV1::QuestionOwnershipMismatch,
+            ClientCommand::QuestionRespond {
+                session_id,
+                question_id,
+                choice_id,
+            },
+        ) => {
+            validate_mismatched_requested_session(catalog_context, actual_session, session_id)?;
+            let question = state
+                .projection
+                .questions
+                .get(&question_id.0)
+                .ok_or(StateStoreError::ProjectionRejected)?;
+            if question.session_id != *actual_session
+                || !question
+                    .choices
+                    .iter()
+                    .any(|choice| choice.choice_id == *choice_id)
+            {
+                return Err(StateStoreError::ProjectionRejected);
+            }
+            command_only_ownership_reply(
+                command_record,
+                ProtocolErrorCode::QuestionOwnershipMismatch,
+                format!("question does not belong to session `{}`", session_id.0),
+            )?
+        }
+        (
+            CommandOnlyReasonV1::ApprovalOwnershipMismatch,
+            ClientCommand::ApprovalRespond {
+                session_id,
+                approval_id,
+                approval_subject_digest,
+                ..
+            },
+        ) => {
+            validate_mismatched_requested_session(catalog_context, actual_session, session_id)?;
+            let approval = state
+                .projection
+                .approvals
+                .get(&approval_id.0)
+                .ok_or(StateStoreError::ProjectionRejected)?;
+            if approval.session_id != *actual_session
+                || approval.approval_subject_digest != *approval_subject_digest
+            {
+                return Err(StateStoreError::ProjectionRejected);
+            }
+            command_only_ownership_reply(
+                command_record,
+                ProtocolErrorCode::ApprovalOwnershipMismatch,
+                format!("approval does not belong to session `{}`", session_id.0),
+            )?
+        }
+        _ => return Err(StateStoreError::ProjectionRejected),
+    };
+    let expected_raw =
+        serde_json::to_vec(&expected).map_err(|_| StateStoreError::IncompatibleSchema)?;
+    if command_record.decode_reply()? != expected_raw {
+        return Err(StateStoreError::ProjectionRejected);
+    }
+    Ok(())
+}
+
+fn validate_mismatched_requested_session(
+    catalog_context: &SessionAllocationCatalogContext,
+    actual_session: &SessionId,
+    requested_session: &SessionId,
+) -> Result<(), StateStoreError> {
+    if requested_session == actual_session
+        || catalog_context.project_id(requested_session).is_none()
+    {
+        return Err(StateStoreError::ProjectionRejected);
+    }
+    Ok(())
+}
+
 fn session_plan_digest(
     session_id: &SessionId,
     transaction_id: &str,
     command_record: Option<&StoredCommandRecordV1>,
     restart_authorization: Option<&StoredRestartAuthorizationV1>,
+    command_only_authorization: Option<&StoredCommandOnlyAuthorizationV1>,
     events: &[StoredSessionEventV1],
 ) -> Result<String, StateStoreError> {
     if transaction_id.is_empty() {
         return Err(StateStoreError::SequenceMismatch);
     }
-    let canonical = serde_json::to_vec(&(
-        "alda-session-plan-v1",
-        &session_id.0,
-        transaction_id,
-        command_record,
-        restart_authorization,
-        events,
-    ))
+    let canonical = if let Some(authorization) = command_only_authorization {
+        serde_json::to_vec(&(
+            "alda-session-plan-v1",
+            &session_id.0,
+            transaction_id,
+            command_record,
+            restart_authorization,
+            authorization,
+            events,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            "alda-session-plan-v1",
+            &session_id.0,
+            transaction_id,
+            command_record,
+            restart_authorization,
+            events,
+        ))
+    }
     .map_err(|_| StateStoreError::IncompatibleSchema)?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
 
 fn session_batch_checksum(batch: &StoredSessionBatchV1) -> Result<String, StateStoreError> {
-    let canonical = serde_json::to_vec(&(
-        "alda-session-batch-v1",
-        batch.schema_version,
-        &batch.session_id,
-        &batch.stream_id,
-        batch.epoch,
-        &batch.transaction_id,
-        batch.event_count,
-        batch.first_sequence,
-        batch.last_sequence,
-        &batch.command_record,
-        &batch.restart_authorization,
-        &batch.events,
-        &batch.previous_batch_checksum,
-    ))
+    let canonical = if let Some(authorization) = &batch.command_only_authorization {
+        serde_json::to_vec(&(
+            "alda-session-batch-v1",
+            batch.schema_version,
+            &batch.session_id,
+            &batch.stream_id,
+            batch.epoch,
+            &batch.transaction_id,
+            batch.event_count,
+            batch.first_sequence,
+            batch.last_sequence,
+            &batch.command_record,
+            &batch.restart_authorization,
+            authorization,
+            &batch.events,
+            &batch.previous_batch_checksum,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            "alda-session-batch-v1",
+            batch.schema_version,
+            &batch.session_id,
+            &batch.stream_id,
+            batch.epoch,
+            &batch.transaction_id,
+            batch.event_count,
+            batch.first_sequence,
+            batch.last_sequence,
+            &batch.command_record,
+            &batch.restart_authorization,
+            &batch.events,
+            &batch.previous_batch_checksum,
+        ))
+    }
     .map_err(|_| StateStoreError::IncompatibleSchema)?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
@@ -2798,6 +3587,7 @@ fn load_session_checkpoint(
     rollout_file: &mut File,
     expected_session: &SessionId,
     state_instance_id: &str,
+    catalog_context: &SessionAllocationCatalogContext,
 ) -> Result<Option<RecoveredSessionState>, StateStoreError> {
     let fd = match openat(
         session_dir,
@@ -2897,7 +3687,7 @@ fn load_session_checkpoint(
         let Ok(batch) = serde_json::from_slice::<StoredSessionBatchV1>(&line) else {
             return Ok(None);
         };
-        if apply_session_batch(&mut anchored, &batch).is_err() {
+        if apply_session_batch(&mut anchored, &batch, catalog_context).is_err() {
             return Ok(None);
         }
         anchored.valid_bytes = anchored
@@ -2925,6 +3715,7 @@ fn open_session_writer_with_lease(
     session_id: SessionId,
     key: &str,
     init_failpoint: Option<InitFailpoint>,
+    catalog_context: SessionAllocationCatalogContext,
 ) -> Result<OpenSessionWriter, (SessionWriterLease, StateStoreError)> {
     let session_dir = match ensure_directory(
         &lease.inner.sessions,
@@ -2944,9 +3735,19 @@ fn open_session_writer_with_lease(
         &mut file,
         &session_id,
         &lease.inner.instance_id,
+        &catalog_context,
     ) {
-        Ok(Some(state)) => scan_session_log_from(&mut file, state),
-        Ok(None) | Err(_) => scan_session_log(&mut file, &session_id, &lease.inner.instance_id),
+        Ok(Some(state)) => {
+            #[cfg(test)]
+            SESSION_CHECKPOINT_LOAD_OBSERVED.set(true);
+            scan_session_log_from(&mut file, state, &catalog_context)
+        }
+        Ok(None) | Err(_) => scan_session_log(
+            &mut file,
+            &session_id,
+            &lease.inner.instance_id,
+            &catalog_context,
+        ),
     };
     match scan {
         Ok(SessionScanOutcome::Clean(state)) => {
@@ -2958,6 +3759,7 @@ fn open_session_writer_with_lease(
                 session_dir,
                 file,
                 state,
+                catalog_context,
                 #[cfg(test)]
                 failpoint: None,
                 #[cfg(test)]
@@ -2976,6 +3778,7 @@ fn open_session_writer_with_lease(
                 valid_bytes: state.valid_bytes,
                 damaged_bytes,
                 tail_digest,
+                catalog_context,
                 #[cfg(test)]
                 repair_failpoint: None,
             },
@@ -2988,6 +3791,7 @@ fn recover_session_with_lease(
     lease: SessionWriterLease,
     session_dir: OwnedFd,
     session_id: SessionId,
+    catalog_context: SessionAllocationCatalogContext,
     #[cfg(test)] recovery_failpoint: Option<RecoveryFailpoint>,
 ) -> SessionRecoveryOutcome {
     let mut file = match open_rollout(&session_dir) {
@@ -3005,9 +3809,15 @@ fn recover_session_with_lease(
         &mut file,
         &session_id,
         &lease.inner.instance_id,
+        &catalog_context,
     ) {
-        Ok(Some(state)) => scan_session_log_from(&mut file, state),
-        Ok(None) | Err(_) => scan_session_log(&mut file, &session_id, &lease.inner.instance_id),
+        Ok(Some(state)) => scan_session_log_from(&mut file, state, &catalog_context),
+        Ok(None) | Err(_) => scan_session_log(
+            &mut file,
+            &session_id,
+            &lease.inner.instance_id,
+            &catalog_context,
+        ),
     };
     match scan {
         Ok(SessionScanOutcome::Clean(state))
@@ -3024,6 +3834,7 @@ fn recover_session_with_lease(
                 session_dir,
                 file,
                 state,
+                catalog_context,
                 #[cfg(test)]
                 failpoint: None,
                 #[cfg(test)]
@@ -3041,6 +3852,7 @@ fn recover_session_with_lease(
             valid_bytes: state.valid_bytes,
             damaged_bytes,
             tail_digest,
+            catalog_context,
             #[cfg(test)]
             repair_failpoint: None,
         }),
@@ -3060,6 +3872,8 @@ fn empty_session_state(session_id: SessionId, state_instance_id: String) -> Reco
         last_checksum: None,
         projection: SessionRolloutProjection::default(),
         events: Vec::new(),
+        restart_authorizations: BTreeMap::new(),
+        batch_heads: Vec::new(),
         commands: BTreeMap::new(),
         transactions: BTreeMap::new(),
         valid_bytes: 0,
@@ -3100,8 +3914,7 @@ fn open_or_create_rollout(
     session_dir: &OwnedFd,
     failpoint: Option<InitFailpoint>,
 ) -> Result<File, StateStoreError> {
-    // B3b shares the B3a durable file-create stages. The distinct Session
-    // directory stages are represented separately above.
+    // B3b 与 B3a 共享 durable file-create stage；Session 特有的目录 stage 已在上方单独表示。
     super::inject_init(
         failpoint,
         InitFailpoint::RolloutCreate,
@@ -3308,6 +4121,23 @@ mod tests {
         StateStore::open(root.path(), StateStoreInstanceLease::for_tests()).expect("open state")
     }
 
+    fn empty_catalog() -> SessionAllocationCatalogContext {
+        SessionAllocationCatalogContext::for_test([])
+    }
+
+    fn command_only_catalog(
+        actual_session: &SessionId,
+        requested_session: &SessionId,
+    ) -> SessionAllocationCatalogContext {
+        SessionAllocationCatalogContext::for_test([
+            (actual_session.clone(), ProjectId("project-1".to_owned())),
+            (
+                requested_session.clone(),
+                ProjectId("project-other".to_owned()),
+            ),
+        ])
+    }
+
     fn session(value: &str) -> SessionId {
         SessionId(value.to_owned())
     }
@@ -3316,6 +4146,20 @@ mod tests {
         match store
             .open_session_writer(session_id.clone())
             .expect("open Session writer")
+        {
+            OpenSessionWriter::Ready(writer) => writer,
+            OpenSessionWriter::RepairRequired(_) => panic!("unexpected incomplete tail"),
+        }
+    }
+
+    fn ready_with_catalog(
+        store: &StateStore,
+        session_id: &SessionId,
+        catalog: SessionAllocationCatalogContext,
+    ) -> ReadySessionWriter {
+        match store
+            .open_session_writer_with_catalog(session_id.clone(), catalog)
+            .expect("open Session writer with catalog")
         {
             OpenSessionWriter::Ready(writer) => writer,
             OpenSessionWriter::RepairRequired(_) => panic!("unexpected incomplete tail"),
@@ -3339,6 +4183,25 @@ mod tests {
             &reply(command_id),
         )
         .expect("command record")
+    }
+
+    fn command_only_request(
+        command_id: &str,
+        command: ClientCommand,
+        reason: CommandOnlyReasonV1,
+        reply: CommandReply,
+    ) -> SessionAppendRequest {
+        let digest =
+            external_command_payload_digest(PROTOCOL_VERSION, &command).expect("command digest");
+        let raw = serde_json::to_vec(&reply).expect("canonical reply");
+        drop(reply);
+        let record =
+            StoredCommandRecordV1::new("client", command_id, digest, &raw).expect("command record");
+        SessionAppendRequest::new_command_only(
+            format!("tx-{command_id}"),
+            record,
+            StoredCommandOnlyAuthorizationV1::new(command, reason),
+        )
     }
 
     fn subject_inputs() -> ApprovalSubjectInputsV1 {
@@ -3495,6 +4358,7 @@ mod tests {
             command_record,
             events,
             restart_authorization: None,
+            command_only_authorization: None,
         }) {
             Ok((writer, _)) => writer,
             Err(_) => panic!("append should succeed"),
@@ -3650,86 +4514,581 @@ mod tests {
     }
 
     #[test]
-    fn event_and_command_only_batches_preserve_head_chain_and_exact_reply() {
+    fn command_only_authorization_accepts_all_six_reasons_at_exact_pre_head() {
+        let actual = session("session-command-only-owner");
+        let requested = session("session-command-only-requested");
+        let catalog = command_only_catalog(&actual, &requested);
+        let mut state = state_after(
+            &actual,
+            &finished_vector(&actual, "turn-command-only", ApprovalDecision::Approve),
+        );
+        let initial_sequence = state.last_sequence;
+        let question = state
+            .projection
+            .questions
+            .get("question-turn-command-only")
+            .expect("question")
+            .clone();
+        let approval = state
+            .projection
+            .approvals
+            .get("approval-turn-command-only")
+            .expect("approval")
+            .clone();
+        let turn_id = TurnId("turn-command-only".to_owned());
+        let question_id = QuestionId("question-turn-command-only".to_owned());
+        let approval_id = ApprovalId("approval-turn-command-only".to_owned());
+        let vectors = vec![
+            command_only_request(
+                "terminal",
+                ClientCommand::TurnCancel {
+                    session_id: actual.clone(),
+                    turn_id: turn_id.clone(),
+                },
+                CommandOnlyReasonV1::TurnAlreadyTerminal,
+                CommandReply::success(
+                    ClientCommandId("terminal".to_owned()),
+                    CommandResult::TurnAlreadyTerminal {
+                        turn_id: turn_id.clone(),
+                        terminal_status: TurnStatus::Succeeded,
+                        terminal_sequence: 7,
+                    },
+                ),
+            ),
+            command_only_request(
+                "question-resolved",
+                ClientCommand::QuestionRespond {
+                    session_id: actual.clone(),
+                    question_id: question_id.clone(),
+                    choice_id: ChoiceId("bars_8".to_owned()),
+                },
+                CommandOnlyReasonV1::QuestionAlreadyResolved,
+                CommandReply::success(
+                    ClientCommandId("question-resolved".to_owned()),
+                    CommandResult::QuestionAlreadyResolved(question.clone()),
+                ),
+            ),
+            command_only_request(
+                "approval-resolved",
+                ClientCommand::ApprovalRespond {
+                    session_id: actual.clone(),
+                    approval_id: approval_id.clone(),
+                    approval_subject_digest: digest("turn-command-only"),
+                    decision: ApprovalDecision::Deny,
+                },
+                CommandOnlyReasonV1::ApprovalAlreadyResolved,
+                CommandReply::success(
+                    ClientCommandId("approval-resolved".to_owned()),
+                    CommandResult::ApprovalAlreadyResolved(approval.clone()),
+                ),
+            ),
+            command_only_request(
+                "turn-owner",
+                ClientCommand::TurnCancel {
+                    session_id: requested.clone(),
+                    turn_id: turn_id.clone(),
+                },
+                CommandOnlyReasonV1::TurnOwnershipMismatch,
+                CommandReply::error(
+                    ClientCommandId("turn-owner".to_owned()),
+                    ProtocolErrorCode::TurnOwnershipMismatch,
+                    format!(
+                        "turn `{}` does not belong to session `{}`",
+                        turn_id.0, requested.0
+                    ),
+                ),
+            ),
+            command_only_request(
+                "question-owner",
+                ClientCommand::QuestionRespond {
+                    session_id: requested.clone(),
+                    question_id: question_id.clone(),
+                    choice_id: ChoiceId("bars_8".to_owned()),
+                },
+                CommandOnlyReasonV1::QuestionOwnershipMismatch,
+                CommandReply::error(
+                    ClientCommandId("question-owner".to_owned()),
+                    ProtocolErrorCode::QuestionOwnershipMismatch,
+                    format!("question does not belong to session `{}`", requested.0),
+                ),
+            ),
+            command_only_request(
+                "approval-owner",
+                ClientCommand::ApprovalRespond {
+                    session_id: requested.clone(),
+                    approval_id,
+                    approval_subject_digest: digest("turn-command-only"),
+                    decision: ApprovalDecision::Approve,
+                },
+                CommandOnlyReasonV1::ApprovalOwnershipMismatch,
+                CommandReply::error(
+                    ClientCommandId("approval-owner".to_owned()),
+                    ProtocolErrorCode::ApprovalOwnershipMismatch,
+                    format!("approval does not belong to session `{}`", requested.0),
+                ),
+            ),
+        ];
+
+        for request in vectors {
+            let previous_checksum = state.last_checksum.clone();
+            let PreparedSessionAppend::Batch(batch, next) =
+                prepare_session_batch(&state, request, &catalog).expect("authorized batch")
+            else {
+                panic!("new command must append");
+            };
+            let mut replayed = state.clone();
+            apply_session_batch(&mut replayed, &batch, &catalog).expect("authorized replay");
+            assert_eq!(replayed.last_sequence, initial_sequence);
+            assert_ne!(replayed.last_checksum, previous_checksum);
+            assert_eq!(replayed.last_checksum, next.last_checksum);
+            state = next;
+        }
+        assert_eq!(state.commands.len(), 6);
+    }
+
+    #[test]
+    fn command_only_authorization_rejects_tampered_shape_state_and_catalog() {
+        let actual = session("session-command-only-negative-owner");
+        let requested = session("session-command-only-negative-requested");
+        let catalog = command_only_catalog(&actual, &requested);
+        let state = state_after(
+            &actual,
+            &finished_vector(&actual, "turn-negative", ApprovalDecision::Approve),
+        );
+        let turn_id = TurnId("turn-negative".to_owned());
+        let terminal_command = ClientCommand::TurnCancel {
+            session_id: actual.clone(),
+            turn_id: turn_id.clone(),
+        };
+        let terminal_reply = |command_id: &str| {
+            CommandReply::success(
+                ClientCommandId(command_id.to_owned()),
+                CommandResult::TurnAlreadyTerminal {
+                    turn_id: turn_id.clone(),
+                    terminal_status: TurnStatus::Succeeded,
+                    terminal_sequence: 7,
+                },
+            )
+        };
+
+        let mut wrong_reason = command_only_request(
+            "wrong-reason",
+            terminal_command.clone(),
+            CommandOnlyReasonV1::TurnAlreadyTerminal,
+            terminal_reply("wrong-reason"),
+        );
+        wrong_reason
+            .command_only_authorization
+            .as_mut()
+            .expect("authorization")
+            .reason = CommandOnlyReasonV1::QuestionAlreadyResolved;
+
+        let wrong_target_command = ClientCommand::TurnCancel {
+            session_id: actual.clone(),
+            turn_id: TurnId("missing-turn".to_owned()),
+        };
+        let wrong_target = command_only_request(
+            "wrong-target",
+            wrong_target_command,
+            CommandOnlyReasonV1::TurnAlreadyTerminal,
+            CommandReply::success(
+                ClientCommandId("wrong-target".to_owned()),
+                CommandResult::TurnAlreadyTerminal {
+                    turn_id: TurnId("missing-turn".to_owned()),
+                    terminal_status: TurnStatus::Succeeded,
+                    terminal_sequence: 7,
+                },
+            ),
+        );
+
+        let wrong_reply = command_only_request(
+            "wrong-reply",
+            terminal_command.clone(),
+            CommandOnlyReasonV1::TurnAlreadyTerminal,
+            CommandReply::success(
+                ClientCommandId("wrong-reply".to_owned()),
+                CommandResult::TurnAlreadyTerminal {
+                    turn_id: turn_id.clone(),
+                    terminal_status: TurnStatus::Failed,
+                    terminal_sequence: 6,
+                },
+            ),
+        );
+
+        let mut wrong_digest = command_only_request(
+            "wrong-digest",
+            terminal_command.clone(),
+            CommandOnlyReasonV1::TurnAlreadyTerminal,
+            terminal_reply("wrong-digest"),
+        );
+        wrong_digest
+            .command_record
+            .as_mut()
+            .expect("command")
+            .payload_digest = format!("sha256:{}", "0".repeat(64));
+
+        let wrong_variant = command_only_request(
+            "wrong-variant",
+            ClientCommand::Initialize,
+            CommandOnlyReasonV1::TurnAlreadyTerminal,
+            terminal_reply("wrong-variant"),
+        );
+
+        let mismatch_command = ClientCommand::TurnCancel {
+            session_id: requested.clone(),
+            turn_id: turn_id.clone(),
+        };
+        let wrong_message = command_only_request(
+            "wrong-message",
+            mismatch_command.clone(),
+            CommandOnlyReasonV1::TurnOwnershipMismatch,
+            CommandReply::error(
+                ClientCommandId("wrong-message".to_owned()),
+                ProtocolErrorCode::TurnOwnershipMismatch,
+                "wrong literal",
+            ),
+        );
+        let wrong_details = command_only_request(
+            "wrong-details",
+            mismatch_command,
+            CommandOnlyReasonV1::TurnOwnershipMismatch,
+            CommandReply::error_with_details(
+                ClientCommandId("wrong-details".to_owned()),
+                ProtocolErrorCode::TurnOwnershipMismatch,
+                format!(
+                    "turn `{}` does not belong to session `{}`",
+                    turn_id.0, requested.0
+                ),
+                Some(crate::protocol::ProtocolErrorDetails {
+                    expected_epoch: None,
+                    actual_epoch: None,
+                    head_sequence: Some(7),
+                    recovery_action: crate::protocol::RecoveryAction::None,
+                }),
+            ),
+        );
+        let same_requested_session = command_only_request(
+            "same-requested-session",
+            ClientCommand::TurnCancel {
+                session_id: actual.clone(),
+                turn_id: turn_id.clone(),
+            },
+            CommandOnlyReasonV1::TurnOwnershipMismatch,
+            CommandReply::error(
+                ClientCommandId("same-requested-session".to_owned()),
+                ProtocolErrorCode::TurnOwnershipMismatch,
+                format!(
+                    "turn `{}` does not belong to session `{}`",
+                    turn_id.0, actual.0
+                ),
+            ),
+        );
+        let question = state
+            .projection
+            .questions
+            .get("question-turn-negative")
+            .expect("question")
+            .clone();
+        let invalid_choice = command_only_request(
+            "invalid-choice",
+            ClientCommand::QuestionRespond {
+                session_id: actual.clone(),
+                question_id: QuestionId("question-turn-negative".to_owned()),
+                choice_id: ChoiceId("not-offered".to_owned()),
+            },
+            CommandOnlyReasonV1::QuestionAlreadyResolved,
+            CommandReply::success(
+                ClientCommandId("invalid-choice".to_owned()),
+                CommandResult::QuestionAlreadyResolved(question),
+            ),
+        );
+        let approval = state
+            .projection
+            .approvals
+            .get("approval-turn-negative")
+            .expect("approval")
+            .clone();
+        let subject_mismatch = command_only_request(
+            "subject-mismatch",
+            ClientCommand::ApprovalRespond {
+                session_id: actual.clone(),
+                approval_id: ApprovalId("approval-turn-negative".to_owned()),
+                approval_subject_digest: digest("different-turn"),
+                decision: ApprovalDecision::Approve,
+            },
+            CommandOnlyReasonV1::ApprovalAlreadyResolved,
+            CommandReply::success(
+                ClientCommandId("subject-mismatch".to_owned()),
+                CommandResult::ApprovalAlreadyResolved(approval),
+            ),
+        );
+
+        for request in [
+            wrong_reason,
+            wrong_target,
+            wrong_reply,
+            wrong_digest,
+            wrong_variant,
+            wrong_message,
+            wrong_details,
+            same_requested_session,
+            invalid_choice,
+            subject_mismatch,
+        ] {
+            assert!(matches!(
+                prepare_session_batch(&state, request, &catalog),
+                Err(StateStoreError::ProjectionRejected | StateStoreError::IncompatibleSchema)
+            ));
+        }
+
+        let missing_requested = session("session-not-allocated");
+        let mismatch_command = ClientCommand::TurnCancel {
+            session_id: missing_requested.clone(),
+            turn_id: turn_id.clone(),
+        };
+        let missing_catalog_request = command_only_request(
+            "missing-requested",
+            mismatch_command,
+            CommandOnlyReasonV1::TurnOwnershipMismatch,
+            CommandReply::error(
+                ClientCommandId("missing-requested".to_owned()),
+                ProtocolErrorCode::TurnOwnershipMismatch,
+                format!(
+                    "turn `{}` does not belong to session `{}`",
+                    turn_id.0, missing_requested.0
+                ),
+            ),
+        );
+        assert!(matches!(
+            prepare_session_batch(&state, missing_catalog_request, &catalog),
+            Err(StateStoreError::ProjectionRejected)
+        ));
+
+        let wrong_actual_catalog = SessionAllocationCatalogContext::for_test([
+            (actual.clone(), ProjectId("wrong-project".to_owned())),
+            (requested, ProjectId("project-other".to_owned())),
+        ]);
+        let wrong_actual_request = command_only_request(
+            "wrong-actual-owner",
+            terminal_command.clone(),
+            CommandOnlyReasonV1::TurnAlreadyTerminal,
+            terminal_reply("wrong-actual-owner"),
+        );
+        assert!(matches!(
+            prepare_session_batch(&state, wrong_actual_request, &wrong_actual_catalog),
+            Err(StateStoreError::ProjectionRejected)
+        ));
+
+        let pre_head_zero_request = command_only_request(
+            "pre-head-zero",
+            terminal_command,
+            CommandOnlyReasonV1::TurnAlreadyTerminal,
+            terminal_reply("pre-head-zero"),
+        );
+        assert!(matches!(
+            StoredSessionPlanV1::from_append_request(
+                &actual,
+                &ProjectId("project-1".to_owned()),
+                0,
+                None,
+                &pre_head_zero_request,
+            ),
+            Err(StateStoreError::ProjectionRejected)
+        ));
+    }
+
+    #[test]
+    fn command_only_authorization_survives_checkpoint_full_replay_and_poisoned_rescan() {
         let root = tempfile::tempdir().expect("tempdir");
         make_private(&root);
-        let id = session("session-command-only");
+        let actual = session("session-command-only-replay-owner");
+        let requested = session("session-command-only-replay-requested");
+        let catalog = command_only_catalog(&actual, &requested);
         let store = open_store(&root);
         let writer = append(
-            ready(&store, &id),
-            "start",
-            Some(command("start", '1')),
-            vec![SessionRolloutEvent::SessionStarted {
-                session_id: id.clone(),
-                project_id: ProjectId("project-1".to_owned()),
-            }],
+            ready_with_catalog(&store, &actual, catalog.clone()),
+            "base-events",
+            None,
+            finished_vector(&actual, "turn-replay", ApprovalDecision::Approve),
         );
-        let writer = append(writer, "reject-1", Some(command("reject-1", '2')), vec![]);
-        let first_anchor = writer.state.last_checksum.clone();
-        let writer = append(writer, "reject-2", Some(command("reject-2", '3')), vec![]);
-        assert_eq!(writer.state.last_sequence, 1);
-        assert_ne!(writer.state.last_checksum, first_anchor);
-        let writer = append(
-            writer,
-            "turn",
-            Some(command("turn", '4')),
-            vec![SessionRolloutEvent::TurnStarted {
-                turn_id: TurnId("turn-1".to_owned()),
-                canonical_prompt: "prompt".to_owned(),
-            }],
-        );
-        let writer = match writer.append(SessionAppendRequest {
-            transaction_id: "turn".to_owned(),
-            command_record: Some(command("turn", '4')),
-            events: vec![SessionRolloutEvent::TurnStarted {
-                turn_id: TurnId("different-turn".to_owned()),
-                canonical_prompt: "different prompt".to_owned(),
-            }],
-            restart_authorization: None,
-        }) {
-            Err(SessionAppendFailure::Rejected { writer, error }) => {
-                assert!(matches!(error, StateStoreError::IdempotencyConflict));
-                writer
-            }
-            _ => panic!("same transaction and command must not hide a different Session plan"),
+        writer.write_checkpoint().expect("base checkpoint");
+        let terminal = |command_id: &str| {
+            command_only_request(
+                command_id,
+                ClientCommand::TurnCancel {
+                    session_id: actual.clone(),
+                    turn_id: TurnId("turn-replay".to_owned()),
+                },
+                CommandOnlyReasonV1::TurnAlreadyTerminal,
+                CommandReply::success(
+                    ClientCommandId(command_id.to_owned()),
+                    CommandResult::TurnAlreadyTerminal {
+                        turn_id: TurnId("turn-replay".to_owned()),
+                        terminal_status: TurnStatus::Succeeded,
+                        terminal_sequence: 7,
+                    },
+                ),
+            )
         };
-        writer.write_checkpoint().expect("checkpoint");
+        let ownership = |command_id: &str| {
+            command_only_request(
+                command_id,
+                ClientCommand::TurnCancel {
+                    session_id: requested.clone(),
+                    turn_id: TurnId("turn-replay".to_owned()),
+                },
+                CommandOnlyReasonV1::TurnOwnershipMismatch,
+                CommandReply::error(
+                    ClientCommandId(command_id.to_owned()),
+                    ProtocolErrorCode::TurnOwnershipMismatch,
+                    format!(
+                        "turn `turn-replay` does not belong to session `{}`",
+                        requested.0
+                    ),
+                ),
+            )
+        };
+        let (writer, _) = match writer.append(terminal("checkpoint-tail")) {
+            Ok(value) => value,
+            Err(_) => panic!("tail append must succeed"),
+        };
         let expected_checksum = writer.state.last_checksum.clone();
         drop(writer);
         drop(store);
 
+        reset_checkpoint_load_observed();
         let store = open_store(&root);
-        let writer = ready(&store, &id);
-        assert_eq!(writer.state.last_sequence, 2);
+        let mut writer = ready_with_catalog(&store, &actual, catalog.clone());
+        assert!(checkpoint_load_observed());
+        assert_eq!(writer.state.last_sequence, 7);
         assert_eq!(writer.state.last_checksum, expected_checksum);
-        assert_eq!(writer.state.commands.len(), 4);
-        let duplicate = writer.append(SessionAppendRequest {
-            transaction_id: "different-transaction".to_owned(),
-            command_record: Some(command("reject-1", '2')),
-            events: Vec::new(),
-            restart_authorization: None,
-        });
-        let (writer, outcome) = match duplicate {
-            Ok(value) => value,
-            Err(_) => panic!("exact duplicate"),
+        writer.set_failpoint(AppendFailpoint::AfterSyncBeforeUpdate);
+        let poisoned = match writer.append(ownership("poisoned-rescan")) {
+            Err(SessionAppendFailure::Poisoned { writer, .. }) => writer,
+            _ => panic!("injected post-sync failure must poison writer"),
         };
-        assert!(!outcome.appended);
-        assert_eq!(outcome.stable_reply, Some(reply("reject-1")));
-        assert_eq!(writer.state.last_sequence, 2);
+        let writer = match poisoned.recover() {
+            SessionRecoveryOutcome::Ready(writer) => writer,
+            SessionRecoveryOutcome::RepairRequired(_) | SessionRecoveryOutcome::Corrupt(_) => {
+                panic!("durable command-only line must rescan cleanly")
+            }
+        };
+        assert_eq!(writer.state.last_sequence, 7);
+        assert_eq!(writer.state.commands.len(), 2);
+        drop(writer);
+        drop(store);
 
-        let conflict = writer.append(SessionAppendRequest {
-            transaction_id: "conflict".to_owned(),
-            command_record: Some(command("reject-1", '9')),
-            events: Vec::new(),
-            restart_authorization: None,
-        });
+        fs::remove_file(checkpoint_path(&root, &actual)).expect("remove checkpoint fixture");
+        let store = open_store(&root);
+        let writer = ready_with_catalog(&store, &actual, catalog.clone());
+        assert_eq!(writer.state.last_sequence, 7);
+        assert_eq!(writer.state.commands.len(), 2);
+        drop(writer);
+        drop(store);
+
+        let missing_requested = SessionAllocationCatalogContext::for_test([(
+            actual.clone(),
+            ProjectId("project-1".to_owned()),
+        )]);
+        let store = open_store(&root);
         assert!(matches!(
-            conflict,
-            Err(SessionAppendFailure::Rejected {
-                error: StateStoreError::IdempotencyConflict,
-                ..
-            })
+            store.open_session_writer_with_catalog(actual, missing_requested),
+            Err(StateStoreError::ProjectionRejected)
         ));
+    }
+
+    #[test]
+    fn command_only_none_preserves_legacy_nonempty_serialization_and_digests() {
+        #[derive(Serialize)]
+        struct LegacyPlan<'a> {
+            schema_version: u32,
+            session_id: &'a str,
+            expected_project_id: &'a str,
+            expected_pre_sequence: u64,
+            expected_pre_batch_checksum: &'a Option<String>,
+            transaction_id: &'a str,
+            command_record: &'a Option<StoredCommandRecordV1>,
+            restart_authorization: &'a Option<StoredRestartAuthorizationV1>,
+            events: &'a [StoredSessionEventV1],
+            canonical_plan_digest: &'a str,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyBatch<'a> {
+            schema_version: u32,
+            session_id: &'a str,
+            stream_id: &'a str,
+            epoch: u64,
+            transaction_id: &'a str,
+            event_count: u64,
+            first_sequence: u64,
+            last_sequence: u64,
+            command_record: &'a Option<StoredCommandRecordV1>,
+            restart_authorization: &'a Option<StoredRestartAuthorizationV1>,
+            events: &'a [StoredSessionEventV1],
+            previous_batch_checksum: &'a Option<String>,
+            batch_checksum: &'a str,
+        }
+
+        let session_id = session("session-command-only-legacy");
+        let request = SessionAppendRequest::new(
+            "legacy-transaction".to_owned(),
+            None,
+            vec![SessionRolloutEvent::SessionStarted {
+                session_id: session_id.clone(),
+                project_id: ProjectId("project-1".to_owned()),
+            }],
+        );
+        let plan = StoredSessionPlanV1::from_append_request(
+            &session_id,
+            &ProjectId("project-1".to_owned()),
+            0,
+            None,
+            &request,
+        )
+        .expect("legacy plan");
+        let legacy_plan = LegacyPlan {
+            schema_version: plan.schema_version,
+            session_id: &plan.session_id,
+            expected_project_id: &plan.expected_project_id,
+            expected_pre_sequence: plan.expected_pre_sequence,
+            expected_pre_batch_checksum: &plan.expected_pre_batch_checksum,
+            transaction_id: &plan.transaction_id,
+            command_record: &plan.command_record,
+            restart_authorization: &plan.restart_authorization,
+            events: &plan.events,
+            canonical_plan_digest: &plan.canonical_plan_digest,
+        };
+        assert_eq!(
+            serde_json::to_vec(&plan).expect("new plan bytes"),
+            serde_json::to_vec(&legacy_plan).expect("legacy plan bytes")
+        );
+
+        let state = empty_session_state(session_id.clone(), "test-instance".to_owned());
+        let PreparedSessionAppend::Batch(batch, _) =
+            prepare_session_batch(&state, request, &empty_catalog()).expect("legacy batch")
+        else {
+            panic!("new legacy transaction must append");
+        };
+        let legacy_batch = LegacyBatch {
+            schema_version: batch.schema_version,
+            session_id: &batch.session_id,
+            stream_id: &batch.stream_id,
+            epoch: batch.epoch,
+            transaction_id: &batch.transaction_id,
+            event_count: batch.event_count,
+            first_sequence: batch.first_sequence,
+            last_sequence: batch.last_sequence,
+            command_record: &batch.command_record,
+            restart_authorization: &batch.restart_authorization,
+            events: &batch.events,
+            previous_batch_checksum: &batch.previous_batch_checksum,
+            batch_checksum: &batch.batch_checksum,
+        };
+        assert_eq!(
+            serde_json::to_vec(&batch).expect("new batch bytes"),
+            serde_json::to_vec(&legacy_batch).expect("legacy batch bytes")
+        );
     }
 
     #[test]
@@ -3958,7 +5317,8 @@ mod tests {
 
         let state = state_after(&id, &prefix(&id, "turn-coordinated"));
         let PreparedSessionAppend::Batch(batch, committed) =
-            prepare_session_batch(&state, first.append_request()).expect("coordinated append")
+            prepare_session_batch(&state, first.append_request(), &empty_catalog())
+                .expect("coordinated append")
         else {
             panic!("first coordinated append cannot be idempotent");
         };
@@ -3985,7 +5345,7 @@ mod tests {
             .expect("command")
             .client_id = "__alda_internal_forged".to_owned();
         assert!(matches!(
-            prepare_session_batch(&state, wrong_namespace),
+            prepare_session_batch(&state, wrong_namespace, &empty_catalog()),
             Err(StateStoreError::ProjectionRejected)
         ));
 
@@ -3993,7 +5353,7 @@ mod tests {
         wrong_transaction.transaction_id =
             "global-00000000000000000000000000000000:session".to_owned();
         assert!(matches!(
-            prepare_session_batch(&state, wrong_transaction),
+            prepare_session_batch(&state, wrong_transaction, &empty_catalog()),
             Err(StateStoreError::ProjectionRejected)
         ));
 
@@ -4004,7 +5364,7 @@ mod tests {
             .expect("command")
             .payload_digest = format!("sha256:{}", "0".repeat(64));
         assert!(matches!(
-            prepare_session_batch(&state, wrong_digest),
+            prepare_session_batch(&state, wrong_digest, &empty_catalog()),
             Err(StateStoreError::ProjectionRejected)
         ));
     }
@@ -4034,6 +5394,7 @@ mod tests {
                 canonical_prompt: "prompt".to_owned(),
             }],
             restart_authorization: None,
+            command_only_authorization: None,
         }) {
             Err(SessionAppendFailure::Poisoned { writer, .. }) => writer,
             _ => panic!("must poison"),
@@ -4087,6 +5448,7 @@ mod tests {
                 canonical_prompt: "prompt".to_owned(),
             }],
             restart_authorization: None,
+            command_only_authorization: None,
         }) {
             Err(SessionAppendFailure::Poisoned { writer, .. }) => writer,
             _ => panic!("must poison"),
@@ -4104,6 +5466,7 @@ mod tests {
                 canonical_prompt: "bad".to_owned(),
             }],
             restart_authorization: None,
+            command_only_authorization: None,
         });
         let (writer, outcome) = match retry {
             Ok(value) => value,
@@ -4142,6 +5505,7 @@ mod tests {
                 canonical_prompt: "prompt".to_owned(),
             }],
             restart_authorization: None,
+            command_only_authorization: None,
         })
         else {
             panic!("file sync failure must poison a complete Session line");
@@ -4158,18 +5522,43 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         make_private(&root);
         let id = session("session-checkpoint");
+        let catalog = SessionAllocationCatalogContext::for_test([(
+            id.clone(),
+            ProjectId("project-1".to_owned()),
+        )]);
         let store = open_store(&root);
         let writer = append(
-            ready(&store, &id),
+            ready_with_catalog(&store, &id, catalog.clone()),
             "start",
             Some(command("start", '1')),
-            vec![SessionRolloutEvent::SessionStarted {
-                session_id: id.clone(),
-                project_id: ProjectId("project-1".to_owned()),
-            }],
+            finished_vector(&id, "turn-terminal", ApprovalDecision::Approve),
         );
-        let writer = append(writer, "empty-1", Some(command("empty-1", '2')), vec![]);
-        let writer = append(writer, "empty-2", Some(command("empty-2", '3')), vec![]);
+        let terminal_request = |command_id: &str| {
+            command_only_request(
+                command_id,
+                ClientCommand::TurnCancel {
+                    session_id: id.clone(),
+                    turn_id: TurnId("turn-terminal".to_owned()),
+                },
+                CommandOnlyReasonV1::TurnAlreadyTerminal,
+                CommandReply::success(
+                    ClientCommandId(command_id.to_owned()),
+                    CommandResult::TurnAlreadyTerminal {
+                        turn_id: TurnId("turn-terminal".to_owned()),
+                        terminal_status: TurnStatus::Succeeded,
+                        terminal_sequence: 7,
+                    },
+                ),
+            )
+        };
+        let writer = match writer.append(terminal_request("empty-1")) {
+            Ok((writer, _)) => writer,
+            Err(_) => panic!("first same-head command-only append"),
+        };
+        let writer = match writer.append(terminal_request("empty-2")) {
+            Ok((writer, _)) => writer,
+            Err(_) => panic!("second same-head command-only append"),
+        };
         writer
             .write_checkpoint()
             .expect("checkpoint over empty batches");
@@ -4178,11 +5567,14 @@ mod tests {
             "turn",
             Some(command("turn", '4')),
             vec![SessionRolloutEvent::TurnStarted {
-                turn_id: TurnId("turn-1".to_owned()),
+                turn_id: TurnId("turn-after-checkpoint".to_owned()),
                 canonical_prompt: "prompt".to_owned(),
             }],
         );
-        let writer = append(writer, "empty-3", Some(command("empty-3", '5')), vec![]);
+        let writer = match writer.append(terminal_request("empty-3")) {
+            Ok((writer, _)) => writer,
+            Err(_) => panic!("tail same-head command-only append"),
+        };
         let expected_snapshot = writer.snapshot().expect("snapshot");
         let expected_checksum = writer.state.last_checksum.clone();
         let expected_commands = writer.state.commands.clone();
@@ -4190,7 +5582,7 @@ mod tests {
         drop(store);
 
         let store = open_store(&root);
-        let checkpoint_tail = ready(&store, &id);
+        let checkpoint_tail = ready_with_catalog(&store, &id, catalog.clone());
         assert_eq!(
             checkpoint_tail.snapshot().expect("snapshot"),
             expected_snapshot
@@ -4202,7 +5594,7 @@ mod tests {
 
         fs::write(checkpoint_path(&root, &id), b"corrupt cache").expect("corrupt cache");
         let store = open_store(&root);
-        let full = ready(&store, &id);
+        let full = ready_with_catalog(&store, &id, catalog);
         assert_eq!(full.snapshot().expect("snapshot"), expected_snapshot);
         assert_eq!(full.state.last_checksum, expected_checksum);
         assert_eq!(full.state.commands, expected_commands);
@@ -4222,6 +5614,7 @@ mod tests {
                 project_id: ProjectId("project-1".to_owned()),
             }],
             restart_authorization: None,
+            command_only_authorization: None,
         };
         let digest = request
             .canonical_plan_digest(&id)
@@ -4258,6 +5651,7 @@ mod tests {
                 project_id: ProjectId("project-1".to_owned()),
             }],
             restart_authorization: None,
+            command_only_authorization: None,
         };
         let (writer, retry) = match writer.append(retry) {
             Ok(value) => value,
@@ -4281,6 +5675,7 @@ mod tests {
                 canonical_prompt: "different".to_owned(),
             }],
             restart_authorization: None,
+            command_only_authorization: None,
         };
         let writer = match writer.append(conflict) {
             Err(SessionAppendFailure::Rejected { writer, error }) => {
@@ -4548,6 +5943,7 @@ mod tests {
                     canonical_prompt: "prompt".to_owned(),
                 }],
                 restart_authorization: None,
+                command_only_authorization: None,
             }) {
                 Err(SessionAppendFailure::Rejected { writer, .. }) => {
                     assert_eq!(writer.state.last_sequence, 1);
@@ -4629,6 +6025,7 @@ mod tests {
                     canonical_prompt: "prompt".to_owned(),
                 }],
                 restart_authorization: None,
+                command_only_authorization: None,
             }) {
                 Err(SessionAppendFailure::Poisoned { writer, .. }) => writer,
                 _ => panic!("partial write"),
@@ -4678,6 +6075,7 @@ mod tests {
             last_sequence,
             command_record: None,
             restart_authorization: None,
+            command_only_authorization: None,
             events: events.iter().map(StoredSessionEventV1::from_live).collect(),
             previous_batch_checksum: state.last_checksum.clone(),
             batch_checksum: String::new(),
@@ -4689,7 +6087,7 @@ mod tests {
     fn state_after(id: &SessionId, events: &[SessionRolloutEvent]) -> RecoveredSessionState {
         let mut state = empty_session_state(id.clone(), "test-instance".to_owned());
         let batch = unchecked_batch(&state, events);
-        apply_session_batch(&mut state, &batch).expect("valid prefix");
+        apply_session_batch(&mut state, &batch, &empty_catalog()).expect("valid prefix");
         state
     }
 
@@ -4707,7 +6105,7 @@ mod tests {
             }],
         );
         assert!(matches!(
-            apply_session_batch(&mut state.clone(), &invalid_choice),
+            apply_session_batch(&mut state.clone(), &invalid_choice, &empty_catalog()),
             Err(StateStoreError::ProjectionRejected)
         ));
 
@@ -4724,7 +6122,7 @@ mod tests {
             }],
         );
         assert!(matches!(
-            apply_session_batch(&mut state.clone(), &invalid_digest),
+            apply_session_batch(&mut state.clone(), &invalid_digest, &empty_catalog()),
             Err(StateStoreError::ProjectionRejected)
         ));
 
@@ -4740,7 +6138,7 @@ mod tests {
             }],
         );
         assert!(matches!(
-            apply_session_batch(&mut state.clone(), &wrong_owner),
+            apply_session_batch(&mut state.clone(), &wrong_owner, &empty_catalog()),
             Err(StateStoreError::StreamMismatch)
         ));
 
@@ -4753,7 +6151,7 @@ mod tests {
             }],
         );
         assert!(matches!(
-            apply_session_batch(&mut state.clone(), &terminal_with_pending),
+            apply_session_batch(&mut state.clone(), &terminal_with_pending, &empty_catalog(),),
             Err(StateStoreError::ProjectionRejected)
         ));
 
@@ -4768,7 +6166,7 @@ mod tests {
         bad_sequence.batch_checksum =
             session_batch_checksum(&bad_sequence).expect("recomputed checksum");
         assert!(matches!(
-            apply_session_batch(&mut state.clone(), &bad_sequence),
+            apply_session_batch(&mut state.clone(), &bad_sequence, &empty_catalog()),
             Err(StateStoreError::SequenceMismatch)
         ));
     }
@@ -4791,7 +6189,7 @@ mod tests {
                 }],
             );
             assert!(matches!(
-                apply_session_batch(&mut running.clone(), &batch),
+                apply_session_batch(&mut running.clone(), &batch, &empty_catalog()),
                 Err(StateStoreError::ProjectionRejected)
             ));
         }
@@ -4809,7 +6207,8 @@ mod tests {
         );
         let budget_batch = unchecked_batch(&running, std::slice::from_ref(&budget_event));
         let mut budget_state = running.clone();
-        apply_session_batch(&mut budget_state, &budget_batch).expect("authoritative budget fact");
+        apply_session_batch(&mut budget_state, &budget_batch, &empty_catalog())
+            .expect("authoritative budget fact");
         assert_eq!(
             budget_state
                 .projection
@@ -4849,7 +6248,7 @@ mod tests {
                 ],
             );
             assert!(matches!(
-                apply_session_batch(&mut state.clone(), &batch),
+                apply_session_batch(&mut state.clone(), &batch, &empty_catalog()),
                 Err(StateStoreError::ProjectionRejected)
             ));
         }
@@ -4865,11 +6264,11 @@ mod tests {
             pre_head_sequence: running.last_sequence,
             turn_ids: vec!["turn-direct".to_owned()],
         });
-        // The transaction was not minted by the restart planner for this
-        // state-store instance, even though the outer checksum is recomputed.
+        // 即使重新计算外层 checksum，该 transaction 也不是本 state-store instance 的
+        // restart planner 所铸造。
         forged_restart.batch_checksum = session_batch_checksum(&forged_restart).expect("checksum");
         assert!(matches!(
-            apply_session_batch(&mut running.clone(), &forged_restart),
+            apply_session_batch(&mut running.clone(), &forged_restart, &empty_catalog()),
             Err(StateStoreError::ProjectionRejected)
         ));
     }
@@ -4921,7 +6320,7 @@ mod tests {
         ] {
             let batch = unchecked_batch(&state, &[forged]);
             assert!(matches!(
-                apply_session_batch(&mut state.clone(), &batch),
+                apply_session_batch(&mut state.clone(), &batch, &empty_catalog()),
                 Err(StateStoreError::ProjectionRejected)
             ));
         }
@@ -4939,7 +6338,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            apply_session_batch(&mut state.clone(), &forged_pair),
+            apply_session_batch(&mut state.clone(), &forged_pair, &empty_catalog()),
             Err(StateStoreError::ProjectionRejected)
         ));
     }
@@ -4995,7 +6394,9 @@ mod tests {
                     command_record: None,
                     events: oversized,
                     restart_authorization: None,
-                }
+                    command_only_authorization: None,
+                },
+                &empty_catalog(),
             ),
             Err(StateStoreError::BatchTooLarge)
         ));
@@ -5036,6 +6437,7 @@ mod tests {
                 command_record: None,
                 events: plan.events,
                 restart_authorization: plan.authorization,
+                command_only_authorization: None,
             }) {
                 Err(SessionAppendFailure::Poisoned { writer, .. }) => writer,
                 _ => panic!("restart injected crash"),
@@ -5077,6 +6479,7 @@ mod tests {
                         command_record: None,
                         events: retry.events,
                         restart_authorization: retry.authorization,
+                        command_only_authorization: None,
                     });
                     let writer = match result {
                         Ok((writer, _)) => writer,
@@ -5097,5 +6500,71 @@ mod tests {
                 SessionRecoveryOutcome::Corrupt(_) => panic!("restart batch is recoverable"),
             }
         }
+    }
+
+    #[test]
+    fn published_session_read_state_replays_live_events_and_restart_authorization() {
+        let root = tempfile::tempdir().expect("tempdir");
+        make_private(&root);
+        let id = session("session-published-restart");
+        let store = open_store(&root);
+        let writer = append(ready(&store, &id), "prefix", None, prefix(&id, "turn-1"));
+        let plan = plan_restart_reconciliation(store.instance_id(), writer.projection())
+            .expect("restart planner")
+            .expect("restart work");
+        let writer = match writer.append(plan.into_append_request()) {
+            Ok((writer, _)) => writer,
+            Err(_) => panic!("append restart"),
+        };
+
+        let published = writer.published_read_state().expect("published state");
+        published.validate().expect("replay published state");
+        assert_eq!(published.snapshot().session_id, id);
+        assert_eq!(
+            published.snapshot().turns[0].status,
+            TurnStatus::AbortedByRestart
+        );
+        assert_eq!(published.head().0, 3);
+    }
+
+    #[test]
+    fn published_session_read_state_rejects_event_projection_identity_head_checksum_and_owner_tampering()
+     {
+        let root = tempfile::tempdir().expect("tempdir");
+        make_private(&root);
+        let id = session("session-published-tamper");
+        let store = open_store(&root);
+        let writer = append(ready(&store, &id), "prefix", None, prefix(&id, "turn-1"));
+        let published = writer.published_read_state().expect("published state");
+
+        let mut event = published.clone();
+        let SessionRolloutEvent::TurnStarted {
+            canonical_prompt, ..
+        } = &mut event.events[1]
+        else {
+            panic!("TurnStarted event");
+        };
+        canonical_prompt.push_str("-tampered");
+        assert!(event.validate().is_err());
+
+        let mut projection = published.clone();
+        projection.projection.head_sequence -= 1;
+        assert!(projection.validate().is_err());
+
+        let mut identity = published.clone();
+        identity.expected_session_id = session("session-other");
+        assert!(identity.validate().is_err());
+
+        let mut head = published.clone();
+        head.last_sequence -= 1;
+        assert!(head.validate().is_err());
+
+        let mut checksum = published.clone();
+        checksum.last_checksum = format!("sha256:{}", "f".repeat(64));
+        assert!(checksum.validate().is_err());
+
+        let mut owner = published;
+        owner.snapshot.turns[0].turn_id = TurnId("turn-other".to_owned());
+        assert!(owner.validate().is_err());
     }
 }

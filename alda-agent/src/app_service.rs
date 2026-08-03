@@ -1,3 +1,8 @@
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "Rustdoc 依照仓库语言规范使用中文“错误”标题"
+)]
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -13,6 +18,12 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+use crate::durable_runtime::DurableCursorError;
+use crate::durable_runtime::FatalDurableRuntime;
+use crate::durable_runtime::ReadyDurableRuntime;
+use crate::durable_runtime::RecoveryFailure;
+use crate::durable_runtime::SessionObjectRef;
+use crate::durable_runtime::SubmitFailure;
 use crate::protocol::ApprovalDecision;
 use crate::protocol::ApprovalId;
 use crate::protocol::ApprovalPayload;
@@ -58,16 +69,17 @@ use crate::protocol::TurnId;
 use crate::protocol::TurnSnapshot;
 use crate::protocol::TurnStatus;
 use crate::protocol::{EVENT_PAGE_LIMIT, EventPage, ProtocolErrorDetails, RecoveryAction};
+use crate::state_store::session::INTERNAL_CLIENT_PREFIX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueueCapacity(NonZeroUsize);
 
 impl QueueCapacity {
-    /// Creates a non-zero queue capacity.
+    /// 创建非零队列容量。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns [`InvalidQueueCapacity`] when `value` is zero.
+    /// `value` 为零时返回 [`InvalidQueueCapacity`]。
     pub fn new(value: usize) -> Result<Self, InvalidQueueCapacity> {
         NonZeroUsize::new(value)
             .map(Self)
@@ -93,11 +105,11 @@ type QueryAttempt = (crate::protocol::StreamCursor, std::time::Instant);
 type QueryAttemptProbe = Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<QueryAttempt>>>>;
 
 impl QueryQueueCapacity {
-    /// Creates a non-zero internal query queue capacity.
+    /// 创建非零内部查询队列容量。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns [`InvalidQueueCapacity`] when `value` is zero.
+    /// `value` 为零时返回 [`InvalidQueueCapacity`]。
     pub fn new(value: usize) -> Result<Self, InvalidQueueCapacity> {
         NonZeroUsize::new(value)
             .map(Self)
@@ -164,12 +176,12 @@ impl AppService {
         service
     }
 
-    /// Enqueues a command without waiting for the actor to process it.
+    /// 命令入队后立即返回，不等待 actor 处理。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns [`SubmitError::Overloaded`] when the bounded queue is full, or
-    /// [`SubmitError::Closed`] after the service runner has stopped.
+    /// 有界队列已满时返回 [`SubmitError::Overloaded`]；service runner 停止后返回
+    /// [`SubmitError::Closed`]。
     pub fn enqueue(&self, envelope: CommandEnvelope) -> Result<PendingReply, SubmitError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
@@ -181,22 +193,20 @@ impl AppService {
         Ok(PendingReply { reply_rx })
     }
 
-    /// Enqueues a command and waits for its protocol reply.
+    /// 将命令入队并等待协议回复。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns a [`SubmitError`] when the command cannot be enqueued or when
-    /// the runner stops before replying.
+    /// 命令无法入队，或 runner 在回复前停止时返回 [`SubmitError`]。
     pub async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReply, SubmitError> {
         self.enqueue(envelope)?.wait().await
     }
 
-    /// Resolves an authenticated HTTP download through the same bounded actor
-    /// that owns Artifact state.
+    /// 通过持有 Artifact 状态的同一个有界 actor 解析已认证 HTTP 下载。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns a [`SubmitError`] if the actor queue is unavailable.
+    /// actor 队列不可用时返回 [`SubmitError`]。
     pub async fn resolve_artifact_download(
         &self,
         project_id: ProjectId,
@@ -218,11 +228,11 @@ impl AppService {
         reply_rx.await.map_err(|_| SubmitError::ReplyDropped)
     }
 
-    /// Resolves Session events via the bounded, lower-priority query channel.
+    /// 通过有界、低优先级查询通道解析 Session 事件。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns a [`SubmitError`] when the query cannot be enqueued or replied.
+    /// 查询无法入队或无法回复时返回 [`SubmitError`]。
     pub async fn resolve_session_events(
         &self,
         cursor: crate::protocol::StreamCursor,
@@ -357,12 +367,11 @@ pub struct PendingReply {
 }
 
 impl PendingReply {
-    /// Waits for the application service to process an enqueued command.
+    /// 等待 application service 处理已入队命令。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns [`SubmitError::ReplyDropped`] when the runner stops without
-    /// producing a reply.
+    /// runner 未产生回复便停止时返回 [`SubmitError::ReplyDropped`]。
     pub async fn wait(self) -> Result<CommandReply, SubmitError> {
         self.reply_rx.await.map_err(|_| SubmitError::ReplyDropped)
     }
@@ -587,6 +596,947 @@ struct StoredReply {
     reply: CommandReply,
 }
 
+/// 只持有已完成启动收敛的 durable 窄能力，不包含内存 reducer 后备状态。
+#[allow(
+    dead_code,
+    reason = "C2 首个叶子先冻结 backend 边界，后续叶子逐项接入 production mutation"
+)]
+pub(crate) struct DurableServiceState {
+    runtime: DurableServiceRuntime,
+}
+
+enum DurableServiceRuntime {
+    Ready(Box<ReadyDurableRuntime>),
+    Fatal(Box<FatalDurableRuntime>),
+    Transitioning,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+enum DurableServiceError {
+    #[error("durable service is unavailable")]
+    RuntimeUnavailable,
+}
+
+#[allow(
+    dead_code,
+    reason = "C2 首个叶子先冻结 backend 边界，后续叶子逐项接入 production mutation"
+)]
+impl DurableServiceState {
+    pub(crate) fn new(runtime: ReadyDurableRuntime) -> Self {
+        Self {
+            runtime: DurableServiceRuntime::Ready(Box::new(runtime)),
+        }
+    }
+
+    pub(crate) fn fatal_error(&self) -> Option<&crate::durable_runtime::DurableRuntimeError> {
+        match &self.runtime {
+            DurableServiceRuntime::Fatal(runtime) => Some(runtime.error()),
+            DurableServiceRuntime::Ready(_) | DurableServiceRuntime::Transitioning => None,
+        }
+    }
+
+    fn ready_runtime(&self) -> Option<&ReadyDurableRuntime> {
+        match &self.runtime {
+            DurableServiceRuntime::Ready(runtime) => Some(runtime),
+            DurableServiceRuntime::Fatal(runtime) => {
+                let _error = runtime.error();
+                None
+            }
+            DurableServiceRuntime::Transitioning => None,
+        }
+    }
+
+    fn take_ready_runtime(&mut self) -> Option<ReadyDurableRuntime> {
+        let previous = std::mem::replace(&mut self.runtime, DurableServiceRuntime::Transitioning);
+        match previous {
+            DurableServiceRuntime::Ready(runtime) => Some(*runtime),
+            unavailable => {
+                self.runtime = unavailable;
+                None
+            }
+        }
+    }
+
+    fn restore_ready_runtime(&mut self, runtime: ReadyDurableRuntime) {
+        self.runtime = DurableServiceRuntime::Ready(Box::new(runtime));
+    }
+
+    #[cfg(test)]
+    fn set_runtime_failpoint_for_test(
+        &mut self,
+        failpoint: crate::durable_runtime::RuntimeFailpoint,
+    ) {
+        let DurableServiceRuntime::Ready(runtime) = &mut self.runtime else {
+            panic!("测试 failpoint 只能安装到 Ready durable backend");
+        };
+        runtime.set_failpoint(failpoint);
+    }
+
+    fn handle_project_create(&mut self, envelope: &CommandEnvelope, name: &str) -> CommandReply {
+        if envelope.client_id.0.starts_with(INTERNAL_CLIENT_PREFIX) {
+            return CommandReply::error(
+                envelope.client_command_id.clone(),
+                ProtocolErrorCode::InvalidRequest,
+                "reserved internal client namespace is not available to external commands",
+            );
+        }
+        let Ok(payload_digest) = crate::protocol::external_command_payload_digest(
+            envelope.protocol_version,
+            &envelope.command,
+        ) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        let lookup = match self.ready_runtime() {
+            Some(runtime) => runtime.lookup_command(
+                &envelope.client_id,
+                &envelope.client_command_id,
+                &payload_digest,
+            ),
+            None => return Self::runtime_unavailable_reply(envelope),
+        };
+        match lookup {
+            Ok(crate::durable_runtime::CommandLookup::ExactReply(raw_reply)) => {
+                return decode_durable_reply(envelope, &raw_reply);
+            }
+            Err(crate::durable_runtime::CommandLookupError::IdempotencyConflict) => {
+                return CommandReply::error(
+                    envelope.client_command_id.clone(),
+                    ProtocolErrorCode::IdempotencyConflict,
+                    "the client command ID was already used with a different payload",
+                );
+            }
+            Err(crate::durable_runtime::CommandLookupError::CorruptCommittedIndex(_)) => {
+                return Self::runtime_unavailable_reply(envelope);
+            }
+            Ok(crate::durable_runtime::CommandLookup::Unseen) => {}
+        }
+
+        let Some(name) = validated_project_name(name) else {
+            return invalid_project_name_reply(envelope);
+        };
+        let Some(request) = self.ready_runtime().and_then(|runtime| {
+            runtime
+                .plan_project_create(
+                    &envelope.client_id,
+                    &envelope.client_command_id,
+                    &payload_digest,
+                    name,
+                )
+                .ok()
+        }) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        self.submit_durable_mutation(envelope, &payload_digest, request)
+    }
+
+    fn handle_session_start(
+        &mut self,
+        envelope: &CommandEnvelope,
+        project_id: &ProjectId,
+    ) -> CommandReply {
+        if envelope.client_id.0.starts_with(INTERNAL_CLIENT_PREFIX) {
+            return CommandReply::error(
+                envelope.client_command_id.clone(),
+                ProtocolErrorCode::InvalidRequest,
+                "reserved internal client namespace is not available to external commands",
+            );
+        }
+        let Ok(payload_digest) = crate::protocol::external_command_payload_digest(
+            envelope.protocol_version,
+            &envelope.command,
+        ) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        let lookup = match self.ready_runtime() {
+            Some(runtime) => runtime.lookup_command(
+                &envelope.client_id,
+                &envelope.client_command_id,
+                &payload_digest,
+            ),
+            None => return Self::runtime_unavailable_reply(envelope),
+        };
+        match lookup {
+            Ok(crate::durable_runtime::CommandLookup::ExactReply(raw_reply)) => {
+                return decode_durable_reply(envelope, &raw_reply);
+            }
+            Err(crate::durable_runtime::CommandLookupError::IdempotencyConflict) => {
+                return CommandReply::error(
+                    envelope.client_command_id.clone(),
+                    ProtocolErrorCode::IdempotencyConflict,
+                    "the client command ID was already used with a different payload",
+                );
+            }
+            Err(crate::durable_runtime::CommandLookupError::CorruptCommittedIndex(_)) => {
+                return Self::runtime_unavailable_reply(envelope);
+            }
+            Ok(crate::durable_runtime::CommandLookup::Unseen) => {}
+        }
+
+        let project_exists = self
+            .ready_runtime()
+            .is_some_and(|runtime| runtime.project_metadata(project_id).is_some());
+        if !project_exists {
+            return project_not_found(envelope, project_id);
+        }
+        let Some(request) = self.ready_runtime().and_then(|runtime| {
+            runtime
+                .plan_session_start(
+                    &envelope.client_id,
+                    &envelope.client_command_id,
+                    &payload_digest,
+                    project_id,
+                )
+                .ok()
+        }) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        self.submit_durable_mutation(envelope, &payload_digest, request)
+    }
+
+    fn handle_turn_start(
+        &mut self,
+        envelope: &CommandEnvelope,
+        session_id: &SessionId,
+        prompt: &str,
+    ) -> CommandReply {
+        if envelope.client_id.0.starts_with(INTERNAL_CLIENT_PREFIX) {
+            return reserved_internal_namespace_reply(envelope);
+        }
+        let Ok(payload_digest) = crate::protocol::external_command_payload_digest(
+            envelope.protocol_version,
+            &envelope.command,
+        ) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        let lookup = match self.ready_runtime() {
+            Some(runtime) => runtime.lookup_command(
+                &envelope.client_id,
+                &envelope.client_command_id,
+                &payload_digest,
+            ),
+            None => return Self::runtime_unavailable_reply(envelope),
+        };
+        match lookup {
+            Ok(crate::durable_runtime::CommandLookup::ExactReply(raw_reply)) => {
+                return decode_durable_reply(envelope, &raw_reply);
+            }
+            Err(crate::durable_runtime::CommandLookupError::IdempotencyConflict) => {
+                return idempotency_conflict_reply(envelope);
+            }
+            Err(crate::durable_runtime::CommandLookupError::CorruptCommittedIndex(_)) => {
+                return Self::runtime_unavailable_reply(envelope);
+            }
+            Ok(crate::durable_runtime::CommandLookup::Unseen) => {}
+        }
+
+        let Some(prompt) = validated_turn_prompt(prompt) else {
+            return invalid_turn_prompt_reply(envelope);
+        };
+        if self
+            .ready_runtime()
+            .is_none_or(|runtime| runtime.session_snapshot(session_id).is_none())
+        {
+            return session_not_found(envelope, session_id);
+        }
+        let Some(request) = self.ready_runtime().and_then(|runtime| {
+            runtime
+                .plan_turn_start(
+                    &envelope.client_id,
+                    &envelope.client_command_id,
+                    &payload_digest,
+                    session_id,
+                    prompt,
+                )
+                .ok()
+        }) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        self.submit_durable_mutation(envelope, &payload_digest, request)
+    }
+
+    fn handle_turn_cancel(
+        &mut self,
+        envelope: &CommandEnvelope,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> CommandReply {
+        if envelope.client_id.0.starts_with(INTERNAL_CLIENT_PREFIX) {
+            return reserved_internal_namespace_reply(envelope);
+        }
+        let Ok(payload_digest) = crate::protocol::external_command_payload_digest(
+            envelope.protocol_version,
+            &envelope.command,
+        ) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        let lookup = match self.ready_runtime() {
+            Some(runtime) => runtime.lookup_command(
+                &envelope.client_id,
+                &envelope.client_command_id,
+                &payload_digest,
+            ),
+            None => return Self::runtime_unavailable_reply(envelope),
+        };
+        match lookup {
+            Ok(crate::durable_runtime::CommandLookup::ExactReply(raw_reply)) => {
+                return decode_durable_reply(envelope, &raw_reply);
+            }
+            Err(crate::durable_runtime::CommandLookupError::IdempotencyConflict) => {
+                return idempotency_conflict_reply(envelope);
+            }
+            Err(crate::durable_runtime::CommandLookupError::CorruptCommittedIndex(_)) => {
+                return Self::runtime_unavailable_reply(envelope);
+            }
+            Ok(crate::durable_runtime::CommandLookup::Unseen) => {}
+        }
+
+        let Some(runtime) = self.ready_runtime() else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        if runtime.session_snapshot(session_id).is_none() {
+            return session_not_found(envelope, session_id);
+        }
+        if runtime.owner_of(SessionObjectRef::Turn(turn_id)).is_none() {
+            return turn_not_found(envelope, turn_id);
+        }
+        let Some(request) = self.ready_runtime().and_then(|runtime| {
+            runtime
+                .plan_turn_cancel(
+                    &envelope.client_id,
+                    &envelope.client_command_id,
+                    &payload_digest,
+                    session_id,
+                    turn_id,
+                )
+                .ok()
+        }) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        self.submit_durable_mutation(envelope, &payload_digest, request)
+    }
+
+    fn handle_question_respond(
+        &mut self,
+        envelope: &CommandEnvelope,
+        session_id: &SessionId,
+        question_id: &QuestionId,
+        choice_id: &ChoiceId,
+    ) -> CommandReply {
+        if envelope.client_id.0.starts_with(INTERNAL_CLIENT_PREFIX) {
+            return reserved_internal_namespace_reply(envelope);
+        }
+        let Ok(payload_digest) = crate::protocol::external_command_payload_digest(
+            envelope.protocol_version,
+            &envelope.command,
+        ) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        let lookup = match self.ready_runtime() {
+            Some(runtime) => runtime.lookup_command(
+                &envelope.client_id,
+                &envelope.client_command_id,
+                &payload_digest,
+            ),
+            None => return Self::runtime_unavailable_reply(envelope),
+        };
+        match lookup {
+            Ok(crate::durable_runtime::CommandLookup::ExactReply(raw_reply)) => {
+                return decode_durable_reply(envelope, &raw_reply);
+            }
+            Err(crate::durable_runtime::CommandLookupError::IdempotencyConflict) => {
+                return idempotency_conflict_reply(envelope);
+            }
+            Err(crate::durable_runtime::CommandLookupError::CorruptCommittedIndex(_)) => {
+                return Self::runtime_unavailable_reply(envelope);
+            }
+            Ok(crate::durable_runtime::CommandLookup::Unseen) => {}
+        }
+
+        let Some(runtime) = self.ready_runtime() else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        if runtime.session_snapshot(session_id).is_none() {
+            return session_not_found(envelope, session_id);
+        }
+        let Some(owner_session_id) = runtime
+            .owner_of(SessionObjectRef::Question(question_id))
+            .cloned()
+        else {
+            return question_not_found(envelope, question_id);
+        };
+        let Some(owner_snapshot) = runtime.session_snapshot(&owner_session_id) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        let Some(question) = owner_snapshot
+            .questions
+            .iter()
+            .find(|question| question.question_id == *question_id)
+        else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        if question.status == QuestionStatus::OwnerTurnAborted {
+            return CommandReply::error(
+                envelope.client_command_id.clone(),
+                ProtocolErrorCode::RequestOwnerTurnAborted,
+                "the question owner Turn is terminal",
+            );
+        }
+        if choice_id.0.is_empty() || choice_id.0.chars().count() > 120 {
+            return CommandReply::error(
+                envelope.client_command_id.clone(),
+                ProtocolErrorCode::InvalidRequest,
+                "choice ID must contain 1 to 120 characters",
+            );
+        }
+        if !question
+            .choices
+            .iter()
+            .any(|choice| choice.choice_id == *choice_id)
+        {
+            return CommandReply::error(
+                envelope.client_command_id.clone(),
+                ProtocolErrorCode::InvalidQuestionChoice,
+                "choice ID must identify one of the question choices",
+            );
+        }
+        let Some(request) = self.ready_runtime().and_then(|runtime| {
+            runtime
+                .plan_question_respond(
+                    &envelope.client_id,
+                    &envelope.client_command_id,
+                    &payload_digest,
+                    session_id,
+                    question_id,
+                    choice_id,
+                )
+                .ok()
+        }) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        self.submit_durable_mutation(envelope, &payload_digest, request)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Approval 分派需连续保持 lookup、权威校验、approve capability 与 deny 边界"
+    )]
+    fn handle_approval_respond(
+        &mut self,
+        envelope: &CommandEnvelope,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
+        approval_subject_digest: &ApprovalSubjectDigest,
+        decision: ApprovalDecision,
+    ) -> CommandReply {
+        if envelope.client_id.0.starts_with(INTERNAL_CLIENT_PREFIX) {
+            return reserved_internal_namespace_reply(envelope);
+        }
+        let Ok(payload_digest) = crate::protocol::external_command_payload_digest(
+            envelope.protocol_version,
+            &envelope.command,
+        ) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        let lookup = match self.ready_runtime() {
+            Some(runtime) => runtime.lookup_command(
+                &envelope.client_id,
+                &envelope.client_command_id,
+                &payload_digest,
+            ),
+            None => return Self::runtime_unavailable_reply(envelope),
+        };
+        match lookup {
+            Ok(crate::durable_runtime::CommandLookup::ExactReply(raw_reply)) => {
+                return decode_durable_reply(envelope, &raw_reply);
+            }
+            Err(crate::durable_runtime::CommandLookupError::IdempotencyConflict) => {
+                return idempotency_conflict_reply(envelope);
+            }
+            Err(crate::durable_runtime::CommandLookupError::CorruptCommittedIndex(_)) => {
+                return Self::runtime_unavailable_reply(envelope);
+            }
+            Ok(crate::durable_runtime::CommandLookup::Unseen) => {}
+        }
+        let Some(runtime) = self.ready_runtime() else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        if runtime.session_snapshot(session_id).is_none() {
+            return session_not_found(envelope, session_id);
+        }
+        let Some(owner_session_id) = runtime
+            .owner_of(SessionObjectRef::Approval(approval_id))
+            .cloned()
+        else {
+            return approval_not_found(envelope, approval_id);
+        };
+        let Some(owner_snapshot) = runtime.session_snapshot(&owner_session_id) else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        let Some(approval) = owner_snapshot
+            .approvals
+            .iter()
+            .find(|approval| approval.approval_id == *approval_id)
+        else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        if approval.status == ApprovalStatus::OwnerTurnAborted {
+            return CommandReply::error(
+                envelope.client_command_id.clone(),
+                ProtocolErrorCode::RequestOwnerTurnAborted,
+                "the approval owner Turn is terminal",
+            );
+        }
+        if approval.approval_subject_digest != *approval_subject_digest {
+            return CommandReply::error(
+                envelope.client_command_id.clone(),
+                ProtocolErrorCode::ApprovalSubjectMismatch,
+                "approval subject digest does not match the requested action",
+            );
+        }
+        match decision {
+            ApprovalDecision::Approve => {
+                let Some(plan) = self.ready_runtime().and_then(|runtime| {
+                    runtime
+                        .plan_approval_approve(
+                            &envelope.client_id,
+                            &envelope.client_command_id,
+                            &payload_digest,
+                            session_id,
+                            approval_id,
+                            approval_subject_digest,
+                        )
+                        .ok()
+                }) else {
+                    return Self::runtime_unavailable_reply(envelope);
+                };
+                let (request, pending_reference) = plan.into_parts();
+                self.submit_durable_mutation_with_artifact(
+                    envelope,
+                    &payload_digest,
+                    request,
+                    pending_reference,
+                )
+            }
+            ApprovalDecision::Deny => {
+                let Some(request) = self.ready_runtime().and_then(|runtime| {
+                    runtime
+                        .plan_approval_deny(
+                            &envelope.client_id,
+                            &envelope.client_command_id,
+                            &payload_digest,
+                            session_id,
+                            approval_id,
+                            approval_subject_digest,
+                        )
+                        .ok()
+                }) else {
+                    return Self::runtime_unavailable_reply(envelope);
+                };
+                self.submit_durable_mutation(envelope, &payload_digest, request)
+            }
+        }
+    }
+
+    fn submit_durable_mutation(
+        &mut self,
+        envelope: &CommandEnvelope,
+        payload_digest: &str,
+        request: crate::control_store::PrepareControlRequest,
+    ) -> CommandReply {
+        self.submit_durable_mutation_with_artifact(envelope, payload_digest, request, None)
+    }
+
+    fn submit_durable_mutation_with_artifact(
+        &mut self,
+        envelope: &CommandEnvelope,
+        payload_digest: &str,
+        request: crate::control_store::PrepareControlRequest,
+        pending_reference: Option<crate::durable_runtime::PendingArtifactReference>,
+    ) -> CommandReply {
+        let Some(runtime) = self.take_ready_runtime() else {
+            return Self::runtime_unavailable_reply(envelope);
+        };
+        match runtime.submit(request) {
+            Ok((runtime, raw_reply)) => {
+                self.restore_ready_runtime(runtime);
+                decode_durable_reply(envelope, &raw_reply)
+            }
+            Err(SubmitFailure::Rejected { runtime, error: _ }) => {
+                let disposition = pending_reference.and_then(|pending_reference| {
+                    runtime.classify_pending_artifact_reference_after_prepared_rejection(
+                        pending_reference,
+                    )
+                });
+                self.restore_ready_runtime(*runtime);
+                match disposition {
+                    Some(
+                        crate::durable_runtime::ArtifactReferenceDisposition::AlreadyReachable,
+                    ) => CommandReply::error(
+                        envelope.client_command_id.clone(),
+                        ProtocolErrorCode::ServiceUnavailable,
+                        "durable service is unavailable; prepared Artifact was already reachable",
+                    ),
+                    Some(
+                        crate::durable_runtime::ArtifactReferenceDisposition::OrphanCandidate(
+                            orphan,
+                        ),
+                    ) => {
+                        let _hash = orphan.hash();
+                        CommandReply::error(
+                            envelope.client_command_id.clone(),
+                            ProtocolErrorCode::ServiceUnavailable,
+                            "durable service is unavailable; prepared Artifact remains an orphan candidate",
+                        )
+                    }
+                    None => Self::runtime_unavailable_reply(envelope),
+                }
+            }
+            Err(SubmitFailure::Recovering { runtime, error: _ }) => match runtime.recover() {
+                Ok(runtime) => {
+                    let reply = runtime.lookup_command(
+                        &envelope.client_id,
+                        &envelope.client_command_id,
+                        payload_digest,
+                    );
+                    self.restore_ready_runtime(runtime);
+                    match reply {
+                        Ok(crate::durable_runtime::CommandLookup::ExactReply(raw_reply)) => {
+                            decode_durable_reply(envelope, &raw_reply)
+                        }
+                        Ok(crate::durable_runtime::CommandLookup::Unseen)
+                        | Err(
+                            crate::durable_runtime::CommandLookupError::IdempotencyConflict
+                            | crate::durable_runtime::CommandLookupError::CorruptCommittedIndex(_),
+                        ) => Self::runtime_unavailable_reply(envelope),
+                    }
+                }
+                Err(RecoveryFailure::Fatal(runtime)) => {
+                    self.runtime = DurableServiceRuntime::Fatal(runtime);
+                    Self::runtime_unavailable_reply(envelope)
+                }
+            },
+            Err(SubmitFailure::Fatal(runtime)) => {
+                self.runtime = DurableServiceRuntime::Fatal(runtime);
+                Self::runtime_unavailable_reply(envelope)
+            }
+        }
+    }
+
+    fn runtime_unavailable_reply(envelope: &CommandEnvelope) -> CommandReply {
+        DurableServiceError::RuntimeUnavailable.into_reply(envelope.client_command_id.clone())
+    }
+
+    pub(crate) fn resolve_artifact_download(
+        &self,
+        project_id: &ProjectId,
+        hash: &ArtifactHash,
+        if_none_match: Option<&str>,
+    ) -> DownloadResolution {
+        let Some(runtime) = self.ready_runtime() else {
+            return DownloadResolution::Corrupt;
+        };
+        let mut opened = match runtime.read_project_artifact(project_id, hash) {
+            Ok(Some(opened)) => opened,
+            Ok(None) => return DownloadResolution::NotFound,
+            Err(_) => return DownloadResolution::Corrupt,
+        };
+        if opened.verified().hash.as_str() != hash.as_str()
+            || opened.verified().size > 64 * 1024 * 1024
+        {
+            return DownloadResolution::Corrupt;
+        }
+        let mut bytes = Vec::new();
+        if std::io::Read::read_to_end(&mut opened, &mut bytes).is_err()
+            || u64::try_from(bytes.len()).ok() != Some(opened.verified().size)
+        {
+            return DownloadResolution::Corrupt;
+        }
+        let etag = format!("\"{}\"", hash.as_str());
+        if if_none_match == Some(etag.as_str()) {
+            return DownloadResolution::NotModified(hash.clone());
+        }
+        DownloadResolution::Verified(VerifiedDownload {
+            artifact_hash: hash.clone(),
+            mime_type: FIXTURE_MIME.to_owned(),
+            size_bytes: opened.verified().size,
+            bytes: Arc::from(bytes),
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "只读分派保持穷尽可审计，mutation authority 仍与共享 helper 隔离"
+    )]
+    pub(crate) fn handle(&mut self, envelope: &CommandEnvelope) -> CommandReply {
+        if let Some(reply) = validate_protocol_version(envelope) {
+            return reply;
+        }
+        if self.ready_runtime().is_none() {
+            return Self::runtime_unavailable_reply(envelope);
+        }
+
+        match &envelope.command {
+            ClientCommand::Initialize => initialized_reply(envelope.client_command_id.clone()),
+            ClientCommand::ProjectSnapshot { project_id } => {
+                let Some(runtime) = self.ready_runtime() else {
+                    return Self::runtime_unavailable_reply(envelope);
+                };
+                runtime.project_metadata(project_id).map_or_else(
+                    || project_not_found(envelope, project_id),
+                    |snapshot| {
+                        CommandReply::success(
+                            envelope.client_command_id.clone(),
+                            CommandResult::ProjectSnapshot(snapshot.clone()),
+                        )
+                    },
+                )
+            }
+            ClientCommand::ProjectDomainSnapshot { project_id } => {
+                let Some(runtime) = self.ready_runtime() else {
+                    return Self::runtime_unavailable_reply(envelope);
+                };
+                let Some(project) = runtime.project_projection(project_id) else {
+                    return project_not_found(envelope, project_id);
+                };
+                match map_domain_snapshot(project_id, project) {
+                    Ok(snapshot) => CommandReply::success(
+                        envelope.client_command_id.clone(),
+                        CommandResult::ProjectDomainSnapshot(snapshot),
+                    ),
+                    Err(error) => CommandReply::error(
+                        envelope.client_command_id.clone(),
+                        ProtocolErrorCode::ServiceUnavailable,
+                        format!("failed to map the durable project domain: {error}"),
+                    ),
+                }
+            }
+            ClientCommand::RevisionList { project_id } => {
+                let Some(runtime) = self.ready_runtime() else {
+                    return Self::runtime_unavailable_reply(envelope);
+                };
+                let Some(project) = runtime.project_projection(project_id) else {
+                    return project_not_found(envelope, project_id);
+                };
+                let revisions = project
+                    .revisions
+                    .values()
+                    .map(|revision| map_revision_summary(project, revision))
+                    .collect();
+                CommandReply::success(
+                    envelope.client_command_id.clone(),
+                    CommandResult::RevisionList(revisions),
+                )
+            }
+            ClientCommand::RevisionRead {
+                project_id,
+                revision_id,
+            } => {
+                let Some(runtime) = self.ready_runtime() else {
+                    return Self::runtime_unavailable_reply(envelope);
+                };
+                let Some(project) = runtime.project_projection(project_id) else {
+                    return project_not_found(envelope, project_id);
+                };
+                let Ok(domain_revision_id) =
+                    crate::domain::RevisionId::parse(revision_id.0.clone())
+                else {
+                    return CommandReply::error(
+                        envelope.client_command_id.clone(),
+                        ProtocolErrorCode::InvalidRequest,
+                        "revision ID is invalid",
+                    );
+                };
+                let Some(revision) = project.revisions.get(&domain_revision_id) else {
+                    return CommandReply::error(
+                        envelope.client_command_id.clone(),
+                        ProtocolErrorCode::RevisionNotFound,
+                        format!("revision `{}` was not found", revision_id.0),
+                    );
+                };
+                CommandReply::success(
+                    envelope.client_command_id.clone(),
+                    CommandResult::RevisionRead(map_revision_detail(project_id, project, revision)),
+                )
+            }
+            ClientCommand::SessionSnapshot { session_id } => {
+                let Some(runtime) = self.ready_runtime() else {
+                    return Self::runtime_unavailable_reply(envelope);
+                };
+                runtime.session_snapshot(session_id).map_or_else(
+                    || session_not_found(envelope, session_id),
+                    |snapshot| {
+                        CommandReply::success(
+                            envelope.client_command_id.clone(),
+                            CommandResult::SessionSnapshot(snapshot),
+                        )
+                    },
+                )
+            }
+            ClientCommand::EventResume { cursor } => {
+                let Some(runtime) = self.ready_runtime() else {
+                    return Self::runtime_unavailable_reply(envelope);
+                };
+                match runtime.resume_events(cursor) {
+                    Ok(page) => CommandReply::success(
+                        envelope.client_command_id.clone(),
+                        CommandResult::EventsResumed(page),
+                    ),
+                    Err(error) => {
+                        durable_cursor_error(envelope.client_command_id.clone(), cursor, &error)
+                    }
+                }
+            }
+            ClientCommand::ArtifactManifest {
+                project_id,
+                artifact_occurrence_id,
+            } => {
+                let Some(runtime) = self.ready_runtime() else {
+                    return Self::runtime_unavailable_reply(envelope);
+                };
+                runtime
+                    .occurrence(project_id, artifact_occurrence_id)
+                    .map_or_else(
+                        || artifact_not_found(envelope),
+                        |manifest| {
+                            CommandReply::success(
+                                envelope.client_command_id.clone(),
+                                CommandResult::ArtifactManifest(manifest.clone()),
+                            )
+                        },
+                    )
+            }
+            ClientCommand::ProjectCreate { name } => self.handle_project_create(envelope, name),
+            ClientCommand::SessionStart { project_id } => {
+                self.handle_session_start(envelope, project_id)
+            }
+            ClientCommand::TurnStart { session_id, prompt } => {
+                self.handle_turn_start(envelope, session_id, prompt)
+            }
+            ClientCommand::TurnCancel {
+                session_id,
+                turn_id,
+            } => self.handle_turn_cancel(envelope, session_id, turn_id),
+            ClientCommand::QuestionRespond {
+                session_id,
+                question_id,
+                choice_id,
+            } => self.handle_question_respond(envelope, session_id, question_id, choice_id),
+            ClientCommand::ApprovalRespond {
+                session_id,
+                approval_id,
+                approval_subject_digest,
+                decision,
+            } => self.handle_approval_respond(
+                envelope,
+                session_id,
+                approval_id,
+                approval_subject_digest,
+                *decision,
+            ),
+        }
+    }
+}
+
+fn decode_durable_reply(envelope: &CommandEnvelope, raw_reply: &[u8]) -> CommandReply {
+    serde_json::from_slice(raw_reply).unwrap_or_else(|_| {
+        CommandReply::error(
+            envelope.client_command_id.clone(),
+            ProtocolErrorCode::ServiceUnavailable,
+            "durable service is unavailable",
+        )
+    })
+}
+
+fn validated_project_name(name: &str) -> Option<&str> {
+    let name = name.trim();
+    (!name.is_empty() && name.chars().count() <= 120).then_some(name)
+}
+
+fn invalid_project_name_reply(envelope: &CommandEnvelope) -> CommandReply {
+    CommandReply::error(
+        envelope.client_command_id.clone(),
+        ProtocolErrorCode::InvalidRequest,
+        "project name must contain 1 to 120 characters",
+    )
+}
+
+fn validated_turn_prompt(prompt: &str) -> Option<&str> {
+    let prompt = prompt.trim();
+    (!prompt.is_empty() && prompt.len() <= 8_000).then_some(prompt)
+}
+
+fn invalid_turn_prompt_reply(envelope: &CommandEnvelope) -> CommandReply {
+    CommandReply::error(
+        envelope.client_command_id.clone(),
+        ProtocolErrorCode::InvalidRequest,
+        "turn prompt must contain 1 to 8000 UTF-8 bytes",
+    )
+}
+
+fn reserved_internal_namespace_reply(envelope: &CommandEnvelope) -> CommandReply {
+    CommandReply::error(
+        envelope.client_command_id.clone(),
+        ProtocolErrorCode::InvalidRequest,
+        "reserved internal client namespace is not available to external commands",
+    )
+}
+
+fn idempotency_conflict_reply(envelope: &CommandEnvelope) -> CommandReply {
+    CommandReply::error(
+        envelope.client_command_id.clone(),
+        ProtocolErrorCode::IdempotencyConflict,
+        "the client command ID was already used with a different payload",
+    )
+}
+
+impl DurableServiceError {
+    fn into_reply(self, client_command_id: ClientCommandId) -> CommandReply {
+        CommandReply::error(
+            client_command_id,
+            ProtocolErrorCode::ServiceUnavailable,
+            self.to_string(),
+        )
+    }
+}
+
+fn validate_protocol_version(envelope: &CommandEnvelope) -> Option<CommandReply> {
+    (envelope.protocol_version != PROTOCOL_VERSION).then(|| {
+        CommandReply::error(
+            envelope.client_command_id.clone(),
+            ProtocolErrorCode::InvalidProtocolVersion,
+            format!(
+                "unsupported protocol version {}; expected {PROTOCOL_VERSION}",
+                envelope.protocol_version
+            ),
+        )
+    })
+}
+
+fn initialized_reply(client_command_id: ClientCommandId) -> CommandReply {
+    CommandReply::success(
+        client_command_id,
+        CommandResult::Initialized {
+            server_name: "alda-agent".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: vec![
+                "project.create".to_owned(),
+                "project.snapshot".to_owned(),
+                "project.domain_snapshot".to_owned(),
+                "revision.list".to_owned(),
+                "revision.read".to_owned(),
+                "session.start".to_owned(),
+                "session.snapshot".to_owned(),
+                "turn.start".to_owned(),
+                "turn.cancel".to_owned(),
+                "question.respond".to_owned(),
+                "approval.respond".to_owned(),
+                "artifact.manifest".to_owned(),
+                "event.resume".to_owned(),
+            ],
+        },
+    )
+}
+
 fn initialize_domain_project(
     project_id: &ProjectId,
     ordinal: u64,
@@ -760,53 +1710,19 @@ impl ServiceState {
         reply
     }
 
-    // Keeping the exhaustive command dispatch together makes the wire surface
-    // auditable; state transitions remain in the single actor.
+    // 集中保留穷尽的命令分派，便于审计 wire surface；状态迁移仍只发生在单一 actor 内。
     #[allow(clippy::too_many_lines)]
     fn process(&mut self, envelope: &CommandEnvelope) -> CommandReply {
-        if envelope.protocol_version != PROTOCOL_VERSION {
-            return CommandReply::error(
-                envelope.client_command_id.clone(),
-                ProtocolErrorCode::InvalidProtocolVersion,
-                format!(
-                    "unsupported protocol version {}; expected {PROTOCOL_VERSION}",
-                    envelope.protocol_version
-                ),
-            );
+        if let Some(reply) = validate_protocol_version(envelope) {
+            return reply;
         }
 
         match &envelope.command {
-            ClientCommand::Initialize => CommandReply::success(
-                envelope.client_command_id.clone(),
-                CommandResult::Initialized {
-                    server_name: "alda-agent".to_owned(),
-                    protocol_version: PROTOCOL_VERSION,
-                    capabilities: vec![
-                        "project.create".to_owned(),
-                        "project.snapshot".to_owned(),
-                        "project.domain_snapshot".to_owned(),
-                        "revision.list".to_owned(),
-                        "revision.read".to_owned(),
-                        "session.start".to_owned(),
-                        "session.snapshot".to_owned(),
-                        "turn.start".to_owned(),
-                        "turn.cancel".to_owned(),
-                        "question.respond".to_owned(),
-                        "approval.respond".to_owned(),
-                        "artifact.manifest".to_owned(),
-                        "event.resume".to_owned(),
-                    ],
-                },
-            ),
+            ClientCommand::Initialize => initialized_reply(envelope.client_command_id.clone()),
             ClientCommand::ProjectCreate { name } => {
-                let name = name.trim();
-                if name.is_empty() || name.chars().count() > 120 {
-                    return CommandReply::error(
-                        envelope.client_command_id.clone(),
-                        ProtocolErrorCode::InvalidRequest,
-                        "project name must contain 1 to 120 characters",
-                    );
-                }
+                let Some(name) = validated_project_name(name) else {
+                    return invalid_project_name_reply(envelope);
+                };
 
                 self.next_project_number += 1;
                 let snapshot = ProjectSnapshot {
@@ -951,14 +1867,9 @@ impl ServiceState {
                 )
             }
             ClientCommand::TurnStart { session_id, prompt } => {
-                let prompt = prompt.trim();
-                if prompt.is_empty() || prompt.chars().count() > 8_000 {
-                    return CommandReply::error(
-                        envelope.client_command_id.clone(),
-                        ProtocolErrorCode::InvalidRequest,
-                        "turn prompt must contain 1 to 8000 characters",
-                    );
-                }
+                let Some(prompt) = validated_turn_prompt(prompt) else {
+                    return invalid_turn_prompt_reply(envelope);
+                };
                 let Some(session) = self.sessions.get_mut(session_id) else {
                     return session_not_found(envelope, session_id);
                 };
@@ -1132,8 +2043,7 @@ impl ServiceState {
         )
     }
 
-    // The cancellation transaction keeps validation and the complete,
-    // auditable event ordering adjacent.
+    // 取消事务将校验与完整、可审计的事件顺序相邻放置。
     #[allow(clippy::too_many_lines)]
     fn cancel_turn(
         &mut self,
@@ -1252,8 +2162,7 @@ impl ServiceState {
         )
     }
 
-    // The response transaction validates before appending either of its two
-    // linked facts (resolution and the next approval request).
+    // 响应事务先完成校验，再追加相互关联的 resolution 与下一项 approval request 事实。
     #[allow(clippy::too_many_lines)]
     fn respond_question(
         &mut self,
@@ -1376,8 +2285,7 @@ impl ServiceState {
         )
     }
 
-    // Validation, local fixture preparation, atomic store/fact commit, and the
-    // stable reply are kept adjacent to make the transition auditable.
+    // 校验、本地 fixture 准备、原子 store/事实提交与 stable reply 相邻放置，便于审计迁移。
     #[allow(clippy::too_many_lines)]
     fn respond_approval(
         &mut self,
@@ -1833,6 +2741,30 @@ fn session_not_found(envelope: &CommandEnvelope, session_id: &SessionId) -> Comm
     )
 }
 
+fn turn_not_found(envelope: &CommandEnvelope, turn_id: &TurnId) -> CommandReply {
+    CommandReply::error(
+        envelope.client_command_id.clone(),
+        ProtocolErrorCode::TurnNotFound,
+        format!("turn `{}` was not found", turn_id.0),
+    )
+}
+
+fn question_not_found(envelope: &CommandEnvelope, question_id: &QuestionId) -> CommandReply {
+    CommandReply::error(
+        envelope.client_command_id.clone(),
+        ProtocolErrorCode::QuestionNotFound,
+        format!("question `{}` was not found", question_id.0),
+    )
+}
+
+fn approval_not_found(envelope: &CommandEnvelope, approval_id: &ApprovalId) -> CommandReply {
+    CommandReply::error(
+        envelope.client_command_id.clone(),
+        ProtocolErrorCode::ApprovalNotFound,
+        format!("approval `{}` was not found", approval_id.0),
+    )
+}
+
 fn direct_cursor_error(
     reply_id: ClientCommandId,
     code: ProtocolErrorCode,
@@ -1854,6 +2786,72 @@ fn direct_cursor_error(
     )
 }
 
+fn durable_cursor_error(
+    reply_id: ClientCommandId,
+    cursor: &crate::protocol::StreamCursor,
+    error: &DurableCursorError,
+) -> CommandReply {
+    match error {
+        DurableCursorError::UnsupportedStreamKind => CommandReply::error_with_details(
+            reply_id,
+            ProtocolErrorCode::UnsupportedStreamKind,
+            "only the session_rollout stream kind is supported",
+            Some(ProtocolErrorDetails {
+                expected_epoch: None,
+                actual_epoch: None,
+                head_sequence: None,
+                recovery_action: RecoveryAction::UseSupportedStreamKind,
+            }),
+        ),
+        DurableCursorError::SessionNotFound => CommandReply::error_with_details(
+            reply_id,
+            ProtocolErrorCode::SessionNotFound,
+            format!("session `{}` was not found", cursor.stream_id),
+            Some(ProtocolErrorDetails {
+                expected_epoch: None,
+                actual_epoch: None,
+                head_sequence: None,
+                recovery_action: RecoveryAction::None,
+            }),
+        ),
+        DurableCursorError::EpochMismatch {
+            expected_epoch,
+            actual_epoch,
+            head_sequence,
+        } => CommandReply::error_with_details(
+            reply_id,
+            ProtocolErrorCode::CursorEpochMismatch,
+            "session stream epoch does not match",
+            Some(ProtocolErrorDetails {
+                expected_epoch: Some(*expected_epoch),
+                actual_epoch: Some(*actual_epoch),
+                head_sequence: Some(*head_sequence),
+                recovery_action: RecoveryAction::FetchSessionSnapshot(SessionId(
+                    cursor.stream_id.clone(),
+                )),
+            }),
+        ),
+        DurableCursorError::Future { head_sequence } => CommandReply::error_with_details(
+            reply_id,
+            ProtocolErrorCode::InvalidCursor,
+            "cursor is ahead of the session stream",
+            Some(ProtocolErrorDetails {
+                expected_epoch: Some(SESSION_STREAM_EPOCH),
+                actual_epoch: Some(cursor.epoch),
+                head_sequence: Some(*head_sequence),
+                recovery_action: RecoveryAction::FetchSessionSnapshot(SessionId(
+                    cursor.stream_id.clone(),
+                )),
+            }),
+        ),
+        DurableCursorError::CorruptPublishedView => CommandReply::error(
+            reply_id,
+            ProtocolErrorCode::ServiceUnavailable,
+            "durable published read view is inconsistent",
+        ),
+    }
+}
+
 fn request_fingerprint(envelope: &CommandEnvelope) -> String {
     serde_json::to_string(&(envelope.protocol_version, &envelope.command))
         .expect("serializing a typed command envelope should not fail")
@@ -1862,8 +2860,1798 @@ fn request_fingerprint(envelope: &CommandEnvelope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable_runtime::CommandLookup;
     use crate::protocol::CommandOutcome;
     use crate::protocol::StreamCursor;
+    use crate::protocol::external_command_payload_digest;
+
+    fn durable_test_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::TempDir::new().expect("创建 durable backend 测试目录");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("设置 durable backend 测试目录权限");
+        root
+    }
+
+    fn durable_file_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn visit(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            files: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+        ) {
+            let mut entries = std::fs::read_dir(directory)
+                .expect("读取 durable 测试目录")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("枚举 durable 测试目录");
+            entries.sort_unstable_by_key(std::fs::DirEntry::path);
+            for entry in entries {
+                let path = entry.path();
+                let file_type = entry.file_type().expect("读取 durable 文件类型");
+                if file_type.is_dir() {
+                    visit(root, &path, files);
+                } else if file_type.is_file() {
+                    files.push((
+                        path.strip_prefix(root)
+                            .expect("durable 文件必须位于测试根目录")
+                            .to_path_buf(),
+                        std::fs::read(&path).expect("读取 durable 文件内容"),
+                    ));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    fn assert_protocol_error(reply: &CommandReply, expected: ProtocolErrorCode) {
+        assert!(matches!(
+            &reply.outcome,
+            CommandOutcome::Error { error } if error.code == expected
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一只读矩阵集中证明 published view、文件与 command index 均不改变"
+    )]
+    fn durable_service_backend_reads_do_not_write_control_wal() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let published_before = state
+            .ready_runtime()
+            .expect("durable backend 保持 Ready")
+            .read_view()
+            .clone();
+        let files_before = durable_file_snapshot(root.path());
+        let commands = [
+            command("durable-initialize", ClientCommand::Initialize),
+            command(
+                "durable-project",
+                ClientCommand::ProjectSnapshot {
+                    project_id: ProjectId("project-missing".to_owned()),
+                },
+            ),
+            command(
+                "durable-domain",
+                ClientCommand::ProjectDomainSnapshot {
+                    project_id: ProjectId("project-missing".to_owned()),
+                },
+            ),
+            command(
+                "durable-revisions",
+                ClientCommand::RevisionList {
+                    project_id: ProjectId("project-missing".to_owned()),
+                },
+            ),
+            command(
+                "durable-revision",
+                ClientCommand::RevisionRead {
+                    project_id: ProjectId("project-missing".to_owned()),
+                    revision_id: ScoreRevisionId("revision-missing".to_owned()),
+                },
+            ),
+            command(
+                "durable-session",
+                ClientCommand::SessionSnapshot {
+                    session_id: SessionId("session-missing".to_owned()),
+                },
+            ),
+            command(
+                "durable-resume",
+                ClientCommand::EventResume {
+                    cursor: StreamCursor {
+                        stream_kind: StreamKind::SessionRollout,
+                        stream_id: "session-missing".to_owned(),
+                        epoch: SESSION_STREAM_EPOCH,
+                        after_sequence: 0,
+                    },
+                },
+            ),
+            command(
+                "durable-kind",
+                ClientCommand::EventResume {
+                    cursor: StreamCursor {
+                        stream_kind: StreamKind::ProjectEvent,
+                        stream_id: "session-missing".to_owned(),
+                        epoch: SESSION_STREAM_EPOCH,
+                        after_sequence: 0,
+                    },
+                },
+            ),
+        ];
+
+        let replies = commands
+            .iter()
+            .map(|envelope| state.handle(envelope))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            replies[0].outcome,
+            CommandOutcome::Success {
+                result: CommandResult::Initialized { .. }
+            }
+        ));
+        for reply in &replies[1..5] {
+            assert_protocol_error(reply, ProtocolErrorCode::ProjectNotFound);
+        }
+        assert_protocol_error(&replies[5], ProtocolErrorCode::SessionNotFound);
+        assert_protocol_error(&replies[6], ProtocolErrorCode::SessionNotFound);
+        assert_protocol_error(&replies[7], ProtocolErrorCode::UnsupportedStreamKind);
+
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("只读命令后 durable backend 保持 Ready")
+                .read_view(),
+            &published_before
+        );
+        assert_eq!(durable_file_snapshot(root.path()), files_before);
+        for envelope in &commands {
+            let digest =
+                external_command_payload_digest(envelope.protocol_version, &envelope.command)
+                    .expect("计算 durable 只读命令摘要");
+            assert_eq!(
+                state
+                    .ready_runtime()
+                    .expect("只读命令后 durable backend 保持 Ready")
+                    .lookup_command(&envelope.client_id, &envelope.client_command_id, &digest,)
+                    .expect("查询 control command index"),
+                CommandLookup::Unseen
+            );
+        }
+    }
+
+    #[test]
+    fn durable_service_backend_rejects_missing_approval_without_memory_fallback() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let files_before = durable_file_snapshot(root.path());
+        let mutation = command(
+            "durable-approval-approve",
+            ClientCommand::ApprovalRespond {
+                session_id: SessionId("session-missing".to_owned()),
+                approval_id: ApprovalId("approval-missing".to_owned()),
+                approval_subject_digest: ApprovalSubjectDigest {
+                    algorithm: "sha256".to_owned(),
+                    schema_version: 1,
+                    value: "0".repeat(64),
+                },
+                decision: ApprovalDecision::Approve,
+            },
+        );
+
+        let reply = state.handle(&mutation);
+        assert_protocol_error(&reply, ProtocolErrorCode::SessionNotFound);
+
+        let query_command = command(
+            "durable-question-respond-check",
+            ClientCommand::ProjectSnapshot {
+                project_id: ProjectId("project-1".to_owned()),
+            },
+        );
+        let query = state.handle(&query_command);
+        assert_protocol_error(&query, ProtocolErrorCode::ProjectNotFound);
+        let digest = external_command_payload_digest(mutation.protocol_version, &mutation.command)
+            .expect("计算未接线 mutation 摘要");
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("拒绝 mutation 后 durable backend 保持 Ready")
+                .lookup_command(&mutation.client_id, &mutation.client_command_id, &digest,)
+                .expect("查询拒绝 mutation control index"),
+            CommandLookup::Unseen
+        );
+        assert_eq!(durable_file_snapshot(root.path()), files_before);
+    }
+
+    fn assert_typed_hex_id(value: &str, prefix: &str) {
+        let hex = value
+            .strip_prefix(prefix)
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .expect("ID 使用冻结的 typed prefix");
+        assert_eq!(hex.len(), 32);
+        assert!(
+            hex.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+
+    #[test]
+    fn durable_project_create_commits_exact_reply_and_rebuilds_after_reopen() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let create = create_command("durable-project-create", "  Etude  ");
+
+        let first = state.handle(&create);
+        let CommandOutcome::Success {
+            result: CommandResult::ProjectCreated(created),
+        } = &first.outcome
+        else {
+            panic!("预期 durable ProjectCreated reply");
+        };
+        assert_eq!(created.name, "Etude");
+        assert_eq!(created.version, 1);
+        assert_typed_hex_id(&created.project_id.0, "project");
+
+        let domain = state.handle(&command(
+            "durable-project-domain",
+            ClientCommand::ProjectDomainSnapshot {
+                project_id: created.project_id.clone(),
+            },
+        ));
+        let CommandOutcome::Success {
+            result: CommandResult::ProjectDomainSnapshot(domain),
+        } = domain.outcome
+        else {
+            panic!("预期已发布的 B1 Project projection");
+        };
+        assert_eq!(domain.project_id, created.project_id);
+        assert_typed_hex_id(&domain.score_id, "score");
+        assert_eq!(domain.takes.len(), 1);
+        assert_typed_hex_id(&domain.takes[0].take_id, "take");
+        assert_eq!(domain.branches.len(), 1);
+        assert_typed_hex_id(&domain.branches[0].branch_id, "branch");
+
+        let files_after_commit = durable_file_snapshot(root.path());
+        assert_eq!(state.handle(&create), first);
+        assert_eq!(durable_file_snapshot(root.path()), files_after_commit);
+
+        let conflict = create_command("durable-project-create", "Nocturne");
+        assert_protocol_error(
+            &state.handle(&conflict),
+            ProtocolErrorCode::IdempotencyConflict,
+        );
+        assert_eq!(durable_file_snapshot(root.path()), files_after_commit);
+
+        let project_id = created.project_id.clone();
+        drop(state);
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("重开 durable runtime");
+        let mut reopened = DurableServiceState::new(runtime);
+        let files_before_replay = durable_file_snapshot(root.path());
+        assert_eq!(reopened.handle(&create), first);
+        assert_eq!(durable_file_snapshot(root.path()), files_before_replay);
+        let snapshot = reopened.handle(&command(
+            "durable-project-snapshot",
+            ClientCommand::ProjectSnapshot { project_id },
+        ));
+        assert!(matches!(
+            snapshot.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::ProjectSnapshot(ref value)
+            } if value == created
+        ));
+    }
+
+    #[test]
+    fn durable_project_create_rejects_before_prepared_and_reserves_internal_namespace() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let files_before = durable_file_snapshot(root.path());
+        let invalid = create_command("durable-project-invalid", "   ");
+
+        assert_protocol_error(&state.handle(&invalid), ProtocolErrorCode::InvalidRequest);
+        let invalid_digest =
+            external_command_payload_digest(invalid.protocol_version, &invalid.command)
+                .expect("计算无效 ProjectCreate 摘要");
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("Prepared 前拒绝保持 Ready")
+                .lookup_command(
+                    &invalid.client_id,
+                    &invalid.client_command_id,
+                    &invalid_digest,
+                )
+                .expect("查询无效 ProjectCreate command index"),
+            CommandLookup::Unseen
+        );
+
+        let internal = CommandEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            client_id: ClientId("__alda_internal_external-forgery".to_owned()),
+            client_command_id: ClientCommandId("durable-project-internal".to_owned()),
+            command: ClientCommand::ProjectCreate {
+                name: "Etude".to_owned(),
+            },
+        };
+        assert_protocol_error(&state.handle(&internal), ProtocolErrorCode::InvalidRequest);
+        assert_eq!(durable_file_snapshot(root.path()), files_before);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一测试连续证明 exact reply、发布 generation、事件页与重开幂等闭包"
+    )]
+    fn durable_session_start_commits_exact_reply_and_rebuilds_after_reopen() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let project = state.handle(&create_command("session-project", "Etude"));
+        let CommandOutcome::Success {
+            result: CommandResult::ProjectCreated(project),
+        } = project.outcome
+        else {
+            panic!("预期 durable ProjectCreated reply");
+        };
+        let start = command(
+            "durable-session-start",
+            ClientCommand::SessionStart {
+                project_id: project.project_id.clone(),
+            },
+        );
+
+        let first = state.handle(&start);
+        let CommandOutcome::Success {
+            result: CommandResult::SessionStarted(created),
+        } = &first.outcome
+        else {
+            panic!("预期 durable SessionStarted reply");
+        };
+        assert_typed_hex_id(&created.session_id.0, "session");
+        assert_eq!(created.project_id, project.project_id);
+        assert_eq!(created.stream_epoch, SESSION_STREAM_EPOCH);
+        assert_eq!(created.covered_through_sequence, 1);
+        assert!(created.turns.is_empty());
+        assert!(created.questions.is_empty());
+        assert!(created.approvals.is_empty());
+
+        let published = state
+            .ready_runtime()
+            .expect("SessionStart 后 durable backend 保持 Ready")
+            .read_view();
+        assert_eq!(published.sessions.len(), 1);
+        assert_eq!(
+            published.sessions[&created.session_id.0].snapshot(),
+            created
+        );
+        let snapshot = state.handle(&command(
+            "durable-session-snapshot",
+            ClientCommand::SessionSnapshot {
+                session_id: created.session_id.clone(),
+            },
+        ));
+        assert!(matches!(
+            snapshot.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::SessionSnapshot(ref value)
+            } if value == created
+        ));
+        let resumed = state.handle(&command(
+            "durable-session-resume",
+            ClientCommand::EventResume {
+                cursor: StreamCursor {
+                    stream_kind: StreamKind::SessionRollout,
+                    stream_id: created.session_id.0.clone(),
+                    epoch: SESSION_STREAM_EPOCH,
+                    after_sequence: 0,
+                },
+            },
+        ));
+        assert!(matches!(
+            resumed.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::EventsResumed(ref page)
+            } if matches!(
+                page.events.as_slice(),
+                [SessionEvent {
+                    sequence: 1,
+                    event: SessionEventKind::SessionStarted { session_id, project_id },
+                }] if session_id == &created.session_id && project_id == &created.project_id
+            )
+        ));
+
+        let files_after_commit = durable_file_snapshot(root.path());
+        assert_eq!(state.handle(&start), first);
+        assert_eq!(durable_file_snapshot(root.path()), files_after_commit);
+        let conflict = command(
+            "durable-session-start",
+            ClientCommand::SessionStart {
+                project_id: ProjectId("project-different".to_owned()),
+            },
+        );
+        assert_protocol_error(
+            &state.handle(&conflict),
+            ProtocolErrorCode::IdempotencyConflict,
+        );
+        assert_eq!(durable_file_snapshot(root.path()), files_after_commit);
+
+        let session_id = created.session_id.clone();
+        drop(state);
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("重开 durable runtime");
+        let mut reopened = DurableServiceState::new(runtime);
+        let files_before_replay = durable_file_snapshot(root.path());
+        assert_eq!(reopened.handle(&start), first);
+        assert_eq!(durable_file_snapshot(root.path()), files_before_replay);
+        assert_eq!(
+            reopened
+                .ready_runtime()
+                .expect("重开后 durable backend 保持 Ready")
+                .session_snapshot(&session_id)
+                .as_ref(),
+            Some(created)
+        );
+    }
+
+    #[test]
+    fn durable_session_start_rejects_before_prepared_and_reserves_internal_namespace() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let files_before = durable_file_snapshot(root.path());
+        let missing = command(
+            "durable-session-missing-project",
+            ClientCommand::SessionStart {
+                project_id: ProjectId("project-missing".to_owned()),
+            },
+        );
+
+        assert_protocol_error(&state.handle(&missing), ProtocolErrorCode::ProjectNotFound);
+        let missing_digest =
+            external_command_payload_digest(missing.protocol_version, &missing.command)
+                .expect("计算缺失 Project 的 SessionStart 摘要");
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("Prepared 前拒绝保持 Ready")
+                .lookup_command(
+                    &missing.client_id,
+                    &missing.client_command_id,
+                    &missing_digest,
+                )
+                .expect("查询拒绝后的 command index"),
+            CommandLookup::Unseen
+        );
+
+        let internal = CommandEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            client_id: ClientId("__alda_internal_external-forgery".to_owned()),
+            client_command_id: ClientCommandId("durable-session-internal".to_owned()),
+            command: ClientCommand::SessionStart {
+                project_id: ProjectId("project-missing".to_owned()),
+            },
+        };
+        assert_protocol_error(&state.handle(&internal), ProtocolErrorCode::InvalidRequest);
+        assert_eq!(durable_file_snapshot(root.path()), files_before);
+        assert!(
+            state
+                .ready_runtime()
+                .expect("Prepared 前拒绝不得发布 Session")
+                .read_view()
+                .sessions
+                .is_empty()
+        );
+    }
+
+    fn durable_chain_until_question(
+        state: &mut DurableServiceState,
+        command_prefix: &str,
+        prompt: &str,
+    ) -> (ProjectId, SessionId, TurnId, PendingQuestion) {
+        let project = state.handle(&create_command(
+            &format!("{command_prefix}-project"),
+            "Etude",
+        ));
+        let CommandOutcome::Success {
+            result: CommandResult::ProjectCreated(project),
+        } = project.outcome
+        else {
+            panic!("预期 durable ProjectCreated reply");
+        };
+        let session = state.handle(&command(
+            format!("{command_prefix}-session"),
+            ClientCommand::SessionStart {
+                project_id: project.project_id.clone(),
+            },
+        ));
+        let CommandOutcome::Success {
+            result: CommandResult::SessionStarted(session),
+        } = session.outcome
+        else {
+            panic!("预期 durable SessionStarted reply");
+        };
+        let turn = state.handle(&command(
+            format!("{command_prefix}-turn"),
+            ClientCommand::TurnStart {
+                session_id: session.session_id.clone(),
+                prompt: prompt.to_owned(),
+            },
+        ));
+        let CommandOutcome::Success {
+            result: CommandResult::TurnStarted(turn),
+        } = turn.outcome
+        else {
+            panic!("预期 durable TurnStarted reply");
+        };
+        let snapshot = state
+            .ready_runtime()
+            .expect("TurnStart 后 durable backend 保持 Ready")
+            .session_snapshot(&session.session_id)
+            .expect("TurnStart 发布 Session snapshot");
+        let question = snapshot
+            .questions
+            .first()
+            .expect("TurnStart 原子发布首个 Question")
+            .clone();
+        (
+            project.project_id,
+            session.session_id,
+            turn.turn_id,
+            question,
+        )
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一向量闭合 TurnStart、pending Question cancel 与 command-only terminal 回复"
+    )]
+    fn durable_turn_mutation_preserves_order_exact_reply_and_terminal_authorization() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let (project_id, session_id, turn_id, question) =
+            durable_chain_until_question(&mut state, "turn-chain", "  Write an etude  ");
+
+        assert_typed_hex_id(&turn_id.0, "turn");
+        assert_typed_hex_id(&question.question_id.0, "question");
+        assert_eq!(question.owner_turn_id, turn_id);
+        assert_eq!(question.created_sequence, 3);
+        let snapshot = state
+            .ready_runtime()
+            .expect("TurnStart 后保持 Ready")
+            .session_snapshot(&session_id)
+            .expect("读取 TurnStart snapshot");
+        assert_eq!(snapshot.covered_through_sequence, 3);
+        assert_eq!(snapshot.turns[0].status, TurnStatus::WaitingForInput);
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("TurnStart 后保持 Ready")
+                .canonical_prompt(&session_id, &turn_id)
+                .expect("读取 canonical prompt"),
+            "Write an etude"
+        );
+
+        let second = state.handle(&command(
+            "turn-chain-second-session",
+            ClientCommand::SessionStart {
+                project_id: project_id.clone(),
+            },
+        ));
+        let CommandOutcome::Success {
+            result: CommandResult::SessionStarted(second),
+        } = second.outcome
+        else {
+            panic!("预期第二个 durable Session");
+        };
+        let mismatch = command(
+            "turn-chain-owner-mismatch",
+            ClientCommand::TurnCancel {
+                session_id: second.session_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+        );
+        assert_protocol_error(
+            &state.handle(&mismatch),
+            ProtocolErrorCode::TurnOwnershipMismatch,
+        );
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("ownership command-only 后保持 Ready")
+                .session_snapshot(&session_id)
+                .expect("读取 owner Session")
+                .covered_through_sequence,
+            3
+        );
+
+        let cancel = command(
+            "turn-chain-cancel",
+            ClientCommand::TurnCancel {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+        );
+        let cancelled = state.handle(&cancel);
+        assert!(matches!(
+            cancelled.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::TurnCancelled(ref turn)
+            } if turn.status == TurnStatus::Cancelled && turn.terminal_sequence == Some(6)
+        ));
+        let files_after_cancel = durable_file_snapshot(root.path());
+        assert_eq!(state.handle(&cancel), cancelled);
+        assert_eq!(durable_file_snapshot(root.path()), files_after_cancel);
+
+        let page = state.handle(&command(
+            "turn-chain-events",
+            ClientCommand::EventResume {
+                cursor: StreamCursor {
+                    stream_kind: StreamKind::SessionRollout,
+                    stream_id: session_id.0.clone(),
+                    epoch: SESSION_STREAM_EPOCH,
+                    after_sequence: 3,
+                },
+            },
+        ));
+        assert!(matches!(
+            page.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::EventsResumed(ref page)
+            } if matches!(
+                page.events.as_slice(),
+                [
+                    SessionEvent { event: SessionEventKind::TurnCancelRequested { .. }, .. },
+                    SessionEvent { event: SessionEventKind::QuestionOwnerTurnAborted { .. }, .. },
+                    SessionEvent { event: SessionEventKind::TurnCompleted { status: TurnStatus::Cancelled, .. }, .. },
+                ]
+            )
+        ));
+
+        let terminal = command(
+            "turn-chain-terminal",
+            ClientCommand::TurnCancel {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+        );
+        assert!(matches!(
+            state.handle(&terminal).outcome,
+            CommandOutcome::Success {
+                result: CommandResult::TurnAlreadyTerminal {
+                    terminal_status: TurnStatus::Cancelled,
+                    terminal_sequence: 6,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("terminal command-only 后保持 Ready")
+                .session_snapshot(&session_id)
+                .expect("读取 terminal Session")
+                .covered_through_sequence,
+            6
+        );
+    }
+
+    #[test]
+    fn durable_turn_mutation_cancels_pending_approval_in_order() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let (_project_id, session_id, turn_id, question) =
+            durable_chain_until_question(&mut state, "turn-approval-cancel", "Approval cancel");
+        let answered = state.handle(&command(
+            "turn-approval-cancel-question",
+            ClientCommand::QuestionRespond {
+                session_id: session_id.clone(),
+                question_id: question.question_id,
+                choice_id: ChoiceId("bars_8".to_owned()),
+            },
+        ));
+        assert!(matches!(
+            answered.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::QuestionAnswered(_)
+            }
+        ));
+
+        let cancelled = state.handle(&command(
+            "turn-approval-cancel-command",
+            ClientCommand::TurnCancel {
+                session_id: session_id.clone(),
+                turn_id,
+            },
+        ));
+        assert!(matches!(
+            cancelled.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::TurnCancelled(ref turn)
+            } if turn.status == TurnStatus::Cancelled && turn.terminal_sequence == Some(8)
+        ));
+        let page = state.handle(&command(
+            "turn-approval-cancel-events",
+            ClientCommand::EventResume {
+                cursor: StreamCursor {
+                    stream_kind: StreamKind::SessionRollout,
+                    stream_id: session_id.0,
+                    epoch: SESSION_STREAM_EPOCH,
+                    after_sequence: 5,
+                },
+            },
+        ));
+        assert!(matches!(
+            page.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::EventsResumed(ref page)
+            } if matches!(
+                page.events.as_slice(),
+                [
+                    SessionEvent { event: SessionEventKind::TurnCancelRequested { .. }, .. },
+                    SessionEvent { event: SessionEventKind::ApprovalOwnerTurnAborted { .. }, .. },
+                    SessionEvent { event: SessionEventKind::TurnCompleted { status: TurnStatus::Cancelled, .. }, .. },
+                ]
+            )
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一向量闭合 Question resolution、Approval subject、幂等与重启重建"
+    )]
+    fn durable_question_mutation_uses_canonical_subject_and_rebuilds_exact_reply() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let (project_id, session_id, turn_id, question) =
+            durable_chain_until_question(&mut state, "question-chain", "  Canonical motif  ");
+        let second = state.handle(&command(
+            "question-chain-second-session",
+            ClientCommand::SessionStart {
+                project_id: project_id.clone(),
+            },
+        ));
+        let CommandOutcome::Success {
+            result: CommandResult::SessionStarted(second),
+        } = second.outcome
+        else {
+            panic!("预期第二个 durable Session");
+        };
+        let mismatch = command(
+            "question-chain-owner-mismatch",
+            ClientCommand::QuestionRespond {
+                session_id: second.session_id,
+                question_id: question.question_id.clone(),
+                choice_id: ChoiceId("bars_8".to_owned()),
+            },
+        );
+        assert_protocol_error(
+            &state.handle(&mismatch),
+            ProtocolErrorCode::QuestionOwnershipMismatch,
+        );
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("Question ownership command-only 后保持 Ready")
+                .session_snapshot(&session_id)
+                .expect("读取 Question owner Session")
+                .covered_through_sequence,
+            3
+        );
+        let respond = command(
+            "question-chain-respond",
+            ClientCommand::QuestionRespond {
+                session_id: session_id.clone(),
+                question_id: question.question_id.clone(),
+                choice_id: ChoiceId("bars_8".to_owned()),
+            },
+        );
+
+        let answered = state.handle(&respond);
+        assert!(matches!(
+            answered.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::QuestionAnswered(ref value)
+            } if value.status == QuestionStatus::Answered
+                && value.terminal_sequence == Some(4)
+                && value.answer.as_ref().is_some_and(|answer| answer.choice_id.0 == "bars_8")
+        ));
+        let snapshot = state
+            .ready_runtime()
+            .expect("QuestionRespond 后保持 Ready")
+            .session_snapshot(&session_id)
+            .expect("读取 QuestionRespond snapshot");
+        assert_eq!(snapshot.covered_through_sequence, 5);
+        let approval = snapshot.approvals.first().expect("原子发布 Approval");
+        assert_typed_hex_id(&approval.approval_id.0, "approval");
+        assert_eq!(approval.created_sequence, 5);
+        assert_eq!(approval.owner_turn_id, turn_id);
+        assert_eq!(
+            approval.approval_subject_digest,
+            approval_subject_digest_for_test(
+                "https://api.openai.com",
+                &["constraints", "prompt"],
+                &turn_id,
+                "Canonical motif",
+            )
+        );
+
+        let files_after_answer = durable_file_snapshot(root.path());
+        assert_eq!(state.handle(&respond), answered);
+        assert_eq!(durable_file_snapshot(root.path()), files_after_answer);
+        let conflict = command(
+            "question-chain-respond",
+            ClientCommand::QuestionRespond {
+                session_id: session_id.clone(),
+                question_id: question.question_id.clone(),
+                choice_id: ChoiceId("bars_16".to_owned()),
+            },
+        );
+        assert_protocol_error(
+            &state.handle(&conflict),
+            ProtocolErrorCode::IdempotencyConflict,
+        );
+
+        let already = command(
+            "question-chain-already",
+            ClientCommand::QuestionRespond {
+                session_id: session_id.clone(),
+                question_id: question.question_id.clone(),
+                choice_id: ChoiceId("bars_16".to_owned()),
+            },
+        );
+        assert!(matches!(
+            state.handle(&already).outcome,
+            CommandOutcome::Success {
+                result: CommandResult::QuestionAlreadyResolved(ref value)
+            } if value.status == QuestionStatus::Answered && value.terminal_sequence == Some(4)
+        ));
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("Question command-only 后保持 Ready")
+                .session_snapshot(&session_id)
+                .expect("读取 Question command-only snapshot")
+                .covered_through_sequence,
+            5
+        );
+
+        drop(state);
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("重开 durable runtime");
+        let mut reopened = DurableServiceState::new(runtime);
+        let files_before_retry = durable_file_snapshot(root.path());
+        assert_eq!(reopened.handle(&respond), answered);
+        assert_eq!(durable_file_snapshot(root.path()), files_before_retry);
+        assert_eq!(
+            reopened
+                .ready_runtime()
+                .expect("重开后保持 Ready")
+                .session_snapshot(&session_id)
+                .expect("重建 QuestionRespond snapshot"),
+            snapshot
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一向量闭合 deny Session facts、无 Artifact 边界、command-only 与重启重建"
+    )]
+    fn durable_approval_deny_writes_only_session_facts_and_rebuilds_exact_reply() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let (project_id, session_id, turn_id, question) =
+            durable_chain_until_question(&mut state, "deny-chain", "Deny fixture");
+        let answered = state.handle(&command(
+            "deny-chain-question",
+            ClientCommand::QuestionRespond {
+                session_id: session_id.clone(),
+                question_id: question.question_id,
+                choice_id: ChoiceId("bars_8".to_owned()),
+            },
+        ));
+        assert!(matches!(
+            answered.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::QuestionAnswered(_)
+            }
+        ));
+        let before = state
+            .ready_runtime()
+            .expect("QuestionRespond 后保持 Ready")
+            .session_snapshot(&session_id)
+            .expect("读取 pending Approval");
+        let approval = before.approvals[0].clone();
+        let second = state.handle(&command(
+            "deny-chain-second-session",
+            ClientCommand::SessionStart {
+                project_id: project_id.clone(),
+            },
+        ));
+        let CommandOutcome::Success {
+            result: CommandResult::SessionStarted(second),
+        } = second.outcome
+        else {
+            panic!("预期第二个 durable Session");
+        };
+        let mismatch = command(
+            "deny-chain-owner-mismatch",
+            ClientCommand::ApprovalRespond {
+                session_id: second.session_id,
+                approval_id: approval.approval_id.clone(),
+                approval_subject_digest: approval.approval_subject_digest.clone(),
+                decision: ApprovalDecision::Deny,
+            },
+        );
+        assert_protocol_error(
+            &state.handle(&mismatch),
+            ProtocolErrorCode::ApprovalOwnershipMismatch,
+        );
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("Approval ownership command-only 后保持 Ready")
+                .session_snapshot(&session_id)
+                .expect("读取 Approval owner Session")
+                .covered_through_sequence,
+            5
+        );
+        let project_head_before = state
+            .ready_runtime()
+            .expect("deny 前保持 Ready")
+            .project_head(&project_id)
+            .expect("读取 Project head");
+        let deny = command(
+            "deny-chain-approval",
+            ClientCommand::ApprovalRespond {
+                session_id: session_id.clone(),
+                approval_id: approval.approval_id.clone(),
+                approval_subject_digest: approval.approval_subject_digest.clone(),
+                decision: ApprovalDecision::Deny,
+            },
+        );
+
+        let denied = state.handle(&deny);
+        assert!(matches!(
+            denied.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::ApprovalDecided {
+                    approval: ref value,
+                    artifact_manifest: None,
+                }
+            } if value.status == ApprovalStatus::Denied
+                && value.terminal_sequence == Some(6)
+                && value.decision == Some(ApprovalDecision::Deny)
+        ));
+        let snapshot = state
+            .ready_runtime()
+            .expect("deny 后保持 Ready")
+            .session_snapshot(&session_id)
+            .expect("读取 deny snapshot");
+        assert_eq!(snapshot.covered_through_sequence, 7);
+        assert_eq!(snapshot.turns[0].turn_id, turn_id);
+        assert_eq!(snapshot.turns[0].status, TurnStatus::Failed);
+        assert_eq!(snapshot.turns[0].terminal_sequence, Some(7));
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("deny 后保持 Ready")
+                .project_head(&project_id)
+                .expect("读取 deny 后 Project head"),
+            project_head_before
+        );
+        assert!(
+            state
+                .ready_runtime()
+                .expect("deny 后保持 Ready")
+                .project_projection(&project_id)
+                .expect("读取 deny 后 Project projection")
+                .artifacts
+                .is_empty()
+        );
+
+        let files_after_deny = durable_file_snapshot(root.path());
+        assert_eq!(state.handle(&deny), denied);
+        assert_eq!(durable_file_snapshot(root.path()), files_after_deny);
+        let already = command(
+            "deny-chain-already",
+            ClientCommand::ApprovalRespond {
+                session_id: session_id.clone(),
+                approval_id: approval.approval_id.clone(),
+                approval_subject_digest: approval.approval_subject_digest.clone(),
+                decision: ApprovalDecision::Deny,
+            },
+        );
+        assert!(matches!(
+            state.handle(&already).outcome,
+            CommandOutcome::Success {
+                result: CommandResult::ApprovalAlreadyResolved(ref value)
+            } if value.status == ApprovalStatus::Denied && value.terminal_sequence == Some(6)
+        ));
+        assert_eq!(
+            state
+                .ready_runtime()
+                .expect("Approval command-only 后保持 Ready")
+                .session_snapshot(&session_id)
+                .expect("读取 Approval command-only snapshot")
+                .covered_through_sequence,
+            7
+        );
+
+        drop(state);
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("重开 durable runtime");
+        let mut reopened = DurableServiceState::new(runtime);
+        let files_before_retry = durable_file_snapshot(root.path());
+        assert_eq!(reopened.handle(&deny), denied);
+        assert_eq!(durable_file_snapshot(root.path()), files_before_retry);
+        assert_eq!(
+            reopened
+                .ready_runtime()
+                .expect("重开 deny 后保持 Ready")
+                .session_snapshot(&session_id)
+                .expect("重建 deny snapshot"),
+            snapshot
+        );
+    }
+
+    fn durable_chain_until_approval(
+        state: &mut DurableServiceState,
+        command_prefix: &str,
+    ) -> (ProjectId, SessionId, TurnId, PendingApproval) {
+        let (project_id, session_id, turn_id, question) =
+            durable_chain_until_question(state, command_prefix, "Durable approval fixture");
+        let answered = state.handle(&command(
+            format!("{command_prefix}-question"),
+            ClientCommand::QuestionRespond {
+                session_id: session_id.clone(),
+                question_id: question.question_id,
+                choice_id: ChoiceId("bars_8".to_owned()),
+            },
+        ));
+        assert!(matches!(
+            answered.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::QuestionAnswered(_)
+            }
+        ));
+        let approval = state
+            .ready_runtime()
+            .expect("QuestionRespond 后保持 Ready")
+            .session_snapshot(&session_id)
+            .expect("读取 pending Approval")
+            .approvals[0]
+            .clone();
+        (project_id, session_id, turn_id, approval)
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一向量闭合 approve 双 aggregate、exact reply、digest conflict 与重启重建"
+    )]
+    fn durable_approval_artifact_commits_both_aggregates_and_exact_reply() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let (project_id, session_id, turn_id, approval) =
+            durable_chain_until_approval(&mut state, "approve-chain");
+        let project_head_before = state
+            .ready_runtime()
+            .expect("approve 前保持 Ready")
+            .project_head(&project_id)
+            .expect("读取 Project head");
+        let approve = command(
+            "approve-chain-command",
+            ClientCommand::ApprovalRespond {
+                session_id: session_id.clone(),
+                approval_id: approval.approval_id.clone(),
+                approval_subject_digest: approval.approval_subject_digest.clone(),
+                decision: ApprovalDecision::Approve,
+            },
+        );
+
+        let first = state.handle(&approve);
+        let CommandOutcome::Success {
+            result:
+                CommandResult::ApprovalDecided {
+                    approval: decided,
+                    artifact_manifest: Some(manifest),
+                },
+        } = &first.outcome
+        else {
+            panic!("预期 durable Approval approve reply");
+        };
+        assert_eq!(decided.status, ApprovalStatus::Approved);
+        assert_eq!(decided.decision, Some(ApprovalDecision::Approve));
+        assert_eq!(decided.terminal_sequence, Some(6));
+        assert_eq!(manifest.project_id, project_id);
+        assert_eq!(manifest.source_session_id, session_id);
+        assert_eq!(manifest.source_turn_id, turn_id);
+        assert_eq!(manifest.created_sequence, 6);
+        assert_eq!(manifest.durability, ArtifactDurability::DurableLocal);
+        assert_typed_hex_id(&manifest.artifact_occurrence_id.0, "occurrence");
+        assert_eq!(manifest.artifact_hash.as_str(), FIXTURE_HASH);
+
+        let runtime = state.ready_runtime().expect("approve 后保持 Ready");
+        let session = runtime
+            .session_snapshot(&session_id)
+            .expect("approve 原子发布 Session");
+        assert_eq!(session.covered_through_sequence, 7);
+        assert_eq!(session.approvals[0], *decided);
+        assert_eq!(session.turns[0].status, TurnStatus::Succeeded);
+        assert_eq!(session.turns[0].terminal_sequence, Some(7));
+        let project_head_after = runtime
+            .project_head(&project_id)
+            .expect("读取 Project head");
+        assert_eq!(
+            project_head_after.last_sequence,
+            project_head_before.last_sequence + 1
+        );
+        let project = runtime
+            .project_projection(&project_id)
+            .expect("approve 原子发布 Project");
+        assert!(project.revisions.is_empty());
+        assert_eq!(project.artifacts.len(), 1);
+        assert!(
+            runtime
+                .occurrence(&project_id, &manifest.artifact_occurrence_id)
+                .is_some_and(|stored| stored == manifest)
+        );
+
+        let files_after_commit = durable_file_snapshot(root.path());
+        assert_eq!(state.handle(&approve), first);
+        assert_eq!(durable_file_snapshot(root.path()), files_after_commit);
+        let conflict = command(
+            "approve-chain-command",
+            ClientCommand::ApprovalRespond {
+                session_id: session_id.clone(),
+                approval_id: approval.approval_id,
+                approval_subject_digest: approval.approval_subject_digest,
+                decision: ApprovalDecision::Deny,
+            },
+        );
+        assert_protocol_error(
+            &state.handle(&conflict),
+            ProtocolErrorCode::IdempotencyConflict,
+        );
+        assert_eq!(durable_file_snapshot(root.path()), files_after_commit);
+
+        let expected_session = session;
+        let expected_manifest = manifest.clone();
+        drop(state);
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("重开 durable runtime");
+        let mut reopened = DurableServiceState::new(runtime);
+        let files_before_retry = durable_file_snapshot(root.path());
+        assert_eq!(reopened.handle(&approve), first);
+        assert_eq!(durable_file_snapshot(root.path()), files_before_retry);
+        let runtime = reopened.ready_runtime().expect("重开后保持 Ready");
+        assert_eq!(
+            runtime
+                .session_snapshot(&session_id)
+                .expect("重建 approve Session"),
+            expected_session
+        );
+        assert_eq!(
+            runtime.occurrence(&project_id, &expected_manifest.artifact_occurrence_id),
+            Some(&expected_manifest)
+        );
+    }
+
+    #[test]
+    fn durable_artifact_query_download_enforces_committed_project_reachability() {
+        let root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+        let mut state = DurableServiceState::new(runtime);
+        let (project_id, session_id, _turn_id, approval) =
+            durable_chain_until_approval(&mut state, "artifact-query");
+        let approve = command(
+            "artifact-query-approve",
+            ClientCommand::ApprovalRespond {
+                session_id,
+                approval_id: approval.approval_id,
+                approval_subject_digest: approval.approval_subject_digest,
+                decision: ApprovalDecision::Approve,
+            },
+        );
+        let approved = state.handle(&approve);
+        let CommandOutcome::Success {
+            result:
+                CommandResult::ApprovalDecided {
+                    artifact_manifest: Some(manifest),
+                    ..
+                },
+        } = approved.outcome
+        else {
+            panic!("预期 durable Artifact manifest");
+        };
+
+        let query = state.handle(&command(
+            "artifact-query-manifest",
+            ClientCommand::ArtifactManifest {
+                project_id: project_id.clone(),
+                artifact_occurrence_id: manifest.artifact_occurrence_id.clone(),
+            },
+        ));
+        assert!(matches!(
+            query.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::ArtifactManifest(ref stored)
+            } if stored == &manifest
+        ));
+        for (id, candidate_project, candidate_occurrence) in [
+            (
+                "artifact-query-wrong-project",
+                ProjectId("project-missing".to_owned()),
+                manifest.artifact_occurrence_id.clone(),
+            ),
+            (
+                "artifact-query-missing-occurrence",
+                project_id.clone(),
+                ArtifactOccurrenceId("occurrence-missing".to_owned()),
+            ),
+        ] {
+            assert_protocol_error(
+                &state.handle(&command(
+                    id,
+                    ClientCommand::ArtifactManifest {
+                        project_id: candidate_project,
+                        artifact_occurrence_id: candidate_occurrence,
+                    },
+                )),
+                ProtocolErrorCode::ArtifactNotFound,
+            );
+        }
+
+        let verified = state.resolve_artifact_download(&project_id, &manifest.artifact_hash, None);
+        let DownloadResolution::Verified(download) = verified else {
+            panic!("预期 same-handle verified download");
+        };
+        assert_eq!(&*download.bytes, FIXTURE_BYTES);
+        assert_eq!(download.size_bytes, FIXTURE_SIZE);
+        assert_eq!(download.mime_type, FIXTURE_MIME);
+        assert_eq!(
+            state.resolve_artifact_download(
+                &project_id,
+                &manifest.artifact_hash,
+                Some(&format!("\"{}\"", manifest.artifact_hash.as_str())),
+            ),
+            DownloadResolution::NotModified(manifest.artifact_hash.clone())
+        );
+        let unreachable = ArtifactHash::parse(
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("有效的不可达 hash");
+        assert_eq!(
+            state.resolve_artifact_download(&project_id, &unreachable, None),
+            DownloadResolution::NotFound
+        );
+        assert_eq!(
+            state.resolve_artifact_download(
+                &ProjectId("project-missing".to_owned()),
+                &manifest.artifact_hash,
+                None,
+            ),
+            DownloadResolution::NotFound
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BackendSemanticsScenario {
+        Happy,
+        Deny,
+        QuestionCancel,
+        ApprovalCancel,
+    }
+
+    impl BackendSemanticsScenario {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Happy => "happy",
+                Self::Deny => "deny",
+                Self::QuestionCancel => "question-cancel",
+                Self::ApprovalCancel => "approval-cancel",
+            }
+        }
+    }
+
+    enum SemanticsBackend {
+        Memory(Box<ServiceState>),
+        Durable(DurableServiceState),
+    }
+
+    impl SemanticsBackend {
+        fn handle(&mut self, envelope: &CommandEnvelope) -> CommandReply {
+            match self {
+                Self::Memory(state) => state.handle(envelope.clone()),
+                Self::Durable(state) => state.handle(envelope),
+            }
+        }
+
+        fn download(&self, project_id: &ProjectId, hash: &ArtifactHash) -> DownloadResolution {
+            match self {
+                Self::Memory(state) => state.resolve_download(project_id, hash, None),
+                Self::Durable(state) => state.resolve_artifact_download(project_id, hash, None),
+            }
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ArtifactWireObservation {
+        hash: String,
+        kind: ArtifactKind,
+        mime_type: String,
+        size_bytes: u64,
+        producer: ArtifactProducer,
+        fixture_version: u32,
+        created_sequence: u64,
+        provenance_label: String,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct DownloadWireObservation {
+        hash: String,
+        mime_type: String,
+        size_bytes: u64,
+        bytes: Vec<u8>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct BackendWireObservation {
+        project_name: String,
+        project_version: u64,
+        covered_through_sequence: u64,
+        turn_status: TurnStatus,
+        turn_terminal_sequence: Option<u64>,
+        question_status: QuestionStatus,
+        question_terminal_sequence: Option<u64>,
+        approval_status: Option<ApprovalStatus>,
+        approval_terminal_sequence: Option<u64>,
+        event_shape: Vec<(u64, &'static str)>,
+        artifact: Option<ArtifactWireObservation>,
+        download: Option<DownloadWireObservation>,
+    }
+
+    struct BackendConformanceResult {
+        wire: BackendWireObservation,
+        artifact_durability: Option<ArtifactDurability>,
+    }
+
+    fn successful_project(reply: CommandReply) -> ProjectSnapshot {
+        let CommandOutcome::Success {
+            result: CommandResult::ProjectCreated(project),
+        } = reply.outcome
+        else {
+            panic!("语义向量预期 ProjectCreated");
+        };
+        project
+    }
+
+    fn successful_session(reply: CommandReply) -> SessionSnapshot {
+        let CommandOutcome::Success {
+            result: CommandResult::SessionStarted(session),
+        } = reply.outcome
+        else {
+            panic!("语义向量预期 SessionStarted");
+        };
+        session
+    }
+
+    fn queried_session(reply: CommandReply) -> SessionSnapshot {
+        let CommandOutcome::Success {
+            result: CommandResult::SessionSnapshot(session),
+        } = reply.outcome
+        else {
+            panic!("语义向量预期 SessionSnapshot");
+        };
+        session
+    }
+
+    const fn event_shape_name(event: &SessionEventKind) -> &'static str {
+        match event {
+            SessionEventKind::SessionStarted { .. } => "session_started",
+            SessionEventKind::TurnStarted { .. } => "turn_started",
+            SessionEventKind::TurnCancelRequested { .. } => "turn_cancel_requested",
+            SessionEventKind::TurnCompleted { .. } => "turn_completed",
+            SessionEventKind::QuestionRequested { .. } => "question_requested",
+            SessionEventKind::QuestionResolved { .. } => "question_resolved",
+            SessionEventKind::ApprovalRequested { .. } => "approval_requested",
+            SessionEventKind::ApprovalResolved { .. } => "approval_resolved",
+            SessionEventKind::QuestionOwnerTurnAborted { .. } => "question_owner_turn_aborted",
+            SessionEventKind::ApprovalOwnerTurnAborted { .. } => "approval_owner_turn_aborted",
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一 table-driven 向量必须连续捕获两种 backend 的 wire 可观察结果"
+    )]
+    fn run_backend_semantics_vector(
+        backend: &mut SemanticsBackend,
+        scenario: BackendSemanticsScenario,
+    ) -> BackendConformanceResult {
+        let label = scenario.label();
+        let create = command(
+            format!("conformance-{label}-project"),
+            ClientCommand::ProjectCreate {
+                name: "Etude".to_owned(),
+            },
+        );
+        let created_reply = backend.handle(&create);
+        assert_eq!(
+            backend.handle(&create),
+            created_reply,
+            "{label}: exact reply"
+        );
+        let project = successful_project(created_reply);
+
+        let start = command(
+            format!("conformance-{label}-session"),
+            ClientCommand::SessionStart {
+                project_id: project.project_id.clone(),
+            },
+        );
+        let session = successful_session(backend.handle(&start));
+        let turn = command(
+            format!("conformance-{label}-turn"),
+            ClientCommand::TurnStart {
+                session_id: session.session_id.clone(),
+                prompt: "Conformance motif".to_owned(),
+            },
+        );
+        let turn_reply = backend.handle(&turn);
+        let CommandOutcome::Success {
+            result: CommandResult::TurnStarted(turn),
+        } = turn_reply.outcome
+        else {
+            panic!("{label}: 语义向量预期 TurnStarted");
+        };
+        let pending = queried_session(backend.handle(&command(
+            format!("conformance-{label}-pending"),
+            ClientCommand::SessionSnapshot {
+                session_id: session.session_id.clone(),
+            },
+        )));
+        let question = pending.questions[0].clone();
+
+        let mut approval = None;
+        if scenario != BackendSemanticsScenario::QuestionCancel {
+            let answered = backend.handle(&command(
+                format!("conformance-{label}-question"),
+                ClientCommand::QuestionRespond {
+                    session_id: session.session_id.clone(),
+                    question_id: question.question_id.clone(),
+                    choice_id: ChoiceId("bars_8".to_owned()),
+                },
+            ));
+            assert!(matches!(
+                answered.outcome,
+                CommandOutcome::Success {
+                    result: CommandResult::QuestionAnswered(_)
+                }
+            ));
+            approval = queried_session(backend.handle(&command(
+                format!("conformance-{label}-approval-pending"),
+                ClientCommand::SessionSnapshot {
+                    session_id: session.session_id.clone(),
+                },
+            )))
+            .approvals
+            .into_iter()
+            .next();
+        }
+
+        let terminal_id = format!("conformance-{label}-terminal");
+        let terminal = match scenario {
+            BackendSemanticsScenario::QuestionCancel | BackendSemanticsScenario::ApprovalCancel => {
+                command(
+                    terminal_id.clone(),
+                    ClientCommand::TurnCancel {
+                        session_id: session.session_id.clone(),
+                        turn_id: turn.turn_id.clone(),
+                    },
+                )
+            }
+            BackendSemanticsScenario::Happy | BackendSemanticsScenario::Deny => {
+                let approval = approval.as_ref().expect("语义向量已建立 pending Approval");
+                command(
+                    terminal_id.clone(),
+                    ClientCommand::ApprovalRespond {
+                        session_id: session.session_id.clone(),
+                        approval_id: approval.approval_id.clone(),
+                        approval_subject_digest: approval.approval_subject_digest.clone(),
+                        decision: if scenario == BackendSemanticsScenario::Happy {
+                            ApprovalDecision::Approve
+                        } else {
+                            ApprovalDecision::Deny
+                        },
+                    },
+                )
+            }
+        };
+        let terminal_reply = backend.handle(&terminal);
+        assert_eq!(
+            backend.handle(&terminal),
+            terminal_reply,
+            "{label}: terminal exact reply"
+        );
+
+        let conflicting = match &terminal.command {
+            ClientCommand::TurnCancel { turn_id, .. } => command(
+                terminal_id,
+                ClientCommand::TurnCancel {
+                    session_id: SessionId("session-different".to_owned()),
+                    turn_id: turn_id.clone(),
+                },
+            ),
+            ClientCommand::ApprovalRespond {
+                session_id,
+                approval_id,
+                approval_subject_digest,
+                decision,
+            } => command(
+                terminal_id,
+                ClientCommand::ApprovalRespond {
+                    session_id: session_id.clone(),
+                    approval_id: approval_id.clone(),
+                    approval_subject_digest: approval_subject_digest.clone(),
+                    decision: if *decision == ApprovalDecision::Approve {
+                        ApprovalDecision::Deny
+                    } else {
+                        ApprovalDecision::Approve
+                    },
+                },
+            ),
+            _ => panic!("语义向量 terminal command 必须是 cancel 或 approval"),
+        };
+        assert_protocol_error(
+            &backend.handle(&conflicting),
+            ProtocolErrorCode::IdempotencyConflict,
+        );
+
+        let final_snapshot = queried_session(backend.handle(&command(
+            format!("conformance-{label}-final"),
+            ClientCommand::SessionSnapshot {
+                session_id: session.session_id.clone(),
+            },
+        )));
+        let events = backend.handle(&command(
+            format!("conformance-{label}-events"),
+            ClientCommand::EventResume {
+                cursor: StreamCursor {
+                    stream_kind: StreamKind::SessionRollout,
+                    stream_id: session.session_id.0.clone(),
+                    epoch: SESSION_STREAM_EPOCH,
+                    after_sequence: 0,
+                },
+            },
+        ));
+        let CommandOutcome::Success {
+            result: CommandResult::EventsResumed(events),
+        } = events.outcome
+        else {
+            panic!("{label}: 语义向量预期 EventsResumed");
+        };
+
+        let (artifact, artifact_durability, download) = match terminal_reply.outcome {
+            CommandOutcome::Success {
+                result:
+                    CommandResult::ApprovalDecided {
+                        artifact_manifest: Some(manifest),
+                        ..
+                    },
+            } => {
+                let queried = backend.handle(&command(
+                    format!("conformance-{label}-manifest"),
+                    ClientCommand::ArtifactManifest {
+                        project_id: project.project_id.clone(),
+                        artifact_occurrence_id: manifest.artifact_occurrence_id.clone(),
+                    },
+                ));
+                assert!(matches!(
+                    queried.outcome,
+                    CommandOutcome::Success {
+                        result: CommandResult::ArtifactManifest(ref value)
+                    } if value == &manifest
+                ));
+                let DownloadResolution::Verified(download) =
+                    backend.download(&project.project_id, &manifest.artifact_hash)
+                else {
+                    panic!("{label}: 语义向量预期 verified download");
+                };
+                (
+                    Some(ArtifactWireObservation {
+                        hash: manifest.artifact_hash.as_str().to_owned(),
+                        kind: manifest.kind,
+                        mime_type: manifest.mime_type.clone(),
+                        size_bytes: manifest.size_bytes,
+                        producer: manifest.producer,
+                        fixture_version: manifest.fixture_version,
+                        created_sequence: manifest.created_sequence,
+                        provenance_label: manifest.provenance_label.clone(),
+                    }),
+                    Some(manifest.durability),
+                    Some(DownloadWireObservation {
+                        hash: download.artifact_hash.as_str().to_owned(),
+                        mime_type: download.mime_type,
+                        size_bytes: download.size_bytes,
+                        bytes: download.bytes.to_vec(),
+                    }),
+                )
+            }
+            _ => (None, None, None),
+        };
+
+        let project_snapshot = backend.handle(&command(
+            format!("conformance-{label}-project-snapshot"),
+            ClientCommand::ProjectSnapshot {
+                project_id: project.project_id,
+            },
+        ));
+        let CommandOutcome::Success {
+            result: CommandResult::ProjectSnapshot(project),
+        } = project_snapshot.outcome
+        else {
+            panic!("{label}: 语义向量预期 ProjectSnapshot");
+        };
+        let turn = &final_snapshot.turns[0];
+        let question = &final_snapshot.questions[0];
+        let final_approval = final_snapshot.approvals.first();
+        BackendConformanceResult {
+            wire: BackendWireObservation {
+                project_name: project.name,
+                project_version: project.version,
+                covered_through_sequence: final_snapshot.covered_through_sequence,
+                turn_status: turn.status,
+                turn_terminal_sequence: turn.terminal_sequence,
+                question_status: question.status,
+                question_terminal_sequence: question.terminal_sequence,
+                approval_status: final_approval.map(|value| value.status),
+                approval_terminal_sequence: final_approval
+                    .and_then(|value| value.terminal_sequence),
+                event_shape: events
+                    .events
+                    .iter()
+                    .map(|event| (event.sequence, event_shape_name(&event.event)))
+                    .collect(),
+                artifact,
+                download,
+            },
+            artifact_durability,
+        }
+    }
+
+    #[test]
+    fn durable_backend_semantics_table_matches_memory_wire_observations() {
+        for scenario in [
+            BackendSemanticsScenario::Happy,
+            BackendSemanticsScenario::Deny,
+            BackendSemanticsScenario::QuestionCancel,
+            BackendSemanticsScenario::ApprovalCancel,
+        ] {
+            let mut memory = SemanticsBackend::Memory(Box::default());
+            let memory_result = run_backend_semantics_vector(&mut memory, scenario);
+
+            let root = durable_test_root();
+            let runtime = ReadyDurableRuntime::open(root.path()).expect("打开 durable runtime");
+            let mut durable = SemanticsBackend::Durable(DurableServiceState::new(runtime));
+            let durable_result = run_backend_semantics_vector(&mut durable, scenario);
+
+            assert_eq!(
+                durable_result.wire,
+                memory_result.wire,
+                "{}: 两种 backend 的 wire 语义必须一致",
+                scenario.label()
+            );
+            if scenario == BackendSemanticsScenario::Happy {
+                assert_eq!(
+                    memory_result.artifact_durability,
+                    Some(ArtifactDurability::ProcessLifetimeFixture)
+                );
+                assert_eq!(
+                    durable_result.artifact_durability,
+                    Some(ArtifactDurability::DurableLocal)
+                );
+            } else {
+                assert_eq!(memory_result.artifact_durability, None);
+                assert_eq!(durable_result.artifact_durability, None);
+            }
+        }
+    }
+
+    #[test]
+    fn durable_backend_fault_service_state_respects_ready_recovering_and_fatal_boundaries() {
+        use crate::durable_runtime::RuntimeFailpoint;
+
+        let rejected_root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(rejected_root.path()).expect("打开 Ready runtime");
+        let mut rejected = DurableServiceState::new(runtime);
+        let before = durable_file_snapshot(rejected_root.path());
+        rejected.set_runtime_failpoint_for_test(RuntimeFailpoint::Prepare);
+        let create = create_command("fault-rejected-project", "Etude");
+        assert_protocol_error(
+            &rejected.handle(&create),
+            ProtocolErrorCode::ServiceUnavailable,
+        );
+        assert_eq!(durable_file_snapshot(rejected_root.path()), before);
+        assert!(rejected.ready_runtime().is_some());
+        assert!(matches!(
+            rejected
+                .handle(&command("fault-rejected-query", ClientCommand::Initialize))
+                .outcome,
+            CommandOutcome::Success { .. }
+        ));
+
+        let recovering_root = durable_test_root();
+        let runtime =
+            ReadyDurableRuntime::open(recovering_root.path()).expect("打开 Recovering runtime");
+        let mut recovering = DurableServiceState::new(runtime);
+        let project = successful_project(
+            recovering.handle(&create_command("fault-recovering-project", "Etude")),
+        );
+        let start = command(
+            "fault-recovering-session",
+            ClientCommand::SessionStart {
+                project_id: project.project_id,
+            },
+        );
+        recovering.set_runtime_failpoint_for_test(RuntimeFailpoint::Session);
+        let recovered_reply = recovering.handle(&start);
+        assert!(matches!(
+            recovered_reply.outcome,
+            CommandOutcome::Success {
+                result: CommandResult::SessionStarted(_)
+            }
+        ));
+        assert_eq!(recovering.handle(&start), recovered_reply);
+        assert!(recovering.ready_runtime().is_some());
+
+        let fatal_root = durable_test_root();
+        let runtime = ReadyDurableRuntime::open(fatal_root.path()).expect("打开 Fatal runtime");
+        let mut fatal = DurableServiceState::new(runtime);
+        let project =
+            successful_project(fatal.handle(&create_command("fault-fatal-project", "Etude")));
+        let start = command(
+            "fault-fatal-session",
+            ClientCommand::SessionStart {
+                project_id: project.project_id.clone(),
+            },
+        );
+        fatal.set_runtime_failpoint_for_test(RuntimeFailpoint::CommitRecoverySync);
+        assert_protocol_error(&fatal.handle(&start), ProtocolErrorCode::ServiceUnavailable);
+        assert!(fatal.ready_runtime().is_none());
+        assert_protocol_error(
+            &fatal.handle(&command("fault-fatal-query", ClientCommand::Initialize)),
+            ProtocolErrorCode::ServiceUnavailable,
+        );
+        let hash = ArtifactHash::parse(FIXTURE_HASH).expect("固定 Artifact hash");
+        assert_eq!(
+            fatal.resolve_artifact_download(&project.project_id, &hash, None),
+            DownloadResolution::Corrupt
+        );
+        drop(fatal);
+
+        let runtime = ReadyDurableRuntime::open(fatal_root.path())
+            .expect("新进程 ordinary open 收敛同一 Prepared");
+        let mut reopened = DurableServiceState::new(runtime);
+        assert!(matches!(
+            reopened.handle(&start).outcome,
+            CommandOutcome::Success {
+                result: CommandResult::SessionStarted(_)
+            }
+        ));
+    }
 
     fn create_command(id: &str, name: &str) -> CommandEnvelope {
         CommandEnvelope {

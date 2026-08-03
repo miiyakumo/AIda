@@ -107,7 +107,7 @@ function renderArtifact(manifest) {
     button.disabled = true;
     try {
       const hex = manifest.artifact_hash.replace("sha256:", "");
-      const response = await fetch(`/v1/artifacts/${hex}`, {
+      const response = await fetch(`/v2/artifacts/${hex}`, {
         credentials: "same-origin",
         headers: {"X-Alda-Project-Id": manifest.project_id}
       });
@@ -194,7 +194,7 @@ function handleServer(value) {
 
 async function bootstrap() {
   const codeNode = byId("bootstrap-code");
-  const response = await fetch("/v1/bootstrap", {
+  const response = await fetch("/v2/bootstrap", {
     method: "POST",
     credentials: "same-origin",
     headers: {"Content-Type": "application/json"},
@@ -212,7 +212,7 @@ function reconnect() {
     socket.onclose = null;
     socket.close();
   }
-  socket = new WebSocket(`ws://${location.host}/v1/ws`, "alda-agent.v1");
+  socket = new WebSocket(`ws://${location.host}/v2/ws`, "alda-agent.v2");
   socket.onopen = () => {
     state.connected = true;
     statusNode.textContent = state.sessionId ?

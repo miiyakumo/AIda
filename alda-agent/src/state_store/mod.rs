@@ -1,6 +1,6 @@
-//! Linux-only B3a Project transaction log.
+//! 仅支持 Linux 的 B3a Project transaction log。
 //!
-//! Stored codecs are deliberately separate from live domain capabilities.
+//! stored codec 有意与 live domain capability 分离。
 #![allow(
     dead_code,
     reason = "B3a freezes the store API before B4 production integration"
@@ -22,7 +22,9 @@
 mod project_codec;
 pub(crate) mod session;
 
-use std::collections::{BTreeMap, HashSet};
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::CStr;
 use std::fmt::Write as _;
 use std::fs::File;
@@ -52,6 +54,11 @@ pub(crate) use self::project_codec::{
     RecoveredArtifactProjectHandoff, StoredProjectPlanV1, recover_artifact_for_project_plan,
 };
 pub(crate) use self::session::StoredSessionPlanV1;
+#[allow(
+    unused_imports,
+    reason = "C1b3 primitive 先冻结最窄 re-export，后续 occurrence 叶子才会消费"
+)]
+pub(crate) use crate::artifact_store::CommittedOccurrenceFact;
 
 const STATE_LAYOUT: &str = "state-v1";
 const STATE_MANIFEST: &str = "state-manifest-v1.json";
@@ -69,6 +76,21 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 const FILE_MODE: Mode = Mode::from_raw_mode(0o600);
 const DIRECTORY_MODE: Mode = Mode::from_raw_mode(0o700);
+
+#[cfg(test)]
+thread_local! {
+    static PROJECT_CHECKPOINT_LOAD_OBSERVED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_project_checkpoint_load_observed() {
+    PROJECT_CHECKPOINT_LOAD_OBSERVED.set(false);
+}
+
+#[cfg(test)]
+pub(crate) fn project_checkpoint_load_observed() -> bool {
+    PROJECT_CHECKPOINT_LOAD_OBSERVED.get()
+}
 
 #[derive(Debug, Error)]
 pub enum StateStoreError {
@@ -141,7 +163,7 @@ pub struct StoredCommandRecordV1 {
 }
 
 impl StoredCommandRecordV1 {
-    /// Constructs and validates a byte-exact stable command reply record.
+    /// 构造并验证 byte-exact stable command reply record。
     pub fn new(
         client_id: impl Into<String>,
         client_command_id: impl Into<String>,
@@ -176,7 +198,10 @@ impl StoredCommandRecordV1 {
         })
     }
 
-    pub(crate) fn decode_reply(&self) -> Result<Vec<u8>, StateStoreError> {
+    pub(crate) fn decode_reply_for_protocol(
+        &self,
+        expected_protocol_version: u32,
+    ) -> Result<(Vec<u8>, CommandReply), StateStoreError> {
         let bytes = BASE64_STANDARD
             .decode(&self.stable_reply_base64)
             .map_err(|_| StateStoreError::IncompatibleSchema)?;
@@ -189,13 +214,19 @@ impl StoredCommandRecordV1 {
         let reply: CommandReply =
             serde_json::from_slice(&bytes).map_err(|_| StateStoreError::IncompatibleSchema)?;
         if reply.protocol_version != self.stable_reply_protocol_version
+            || reply.protocol_version != expected_protocol_version
             || reply.client_command_id.0 != self.client_command_id
             || serde_json::to_vec(&reply).map_err(|_| StateStoreError::IncompatibleSchema)? != bytes
         {
             return Err(StateStoreError::IncompatibleSchema);
         }
         validate_sha256(&self.payload_digest)?;
-        Ok(bytes)
+        Ok((bytes, reply))
+    }
+
+    pub(crate) fn decode_reply(&self) -> Result<Vec<u8>, StateStoreError> {
+        self.decode_reply_for_protocol(self.stable_reply_protocol_version)
+            .map(|(bytes, _reply)| bytes)
     }
 }
 
@@ -308,10 +339,12 @@ struct StoreInner {
     instance_id: String,
     project_registry: Mutex<HashSet<String>>,
     session_registry: Mutex<HashSet<String>>,
+    #[cfg(test)]
+    writer_open_counts: Mutex<BTreeMap<String, usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InitFailpoint {
+pub(crate) enum InitFailpoint {
     LayoutCreate,
     LayoutChildSync,
     LayoutParentSync,
@@ -349,14 +382,13 @@ enum DirectoryKind {
     Session,
 }
 
-/// Sealed B4 instance-lock capability. B3a only mints it in tests.
+/// 密封的 B4 instance-lock capability；B3a 只在测试中铸造它。
 pub struct StateStoreInstanceLease {
     _private: (),
 }
 
 impl StateStoreInstanceLease {
-    /// Mints the sealed lease at the durable composition root after it has
-    /// acquired the process-wide instance lock.
+    /// durable composition root 取得进程级实例锁后铸造密封 lease。
     pub(crate) const fn for_durable_runtime() -> Self {
         Self { _private: () }
     }
@@ -377,7 +409,7 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    /// Opens the Linux state layout under an already-existing private root.
+    /// 在已存在的私有 root 下打开 Linux state layout。
     pub fn open(
         root: &Path,
         instance_lease: StateStoreInstanceLease,
@@ -416,6 +448,8 @@ impl StateStore {
                     instance_id: manifest.body.instance_id.clone(),
                     project_registry: Mutex::new(HashSet::new()),
                     session_registry: Mutex::new(HashSet::new()),
+                    #[cfg(test)]
+                    writer_open_counts: Mutex::new(BTreeMap::new()),
                 }),
                 instance_id: manifest.body.instance_id,
                 init_failpoint,
@@ -424,7 +458,7 @@ impl StateStore {
     }
 
     #[cfg(test)]
-    fn open_with_failpoint(
+    pub(crate) fn open_with_failpoint(
         root: &Path,
         instance_lease: StateStoreInstanceLease,
         failpoint: InitFailpoint,
@@ -442,6 +476,8 @@ impl StateStore {
         project_id: DomainProjectId,
     ) -> Result<OpenProjectWriter, StateStoreError> {
         let key = project_key(&project_id);
+        #[cfg(test)]
+        self.record_writer_open(format!("project:{key}"));
         {
             let mut registry = self
                 .inner
@@ -465,11 +501,10 @@ impl StateStore {
         }
     }
 
-    /// Rebuilds the Project catalog from descriptor-relative, replayed facts.
+    /// 从相对 descriptor 重放的事实重建 Project catalog。
     ///
-    /// Directory names are treated only as hashes. The canonical Project
-    /// identity is recovered from the first committed batch and then hashed
-    /// again, so a renamed, empty, weak, or special entry fails closed.
+    /// 目录名只作为 hash 使用。canonical Project identity 从首个 committed batch 恢复后
+    /// 再次计算 hash，因此被改名、空、弱权限或特殊 entry 都会 fail closed。
     pub(crate) fn list_projects(&self) -> Result<ProjectCatalog, StateStoreError> {
         let mut directory = Dir::read_from(&self.inner.projects)
             .map_err(|source| io_error("list projects", source))?;
@@ -527,6 +562,60 @@ impl StateStore {
             }
         }
         Ok(catalog)
+    }
+
+    /// 仅比较受管目录名，不打开或重放 aggregate 日志。
+    pub(crate) fn validate_project_directory_catalog(
+        &self,
+        expected_project_ids: &BTreeSet<String>,
+        strict: bool,
+    ) -> Result<(), StateStoreError> {
+        let expected = expected_project_ids
+            .iter()
+            .map(|project_id| {
+                DomainProjectId::parse(project_id.clone())
+                    .map(|id| project_key(&id))
+                    .map_err(|_| StateStoreError::StreamMismatch)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let mut actual = BTreeSet::new();
+        let mut directory = Dir::read_from(&self.inner.projects)
+            .map_err(|source| io_error("list Project directory keys", source))?;
+        for entry in &mut directory {
+            let entry = entry.map_err(|source| io_error("read Project directory key", source))?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            if actual.len() >= MAX_PROJECTS
+                || !actual.insert(canonical_project_directory_name(name)?)
+            {
+                return Err(StateStoreError::ProjectionRejected);
+            }
+        }
+        if (strict && actual != expected) || (!strict && !actual.is_subset(&expected)) {
+            return Err(StateStoreError::StreamMismatch);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writer_open_counts(&self) -> BTreeMap<String, usize> {
+        self.inner
+            .writer_open_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn record_writer_open(&self, key: String) {
+        let mut counts = self
+            .inner
+            .writer_open_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *counts.entry(key).or_default() += 1;
     }
 }
 
@@ -913,7 +1002,7 @@ pub(crate) struct PoisonedProjectWriter {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecoveryFailpoint {
+pub(crate) enum RecoveryFailpoint {
     FileSync,
 }
 
@@ -925,7 +1014,7 @@ pub(crate) enum RecoveryOutcome {
 
 impl PoisonedProjectWriter {
     #[cfg(test)]
-    fn set_recovery_failpoint(&mut self, failpoint: RecoveryFailpoint) {
+    pub(crate) fn set_recovery_failpoint(&mut self, failpoint: RecoveryFailpoint) {
         self.recovery_failpoint = Some(failpoint);
     }
 
@@ -1479,15 +1568,21 @@ fn load_checkpoint(
     }
     if anchored.last_sequence != checkpoint.covered_sequence
         || anchored.last_checksum != checkpoint.covered_batch_checksum
-        || anchored.stream_id != checkpoint.stream_id
+        || (checkpoint.covered_valid_bytes != 0 && anchored.stream_id != checkpoint.stream_id)
         || anchored.commands != commands
         || anchored.transactions != transactions
     {
         return Ok(None);
     }
+    // 零覆盖 checkpoint 只能缓存空投影，不能把未被日志锚定的随机 stream ID 提升为权威事实。
+    let stream_id = if checkpoint.covered_valid_bytes == 0 {
+        String::new()
+    } else {
+        checkpoint.stream_id
+    };
     Ok(Some(RecoveredState {
         project_id: expected_project.clone(),
-        stream_id: checkpoint.stream_id,
+        stream_id,
         last_sequence: checkpoint.covered_sequence,
         last_checksum: checkpoint.covered_batch_checksum,
         projection,
@@ -1518,7 +1613,11 @@ fn open_writer_with_lease(
         Err(error) => return Err((lease, error)),
     };
     let scan = match load_checkpoint(&project_dir, &mut file, &project_id) {
-        Ok(Some(state)) => scan_log_from(&mut file, state),
+        Ok(Some(state)) => {
+            #[cfg(test)]
+            PROJECT_CHECKPOINT_LOAD_OBSERVED.set(true);
+            scan_log_from(&mut file, state)
+        }
         Ok(None) | Err(_) => scan_log(&mut file, &project_id),
     };
     match scan {
@@ -2114,6 +2213,106 @@ mod tests {
             ),
             Err(StateStoreError::IncompatibleSchema)
         ));
+    }
+
+    #[test]
+    fn protocol_bound_reply_accepts_only_the_expected_canonical_reply() {
+        let raw = reply("command-protocol-bound");
+        let record = StoredCommandRecordV1::new(
+            "client-protocol-bound",
+            "command-protocol-bound",
+            format!("sha256:{}", "a".repeat(64)),
+            &raw,
+        )
+        .expect("构造当前协议 reply record");
+        let (decoded_raw, decoded_reply) = record
+            .decode_reply_for_protocol(crate::protocol::PROTOCOL_VERSION)
+            .expect("按当前协议解码 reply");
+        assert_eq!(decoded_raw, raw);
+        assert_eq!(decoded_reply.client_command_id.0, "command-protocol-bound");
+        assert_eq!(
+            decoded_reply.protocol_version,
+            crate::protocol::PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn protocol_bound_reply_rejects_corrupt_encoding_length_identity_and_canonical_bytes() {
+        let record = command("command-protocol-corrupt", 'b');
+
+        let mut invalid_base64 = record.clone();
+        invalid_base64.stable_reply_base64 = "***".to_owned();
+        assert!(
+            invalid_base64
+                .decode_reply_for_protocol(crate::protocol::PROTOCOL_VERSION)
+                .is_err()
+        );
+
+        let mut wrong_length = record.clone();
+        wrong_length.stable_reply_raw_len += 1;
+        assert!(
+            wrong_length
+                .decode_reply_for_protocol(crate::protocol::PROTOCOL_VERSION)
+                .is_err()
+        );
+
+        let mut wrong_identity = record.clone();
+        wrong_identity.client_command_id = "different-command".to_owned();
+        assert!(
+            wrong_identity
+                .decode_reply_for_protocol(crate::protocol::PROTOCOL_VERSION)
+                .is_err()
+        );
+
+        let mut noncanonical_raw = reply("command-protocol-corrupt");
+        noncanonical_raw.push(b' ');
+        let mut noncanonical = record;
+        noncanonical.stable_reply_raw_len =
+            u64::try_from(noncanonical_raw.len()).expect("测试 reply 长度适配 u64");
+        noncanonical.stable_reply_base64 = BASE64_STANDARD.encode(noncanonical_raw);
+        assert!(
+            noncanonical
+                .decode_reply_for_protocol(crate::protocol::PROTOCOL_VERSION)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn protocol_bound_reply_rejects_record_and_expected_version_mismatches() {
+        let mut record_version_mismatch = command("command-record-version", 'c');
+        record_version_mismatch.stable_reply_protocol_version =
+            crate::protocol::PROTOCOL_VERSION + 1;
+        assert!(
+            record_version_mismatch
+                .decode_reply_for_protocol(crate::protocol::PROTOCOL_VERSION)
+                .is_err()
+        );
+
+        let command_id = ClientCommandId("command-self-consistent-version".to_owned());
+        let mut versioned_reply = CommandReply::error(
+            command_id.clone(),
+            ProtocolErrorCode::InvalidRequest,
+            "未知协议 fixture",
+        );
+        versioned_reply.protocol_version = crate::protocol::PROTOCOL_VERSION + 1;
+        let versioned_raw = serde_json::to_vec(&versioned_reply).expect("编码未知协议 reply");
+        let versioned_record = StoredCommandRecordV1::new(
+            "client-self-consistent-version",
+            command_id.0,
+            format!("sha256:{}", "d".repeat(64)),
+            &versioned_raw,
+        )
+        .expect("构造自洽未知协议 record");
+        assert!(
+            versioned_record
+                .decode_reply_for_protocol(crate::protocol::PROTOCOL_VERSION)
+                .is_err()
+        );
+        assert!(
+            versioned_record
+                .decode_reply_for_protocol(crate::protocol::PROTOCOL_VERSION + 1)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ export function commandEnvelope(state, command, purpose = "command") {
   return {
     type: "command",
     value: {
-      protocol_version: 1,
+      protocol_version: 2,
       client_id: "pwa",
       client_command_id: `pwa-${purpose}-${state.commandCounter}`,
       command

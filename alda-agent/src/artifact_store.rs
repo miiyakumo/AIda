@@ -1,4 +1,9 @@
-//! Linux-only, descriptor-relative durable content-addressed Artifact Store.
+//! 仅支持 Linux、相对 descriptor 操作的持久化 content-addressed Artifact Store。
+
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "Rustdoc 依照仓库语言规范使用中文“错误”标题"
+)]
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -21,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::domain::{ArtifactHash, ArtifactRecord, DomainError, DurabilityCapability};
+use crate::domain::{
+    ArtifactAvailability, ArtifactHash, ArtifactRecord, DomainError, DurabilityCapability,
+};
 
 const LAYOUT_VERSION: u32 = 1;
 const LAYOUT: &str = "artifacts-v1";
@@ -68,9 +75,9 @@ impl Read for VerifiedBlobFile {
     }
 }
 
-/// An opaque proof minted only after a successful durable Store commit.
+/// 仅在 durable Store 成功提交后铸造的不透明证明。
 ///
-/// It intentionally implements neither `Clone` nor `Deserialize`.
+/// 该类型有意不实现 `Clone` 或 `Deserialize`。
 #[derive(Debug)]
 pub struct CommittedArtifactReceipt {
     hash: ArtifactHash,
@@ -129,10 +136,9 @@ impl CommittedArtifactReceipt {
         &self.commit_identity
     }
 
-    /// Freezes the primitive audit facts needed by a control transaction.
+    /// 冻结 control transaction 所需的 primitive audit fact。
     ///
-    /// The returned value contains no live receipt capability and is safe to
-    /// persist in the control WAL.
+    /// 返回值不含 live receipt capability，可安全写入 control WAL。
     #[allow(
         dead_code,
         reason = "B4a freezes this prerequisite before the B4 control WAL calls it"
@@ -156,11 +162,10 @@ impl CommittedArtifactReceipt {
     }
 }
 
-/// Primitive, versioned facts persisted by the control WAL for Artifact redo.
+/// control WAL 为 Artifact redo 持久化的带版本 primitive fact。
 ///
-/// This is deliberately data rather than a capability. Deserializing it never
-/// authorizes an `ArtifactRegistered` fact; a live Store audit is still
-/// required.
+/// 这里有意保存数据而非 capability。反序列化不会授权 `ArtifactRegistered` 事实；
+/// 仍须经过 live Store audit。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArtifactAuditPlanV1 {
@@ -174,6 +179,61 @@ pub(crate) struct ArtifactAuditPlanV1 {
     commit_identity: String,
     #[serde(rename = "control_tx")]
     control_transaction_id: String,
+}
+
+/// 已提交 Project 记录与 Prepared audit plan 全字段一致的不可变事实。
+///
+/// 该值不持有 Store、文件描述符或写入能力，只能由本模块的逐字段 matcher 构造。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommittedOccurrenceFact {
+    hash: ArtifactHash,
+    size: u64,
+    layout_version: u32,
+    store_instance_id: String,
+    durability: DurabilityCapability,
+    commit_identity: String,
+    control_transaction_id: String,
+}
+
+#[allow(
+    dead_code,
+    reason = "C1b3 primitive 先冻结只读字段，后续 occurrence 叶子才会逐字段消费"
+)]
+impl CommittedOccurrenceFact {
+    #[must_use]
+    pub(crate) fn hash(&self) -> &ArtifactHash {
+        &self.hash
+    }
+
+    #[must_use]
+    pub(crate) const fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub(crate) const fn layout_version(&self) -> u32 {
+        self.layout_version
+    }
+
+    #[must_use]
+    pub(crate) fn store_instance_id(&self) -> &str {
+        &self.store_instance_id
+    }
+
+    #[must_use]
+    pub(crate) const fn durability(&self) -> DurabilityCapability {
+        self.durability
+    }
+
+    #[must_use]
+    pub(crate) fn commit_identity(&self) -> &str {
+        &self.commit_identity
+    }
+
+    #[must_use]
+    pub(crate) fn control_transaction_id(&self) -> &str {
+        &self.control_transaction_id
+    }
 }
 
 impl ArtifactAuditPlanV1 {
@@ -242,12 +302,44 @@ impl ArtifactAuditPlanV1 {
         }
         self.validate().map(|_| ())
     }
+
+    /// 比较 audit plan 与 stored Project record，并返回纯数据证明。
+    pub(crate) fn match_committed_record(
+        &self,
+        expected_control_transaction_id: &str,
+        stored_record: &ArtifactRecord,
+    ) -> Result<CommittedOccurrenceFact, StoreError> {
+        self.validate_for_control(expected_control_transaction_id)?;
+        stored_record
+            .validate_audit()
+            .map_err(|_| StoreError::RecoveryAuditMismatch)?;
+        if stored_record.availability() != ArtifactAvailability::VerifiedDurable
+            || stored_record.hash().as_str() != self.hash
+            || stored_record.size() != self.size
+            || stored_record.layout_version() != Some(self.layout_version)
+            || stored_record.store_instance_id() != Some(self.store_instance_id.as_str())
+            || stored_record.durability() != Some(DurabilityCapability::LinuxFileAndDirectorySynced)
+            || self.durability != durability_name(DurabilityCapability::LinuxFileAndDirectorySynced)
+            || stored_record.store_commit_identity() != Some(self.commit_identity.as_str())
+        {
+            return Err(StoreError::RecoveryAuditMismatch);
+        }
+        Ok(CommittedOccurrenceFact {
+            hash: stored_record.hash().clone(),
+            size: self.size,
+            layout_version: self.layout_version,
+            store_instance_id: self.store_instance_id.clone(),
+            durability: DurabilityCapability::LinuxFileAndDirectorySynced,
+            commit_identity: self.commit_identity.clone(),
+            control_transaction_id: self.control_transaction_id.clone(),
+        })
+    }
 }
 
-/// Per-open, non-forgeable authority issued only with the durable-runtime Store
-/// constructor (or from this module's tests).
+/// 每次打开时独立生成且不可伪造的 authority，只能由 durable runtime Store 构造器
+/// 或本模块测试签发。
 ///
-/// It intentionally implements neither `Clone` nor serialization traits.
+/// 该类型有意不实现 `Clone` 或 serialization trait。
 #[derive(Debug)]
 pub(crate) struct ArtifactRecoveryGuard {
     authority: Arc<ArtifactRecoveryAuthority>,
@@ -256,11 +348,10 @@ pub(crate) struct ArtifactRecoveryGuard {
 #[derive(Debug)]
 struct ArtifactRecoveryAuthority;
 
-/// A one-shot proof that a specific persisted audit plan was reverified.
+/// 指定持久化 audit plan 已重新验证的一次性证明。
 ///
-/// It intentionally implements neither `Clone` nor serialization traits. Its
-/// only consuming handoff is crate-private and is used by the trusted Project
-/// stored-plan converter.
+/// 该类型有意不实现 `Clone` 或 serialization trait；唯一会消费它的交接入口保持
+/// crate-private，并由可信 Project stored-plan converter 使用。
 #[derive(Debug)]
 pub(crate) struct RecoveredArtifactCapability {
     audited_plan: ArtifactAuditPlanV1,
@@ -395,12 +486,11 @@ thread_local! {
 }
 
 impl ArtifactStore {
-    /// Safely opens or initializes a Linux Artifact Store.
+    /// 安全地打开或初始化 Linux Artifact Store。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns a typed error for unsafe roots, invalid manifests, or I/O and
-    /// durability failures.
+    /// root 不安全、manifest 无效，或发生 I/O 与持久性失败时返回类型化错误。
     #[cfg(target_os = "linux")]
     pub fn open(root: &Path) -> Result<Self, StoreError> {
         let root = open_absolute_directory(root)?;
@@ -442,11 +532,9 @@ impl ArtifactStore {
         Err(StoreError::UnsupportedSafety)
     }
 
-    /// Opens the Store together with the non-forgeable authority required by
-    /// durable-runtime recovery.
+    /// 打开 Store，同时返回 durable runtime 恢复所需的不可伪造 authority。
     ///
-    /// This constructor is crate-private so wire, plugin, and ordinary public
-    /// Store callers cannot obtain recovery minting authority.
+    /// 该构造器保持 crate-private，防止 wire、plugin 与普通公开 Store 调用者取得恢复铸造权。
     #[allow(
         dead_code,
         reason = "B4a freezes this prerequisite before the B4 composition root calls it"
@@ -469,12 +557,11 @@ impl ArtifactStore {
         result
     }
 
-    /// Streams, verifies, and durably commits one Artifact.
+    /// 流式读取、校验并持久提交一个 Artifact。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns no receipt unless the complete file and directory sync policy
-    /// succeeds.
+    /// 只有完整的文件与目录同步策略成功后才返回 receipt。
     pub fn put(
         &self,
         mut reader: impl Read,
@@ -580,13 +667,11 @@ impl ArtifactStore {
         Ok(self.receipt(hash, size))
     }
 
-    /// Verifies an installed blob through a descriptor-relative, no-follow
-    /// open.
+    /// 通过相对 descriptor 且 no-follow 的打开方式验证已安装 blob。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns a typed error when the hash path is absent, unsafe, unreadable,
-    /// too large, or does not contain the requested hash.
+    /// hash 路径不存在、不安全、不可读、过大或内容不匹配请求 hash 时返回类型化错误。
     pub fn verify(&self, hash: &ArtifactHash) -> Result<VerifiedBlob, StoreError> {
         let file = self.open_blob(hash)?;
         let verified = verify_owned_file(file, StoreError::BlobCorrupt)?;
@@ -596,11 +681,11 @@ impl ArtifactStore {
         Ok(verified)
     }
 
-    /// Verifies and rewinds one handle, returning that same handle for reads.
+    /// 验证并回卷同一 handle，再返回该 handle 供读取。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns the same verification and I/O errors as [`Self::verify`].
+    /// 返回与 [`Self::verify`] 相同的验证或 I/O 错误。
     pub fn get(&self, hash: &ArtifactHash) -> Result<VerifiedBlobFile, StoreError> {
         let mut file = self.open_blob(hash)?;
         let verified = verify_file(&mut file, StoreError::BlobCorrupt)?;
@@ -612,13 +697,11 @@ impl ArtifactStore {
         Ok(VerifiedBlobFile { file, verified })
     }
 
-    /// Revalidates a persisted audit plan and mints one consuming Project
-    /// recovery capability.
+    /// 重新验证持久化 audit plan，并铸造一项可消费的 Project 恢复 capability。
     ///
-    /// Callers must first prove through the Project transaction probe that the
-    /// corresponding aggregate transaction is `Absent`. A retry may call this
-    /// method again only after probing `Absent` again; a
-    /// `SamePlanCommitted` result skips minting entirely.
+    /// 调用者必须先通过 Project transaction probe 证明对应 aggregate transaction 为
+    /// `Absent`。重试时只有再次探测到 `Absent` 才能调用；若结果为 `SamePlanCommitted`，
+    /// 则完全跳过铸造。
     pub(crate) fn audit_recovery_artifact(
         &self,
         guard: &ArtifactRecoveryGuard,
@@ -640,9 +723,8 @@ impl ArtifactStore {
             return Err(StoreError::RecoveryAuditMismatch);
         }
 
-        // `get` hashes and rewinds the exact descriptor it opened. The audit
-        // reads verification facts from that same live handle rather than
-        // reopening the path after validation.
+        // `get` 对实际打开的 descriptor 计算 hash 并回卷；audit 从同一 live handle
+        // 读取验证事实，不会在校验后重新打开路径。
         let opened = self.get(&hash)?;
         if opened.verified().hash != hash || opened.verified().size != plan.size {
             return Err(StoreError::RecoveryAuditMismatch);
@@ -662,12 +744,11 @@ impl ArtifactStore {
         })
     }
 
-    /// Creates an idempotent, durable pin marker after verifying the blob.
+    /// 验证 blob 后创建幂等、持久化的 pin marker。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns a typed verification or durability error without removing the
-    /// referenced blob.
+    /// 返回类型化验证或持久性错误，但不移除被引用的 blob。
     pub fn pin(&self, hash: &ArtifactHash) -> Result<(), StoreError> {
         self.verify(hash)?;
         let hex = hash_hex(hash)?;
@@ -754,11 +835,11 @@ impl ArtifactStore {
         result.and(cleanup)
     }
 
-    /// Lists valid regular staging entries without deleting them.
+    /// 列出有效的普通 staging entry，但不删除它们。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns an I/O error if the anchored staging directory cannot be read.
+    /// 无法读取已锚定 staging 目录时返回 I/O 错误。
     pub fn list_staging_orphans(&self) -> Result<Vec<String>, StoreError> {
         list_regular_names(&self.staging, |name| {
             Path::new(name)
@@ -767,11 +848,11 @@ impl ArtifactStore {
         })
     }
 
-    /// Lists all valid installed blob hashes.
+    /// 列出所有有效的已安装 blob hash。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// Returns a typed error if an anchored directory cannot be opened or read.
+    /// 无法打开或读取已锚定目录时返回类型化错误。
     pub fn list_blob_hashes(&self) -> Result<Vec<ArtifactHash>, StoreError> {
         let mut hashes = Vec::new();
         for shard_name in list_directory_names(&self.sha256)? {
@@ -1747,6 +1828,98 @@ mod tests {
                 "control-tx:artifact-2",
                 &wrong_instance
             ),
+            Err(StoreError::RecoveryAuditMismatch)
+        ));
+    }
+
+    #[test]
+    fn artifact_audit_match_requires_every_committed_field_and_control_identity() {
+        let (_root, store, _guard) = runtime_store();
+        let receipt = store.put(Cursor::new(b"fixture"), None).expect("put");
+        let plan = receipt
+            .recovery_audit_plan("control-tx:occurrence-match")
+            .expect("audit plan");
+        let record = receipt.into_record().expect("committed record");
+
+        let fact = plan
+            .match_committed_record("control-tx:occurrence-match", &record)
+            .expect("全字段匹配");
+        assert_eq!(fact.hash(), record.hash());
+        assert_eq!(fact.size(), record.size());
+        assert_eq!(
+            fact.layout_version(),
+            record.layout_version().expect("layout")
+        );
+        assert_eq!(
+            fact.store_instance_id(),
+            record.store_instance_id().expect("Store identity")
+        );
+        assert_eq!(fact.durability(), record.durability().expect("durability"));
+        assert_eq!(
+            fact.commit_identity(),
+            record.store_commit_identity().expect("commit identity")
+        );
+        assert_eq!(fact.control_transaction_id(), "control-tx:occurrence-match");
+
+        let rebind_identity = |candidate: &mut ArtifactAuditPlanV1| {
+            let hash = ArtifactHash::parse(candidate.hash.clone()).expect("candidate hash");
+            candidate.commit_identity = artifact_commit_identity(
+                &hash,
+                candidate.size,
+                candidate.layout_version,
+                &candidate.store_instance_id,
+                &candidate.durability,
+            );
+        };
+
+        let mut wrong_hash = plan.clone();
+        wrong_hash.hash = format!("sha256:{}", "a".repeat(64));
+        rebind_identity(&mut wrong_hash);
+        assert!(matches!(
+            wrong_hash.match_committed_record("control-tx:occurrence-match", &record),
+            Err(StoreError::RecoveryAuditMismatch)
+        ));
+
+        let mut wrong_size = plan.clone();
+        wrong_size.size += 1;
+        rebind_identity(&mut wrong_size);
+        assert!(matches!(
+            wrong_size.match_committed_record("control-tx:occurrence-match", &record),
+            Err(StoreError::RecoveryAuditMismatch)
+        ));
+
+        let mut wrong_layout = plan.clone();
+        wrong_layout.layout_version += 1;
+        rebind_identity(&mut wrong_layout);
+        assert!(matches!(
+            wrong_layout.match_committed_record("control-tx:occurrence-match", &record),
+            Err(StoreError::RecoveryAuditMismatch)
+        ));
+
+        let mut wrong_store = plan.clone();
+        wrong_store.store_instance_id = "f".repeat(32);
+        rebind_identity(&mut wrong_store);
+        assert!(matches!(
+            wrong_store.match_committed_record("control-tx:occurrence-match", &record),
+            Err(StoreError::RecoveryAuditMismatch)
+        ));
+
+        let mut wrong_durability = plan.clone();
+        wrong_durability.durability = "file_only".to_owned();
+        rebind_identity(&mut wrong_durability);
+        assert!(matches!(
+            wrong_durability.match_committed_record("control-tx:occurrence-match", &record),
+            Err(StoreError::RecoveryAuditMismatch)
+        ));
+
+        let mut wrong_commit = plan.clone();
+        wrong_commit.commit_identity = format!("sha256:{}", "0".repeat(64));
+        assert!(matches!(
+            wrong_commit.match_committed_record("control-tx:occurrence-match", &record),
+            Err(StoreError::RecoveryAuditMismatch)
+        ));
+        assert!(matches!(
+            plan.match_committed_record("control-tx:different", &record),
             Err(StoreError::RecoveryAuditMismatch)
         ));
     }

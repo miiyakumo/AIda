@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import {readFileSync} from "node:fs";
 import {
   applyCommandResult,
   applyEventPage,
@@ -12,6 +13,14 @@ import {
   recoveryOptionsForServerMessage
 } from "./client-state.js";
 
+test("production browser sources contain only the v2 transport", () => {
+  const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const state = readFileSync(new URL("./client-state.js", import.meta.url), "utf8");
+  assert.match(app, /alda-agent\.v2/);
+  assert.match(app, /\/v2\//);
+  assert.doesNotMatch(`${app}\n${state}`, /alda-agent\.v1|\/v1\//);
+});
+
 test("structured commands map to protocol DTOs and update IDs/status", () => {
   const state = createClientState();
   assert.deepEqual(commands.projectCreate("Etude"), {
@@ -19,6 +28,8 @@ test("structured commands map to protocol DTOs and update IDs/status", () => {
   });
   assert.equal(commandEnvelope(state, commands.sessionStart("project-1")).value
     .command.params.project_id, "project-1");
+  assert.equal(commandEnvelope(state, commands.sessionSnapshot("session-1")).value
+    .protocol_version, 2);
   applyCommandResult(state, {
     type: "session_started",
     value: {

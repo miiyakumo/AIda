@@ -1,7 +1,7 @@
-//! Private B4 control transaction log.
+//! 私有 B4 control transaction log。
 //!
-//! The log is a redo WAL, global command index, and Project/Session catalog.
-//! It deliberately contains primitive plans rather than live capabilities.
+//! 该日志同时承担 redo WAL、全局命令索引与 Project/Session catalog；
+//! 其中有意只保存 primitive plan，而不保存 live capability。
 
 #![allow(
     dead_code,
@@ -9,11 +9,14 @@
 )]
 #![allow(
     clippy::missing_errors_doc,
+    clippy::large_enum_variant,
     clippy::result_large_err,
     clippy::too_many_lines,
-    reason = "ownership-preserving poison/recovery states use one typed error boundary"
+    reason = "保留 writer 所有权的中毒恢复状态需要统一的类型化错误边界"
 )]
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -56,6 +59,21 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
+#[cfg(test)]
+thread_local! {
+    static CHECKPOINT_LOAD_OBSERVED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_checkpoint_load_observed() {
+    CHECKPOINT_LOAD_OBSERVED.set(false);
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_load_observed() -> bool {
+    CHECKPOINT_LOAD_OBSERVED.get()
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum ControlStoreError {
     #[error("control Store root or entry is unsafe")]
@@ -91,6 +109,12 @@ pub(crate) enum ControlStoreError {
         #[source]
         source: std::io::Error,
     },
+}
+
+impl ControlStoreError {
+    pub(crate) const fn is_capability_loss(&self) -> bool {
+        matches!(self, Self::LockUnavailable | Self::WriterPoisoned)
+    }
 }
 
 impl From<StateStoreError> for ControlStoreError {
@@ -252,6 +276,28 @@ pub(crate) struct SessionAllocation {
     pub project_id: ProjectId,
 }
 
+/// 只读 Session allocation catalog，只能从已验证的 control writer 投影导出。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionAllocationCatalogContext {
+    allocations: BTreeMap<String, String>,
+}
+
+impl SessionAllocationCatalogContext {
+    pub(crate) fn project_id(&self, session_id: &SessionId) -> Option<&str> {
+        self.allocations.get(&session_id.0).map(String::as_str)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(allocations: impl IntoIterator<Item = (SessionId, ProjectId)>) -> Self {
+        Self {
+            allocations: allocations
+                .into_iter()
+                .map(|(session_id, project_id)| (session_id.0, project_id.0))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PrepareControlRequest {
     pub project_allocation: Option<DomainProjectId>,
@@ -280,6 +326,8 @@ pub(crate) struct ControlProjection {
     #[serde(with = "stored_global_command_map")]
     pub commands: BTreeMap<(String, String), GlobalCommandRecord>,
     pub prepared: BTreeMap<String, PreparedTransactionV1>,
+    #[serde(default)]
+    pub prepared_order: Vec<String>,
     pub committed: BTreeMap<String, CommittedTransactionV1>,
     #[serde(default)]
     external_prepared_count: usize,
@@ -288,6 +336,9 @@ pub(crate) struct ControlProjection {
     pub last_batch_sequence: u64,
     pub last_batch_checksum: Option<String>,
     pub valid_bytes: u64,
+    #[cfg(test)]
+    #[serde(skip)]
+    startup_test_capacity: Option<ControlCapacity>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -363,14 +414,18 @@ pub(crate) struct CommittedTransactionV1 {
 
 impl ControlProjection {
     pub(crate) fn pending(&self) -> Vec<PreparedTransactionV1> {
-        self.prepared
+        self.prepared_order
             .iter()
-            .filter(|(tx, _)| !self.committed.contains_key(*tx))
-            .map(|(_, prepared)| prepared.clone())
+            .filter(|tx| !self.committed.contains_key(*tx))
+            .filter_map(|tx| self.prepared.get(tx).cloned())
             .collect()
     }
 
     pub(crate) fn capacity(&self) -> ControlCapacity {
+        #[cfg(test)]
+        if let Some(capacity) = self.startup_test_capacity {
+            return capacity;
+        }
         ControlCapacity {
             external: self.external_prepared_count,
             internal_restart: self.internal_restart_prepared_count,
@@ -500,18 +555,54 @@ pub(crate) enum ControlRecoveryFailpoint {
     FileSync,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlOpenFailpoint {
+    FileSync,
+}
+
 pub(crate) fn open_control_writer(
     root_path: &Path,
     lock_health: Weak<LockHealth>,
+) -> Result<OpenControlWriter, ControlStoreError> {
+    open_control_writer_inner(
+        root_path,
+        lock_health,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn open_control_writer_with_failpoint(
+    root_path: &Path,
+    lock_health: Weak<LockHealth>,
+    failpoint: ControlOpenFailpoint,
+) -> Result<OpenControlWriter, ControlStoreError> {
+    open_control_writer_inner(root_path, lock_health, Some(failpoint))
+}
+
+fn open_control_writer_inner(
+    root_path: &Path,
+    lock_health: Weak<LockHealth>,
+    #[cfg(test)] open_failpoint: Option<ControlOpenFailpoint>,
 ) -> Result<OpenControlWriter, ControlStoreError> {
     require_lock(&lock_health)?;
     let root = open_absolute_directory(root_path)?;
     validate_directory(&root, true)?;
     let layout = open_directory(&root, STATE_LAYOUT)?;
     let control_dir = ensure_directory(&layout, CONTROL_DIRECTORY)?;
-    let mut file = open_or_create_control_log(&control_dir)?;
-    let scan = match load_control_checkpoint(&control_dir) {
-        Ok(Some(state)) => scan_control_log_from(&mut file, state)?,
+    let mut file = open_or_create_control_log(
+        &control_dir,
+        #[cfg(test)]
+        open_failpoint,
+    )?;
+    let scan = match load_control_checkpoint(&control_dir, &mut file) {
+        Ok(Some(state)) => {
+            #[cfg(test)]
+            CHECKPOINT_LOAD_OBSERVED.set(true);
+            scan_control_log_from(&mut file, state)?
+        }
         Ok(None) | Err(_) => scan_control_log(&mut file)?,
     };
     match scan {
@@ -550,6 +641,17 @@ pub(crate) fn open_control_writer(
 impl ReadyControlWriter {
     pub(crate) fn projection(&self) -> &ControlProjection {
         &self.state
+    }
+
+    pub(crate) fn session_allocation_catalog_context(&self) -> SessionAllocationCatalogContext {
+        SessionAllocationCatalogContext {
+            allocations: self.state.sessions.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_startup_test_capacity(&mut self, capacity: ControlCapacity) {
+        self.state.startup_test_capacity = Some(capacity);
     }
 
     pub(crate) fn prepare(
@@ -899,6 +1001,127 @@ impl ReadyControlWriter {
     }
 }
 
+#[cfg(test)]
+fn fixture_prepare_facts(request: PrepareControlRequest) -> Vec<StoredControlFactV1> {
+    let mut facts = Vec::with_capacity(3);
+    if let Some(project_id) = request.project_allocation {
+        facts.push(StoredControlFactV1::ProjectAllocated {
+            project_id: project_id.as_str().to_owned(),
+        });
+    }
+    if let Some(allocation) = request.session_allocation {
+        facts.push(StoredControlFactV1::SessionAllocated {
+            session_id: allocation.session_id.0,
+            project_id: allocation.project_id.0,
+        });
+    }
+    facts.push(StoredControlFactV1::CommandPreparedV1(Box::new(
+        request.prepared,
+    )));
+    facts
+}
+
+#[cfg(test)]
+fn fixture_batch(
+    state: &ControlProjection,
+    facts: Vec<StoredControlFactV1>,
+) -> Result<StoredControlBatchV1, ControlStoreError> {
+    let mut batch = StoredControlBatchV1 {
+        schema_version: 1,
+        batch_sequence: state
+            .last_batch_sequence
+            .checked_add(1)
+            .ok_or(ControlStoreError::ResourceLimit)?,
+        facts,
+        previous_batch_checksum: state.last_batch_checksum.clone(),
+        batch_checksum: String::new(),
+    };
+    batch.batch_checksum = control_batch_checksum(&batch)?;
+    Ok(batch)
+}
+
+#[cfg(test)]
+fn write_fixture_batch(
+    writer: &mut ReadyControlWriter,
+    batch: &StoredControlBatchV1,
+) -> Result<(), ControlStoreError> {
+    let mut bytes = serde_json::to_vec(batch).map_err(|_| ControlStoreError::IncompatibleSchema)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_LINE_BYTES {
+        return Err(ControlStoreError::ResourceLimit);
+    }
+    writer
+        .file
+        .write_all(&bytes)
+        .map_err(|source| control_io("write validated control fixture", source))?;
+    writer.state.valid_bytes = writer
+        .state
+        .valid_bytes
+        .checked_add(u64::try_from(bytes.len()).map_err(|_| ControlStoreError::ResourceLimit)?)
+        .ok_or(ControlStoreError::ResourceLimit)?;
+    Ok(())
+}
+
+/// 批量生成真实 control JSONL fixture；每条记录仍经过 production reducer 全量校验。
+#[cfg(test)]
+pub(crate) fn append_validated_control_fixture(
+    mut writer: ReadyControlWriter,
+    requests: impl IntoIterator<Item = PrepareControlRequest>,
+    committed: bool,
+) -> Result<ReadyControlWriter, ControlStoreError> {
+    require_lock(&writer.lock_health)?;
+    for request in requests {
+        let prepared = request.prepared.clone();
+        let batch = fixture_batch(&writer.state, fixture_prepare_facts(request))?;
+        apply_control_batch(&mut writer.state, &batch)?;
+        write_fixture_batch(&mut writer, &batch)?;
+
+        if committed {
+            let anchor = || AggregateCommitV1 {
+                resulting_last_sequence: 1,
+                resulting_batch_checksum: format!("sha256:{}", "a".repeat(64)),
+            };
+            let facts = vec![StoredControlFactV1::CommandCommittedV1 {
+                global_tx_id: prepared.global_tx_id,
+                project_last: prepared.project_plan.is_some().then(anchor),
+                session_last: prepared.session_plan.is_some().then(anchor),
+            }];
+            let batch = fixture_batch(&writer.state, facts)?;
+            apply_control_batch(&mut writer.state, &batch)?;
+            write_fixture_batch(&mut writer, &batch)?;
+        }
+    }
+    writer
+        .file
+        .flush()
+        .map_err(|source| control_io("flush validated control fixture", source))?;
+    writer
+        .file
+        .sync_all()
+        .map_err(|source| control_io("sync validated control fixture", source))?;
+    Ok(writer)
+}
+
+/// 在合法边界后追加 checksum-chain 正确但容量超限的一条 replay 负例。
+#[cfg(test)]
+pub(crate) fn append_canonical_over_limit_fixture_tail(
+    mut writer: ReadyControlWriter,
+    request: PrepareControlRequest,
+) -> Result<(), ControlStoreError> {
+    require_lock(&writer.lock_health)?;
+    request.prepared.validate()?;
+    let batch = fixture_batch(&writer.state, fixture_prepare_facts(request))?;
+    write_fixture_batch(&mut writer, &batch)?;
+    writer
+        .file
+        .flush()
+        .map_err(|source| control_io("flush over-limit control fixture", source))?;
+    writer
+        .file
+        .sync_all()
+        .map_err(|source| control_io("sync over-limit control fixture", source))
+}
+
 impl PoisonedControlWriter {
     #[cfg(test)]
     pub(crate) fn set_recovery_failpoint(&mut self, failpoint: ControlRecoveryFailpoint) {
@@ -1180,6 +1403,7 @@ fn apply_control_batch(
                 state
                     .prepared
                     .insert(prepared.global_tx_id.clone(), prepared.as_ref().clone());
+                state.prepared_order.push(prepared.global_tx_id.clone());
                 match kind {
                     PreparedKind::External => state.external_prepared_count += 1,
                     PreparedKind::InternalRestart => state.internal_restart_prepared_count += 1,
@@ -1296,6 +1520,7 @@ fn scan_control_log_from(
 
 fn load_control_checkpoint(
     control_dir: &OwnedFd,
+    control_file: &mut File,
 ) -> Result<Option<ControlProjection>, ControlStoreError> {
     let fd = match openat(
         control_dir,
@@ -1332,12 +1557,61 @@ fn load_control_checkpoint(
         return Err(ControlStoreError::ChecksumMismatch);
     }
     validate_control_projection(&checkpoint.projection)?;
+    let log_length = control_file
+        .metadata()
+        .map_err(|source| control_io("inspect control checkpoint anchor length", source))?
+        .len();
+    if checkpoint.covered_valid_bytes > log_length {
+        return Ok(Some(checkpoint.projection));
+    }
+
+    let mut anchored = ControlProjection::default();
+    loop {
+        if anchored.valid_bytes == checkpoint.covered_valid_bytes {
+            break;
+        }
+        if anchored.valid_bytes > checkpoint.covered_valid_bytes {
+            return Ok(None);
+        }
+        control_file
+            .seek(SeekFrom::Start(anchored.valid_bytes))
+            .map_err(|source| control_io("seek control checkpoint anchor", source))?;
+        let mut reader = BufReader::new(&mut *control_file);
+        let mut line = Vec::new();
+        let count = reader
+            .by_ref()
+            .take(u64::try_from(MAX_LINE_BYTES).expect("line limit fits u64") + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|source| control_io("read control checkpoint anchor", source))?;
+        if count == 0 || count > MAX_LINE_BYTES || !line.ends_with(b"\n") {
+            return Ok(None);
+        }
+        line.pop();
+        let Ok(batch) = serde_json::from_slice::<StoredControlBatchV1>(&line) else {
+            return Ok(None);
+        };
+        if apply_control_batch(&mut anchored, &batch).is_err() {
+            return Ok(None);
+        }
+        anchored.valid_bytes = anchored
+            .valid_bytes
+            .checked_add(u64::try_from(count).map_err(|_| ControlStoreError::ResourceLimit)?)
+            .ok_or(ControlStoreError::ResourceLimit)?;
+    }
+    if anchored != checkpoint.projection {
+        return Ok(None);
+    }
 
     Ok(Some(checkpoint.projection))
 }
 
 fn validate_control_projection(state: &ControlProjection) -> Result<(), ControlStoreError> {
     let counted = count_prepared_kinds(state.prepared.values())?;
+    let ordered_prepared = state
+        .prepared_order
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if state.projects.len() > MAX_CATALOG_ENTRIES
         || state.sessions.len() > MAX_CATALOG_ENTRIES
         || counted.external > MAX_EXTERNAL_PREPARED
@@ -1346,6 +1620,9 @@ fn validate_control_projection(state: &ControlProjection) -> Result<(), ControlS
         || counted.external != state.external_prepared_count
         || counted.internal_restart != state.internal_restart_prepared_count
         || state.commands.len() != state.prepared.len()
+        || state.prepared_order.len() != state.prepared.len()
+        || ordered_prepared.len() != state.prepared.len()
+        || ordered_prepared != state.prepared.keys().cloned().collect()
         || state.committed.len() > state.prepared.len()
         || (state.last_batch_sequence == 0) != state.last_batch_checksum.is_none()
     {
@@ -1596,7 +1873,10 @@ fn validate_directory(fd: &OwnedFd, root: bool) -> Result<(), ControlStoreError>
     Ok(())
 }
 
-fn open_or_create_control_log(control_dir: &OwnedFd) -> Result<File, ControlStoreError> {
+fn open_or_create_control_log(
+    control_dir: &OwnedFd,
+    #[cfg(test)] failpoint: Option<ControlOpenFailpoint>,
+) -> Result<File, ControlStoreError> {
     let fd = openat(
         control_dir,
         CONTROL_LOG,
@@ -1606,6 +1886,13 @@ fn open_or_create_control_log(control_dir: &OwnedFd) -> Result<File, ControlStor
     .map_err(|source| control_io("open control log", source))?;
     let file = File::from(fd);
     validate_regular_file(&file, None)?;
+    #[cfg(test)]
+    if failpoint == Some(ControlOpenFailpoint::FileSync) {
+        return Err(control_io(
+            "test control log open file sync",
+            std::io::Error::other("injected"),
+        ));
+    }
     file.sync_all()
         .map_err(|source| control_io("sync control log create", source))?;
     fsync(control_dir).map_err(|source| control_io("sync control log directory", source))?;
@@ -1879,6 +2166,147 @@ mod tests {
         .expect("coordinated control Prepared")
     }
 
+    struct RestartCapacityFixture {
+        _root: tempfile::TempDir,
+        _store: StateStore,
+        writer: crate::state_store::session::ReadySessionWriter,
+    }
+
+    impl RestartCapacityFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("容量 Session root");
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+                .expect("私有容量 Session root");
+            let store = StateStore::open(root.path(), StateStoreInstanceLease::for_tests())
+                .expect("容量 Session store");
+            let session_id = SessionId("session-control".to_owned());
+            let writer = match store
+                .open_session_writer(session_id.clone())
+                .expect("容量 Session writer")
+            {
+                OpenSessionWriter::Ready(writer) => writer,
+                OpenSessionWriter::RepairRequired(_) => panic!("新 Session 不应需要修复"),
+            };
+            let Ok((writer, _)) = writer.append(SessionAppendRequest::new(
+                "capacity-prefix".to_owned(),
+                None,
+                vec![
+                    SessionRolloutEvent::SessionStarted {
+                        session_id,
+                        project_id: ProjectId("project-control".to_owned()),
+                    },
+                    SessionRolloutEvent::TurnStarted {
+                        turn_id: crate::protocol::TurnId("turn-control".to_owned()),
+                        canonical_prompt: "容量边界重启义务".to_owned(),
+                    },
+                ],
+            )) else {
+                panic!("写入容量 Session 前缀");
+            };
+            Self {
+                _root: root,
+                _store: store,
+                writer,
+            }
+        }
+
+        fn request(&self, index: usize) -> PrepareControlRequest {
+            let instance_id = format!("{index:032x}");
+            let coordinated =
+                plan_coordinated_restart_reconciliation(&instance_id, self.writer.projection())
+                    .expect("容量 restart planner")
+                    .expect("容量 restart obligation");
+            let (pre_sequence, pre_checksum) = self.writer.head();
+            let session_plan = StoredSessionPlanV1::from_append_request(
+                &SessionId("session-control".to_owned()),
+                &ProjectId("project-control".to_owned()),
+                pre_sequence,
+                pre_checksum.map(ToOwned::to_owned),
+                &coordinated.append_request(),
+            )
+            .expect("容量 coordinated Session plan");
+            let prepared = PreparedTransactionV1::new(
+                coordinated.global_tx_id,
+                coordinated.command_record,
+                None,
+                Some(session_plan),
+                Vec::new(),
+            )
+            .expect("容量 internal Prepared");
+            PrepareControlRequest {
+                project_allocation: None,
+                session_allocation: None,
+                prepared,
+            }
+        }
+    }
+
+    fn external_capacity_request(index: usize) -> PrepareControlRequest {
+        let global_tx_id = format!("global-e{index:031x}");
+        let command_id = format!("command-capacity-external-{index}");
+        let command = command(&command_id, 'c');
+        let allocate_catalog = index == 0;
+        PrepareControlRequest {
+            project_allocation: allocate_catalog.then(|| project("project-control")),
+            session_allocation: allocate_catalog.then(|| SessionAllocation {
+                session_id: SessionId("session-control".to_owned()),
+                project_id: ProjectId("project-control".to_owned()),
+            }),
+            prepared: prepared_with(&global_tx_id, command, allocate_catalog, true),
+        }
+    }
+
+    fn assert_prepare_rejected_without_append(
+        writer: ReadyControlWriter,
+        request: PrepareControlRequest,
+        log_path: &Path,
+    ) -> ReadyControlWriter {
+        let before = fs::read(log_path).expect("读取拒绝前 control log");
+        let writer = match writer.prepare(request) {
+            Err(ControlAppendFailure::Rejected {
+                writer,
+                error: ControlStoreError::ResourceLimit,
+            }) => writer,
+            Err(ControlAppendFailure::Rejected { error, .. }) => {
+                panic!("容量拒绝返回了错误类型：{error}")
+            }
+            Err(ControlAppendFailure::Poisoned { error, .. }) => {
+                panic!("容量拒绝不得使 writer 中毒：{error}")
+            }
+            Ok(_) => panic!("超限 Prepared 不得追加"),
+        };
+        assert_eq!(
+            fs::read(log_path).expect("读取拒绝后 control log"),
+            before,
+            "容量拒绝必须发生在 durable append 前"
+        );
+        writer
+    }
+
+    fn open_capacity(
+        fixture: &Fixture,
+        expected: ControlCapacity,
+        checkpoint: bool,
+        label: &str,
+    ) -> ReadyControlWriter {
+        reset_checkpoint_load_observed();
+        let writer = fixture.ready();
+        assert_eq!(writer.projection().capacity(), expected, "{label}");
+        assert_eq!(checkpoint_load_observed(), checkpoint, "{label}");
+        println!(
+            "{label}: external={}, internal={}, total={}, replay={}",
+            expected.external,
+            expected.internal_restart,
+            expected.total,
+            if checkpoint {
+                "checkpoint+tail"
+            } else {
+                "full"
+            }
+        );
+        writer
+    }
+
     fn prepare_ok(
         writer: ReadyControlWriter,
         request: PrepareControlRequest,
@@ -2000,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn external_internal_and_total_capacity_boundaries_are_independent() {
+    fn durable_backend_capacity_external_internal_and_total_boundaries_are_independent() {
         assert!(
             require_capacity_for(
                 ControlCapacity {
@@ -2061,7 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_classification_survives_checkpoint_and_full_replay() {
+    fn durable_backend_capacity_classification_survives_checkpoint_and_full_replay() {
         let fixture = Fixture::new();
         let (writer, _) = prepare_ok(fixture.ready(), combined_prepare("command-capacity", 'a'));
         let internal = coordinated_restart_prepared();
@@ -2101,6 +2529,371 @@ mod tests {
                 internal_restart: 1,
                 total: 2,
             }
+        );
+    }
+
+    #[test]
+    fn durable_backend_capacity_real_control_prepare_boundaries() {
+        let external = Fixture::new();
+        let writer = append_validated_control_fixture(
+            external.ready(),
+            (0..9_999).map(external_capacity_request),
+            false,
+        )
+        .expect("生成 9,999 external durable Prepared");
+        assert_eq!(
+            writer.projection().capacity(),
+            ControlCapacity {
+                external: 9_999,
+                internal_restart: 0,
+                total: 9_999,
+            }
+        );
+        let tenthousandth = external_capacity_request(9_999);
+        let (writer, appended) = prepare_ok(writer, tenthousandth.clone());
+        assert!(appended.appended);
+        let before_duplicate = fs::read(external.log_path()).expect("读取幂等前 control log");
+        let (writer, duplicate) = prepare_ok(writer, tenthousandth);
+        assert!(!duplicate.appended);
+        assert_eq!(
+            fs::read(external.log_path()).expect("读取幂等后 control log"),
+            before_duplicate
+        );
+        let writer = assert_prepare_rejected_without_append(
+            writer,
+            external_capacity_request(10_000),
+            &external.log_path(),
+        );
+        assert_eq!(writer.projection().capacity().external, 10_000);
+        println!("prepare external: 9,999 -> 10,000 -> 10,001 rejected");
+
+        let internal = Fixture::new();
+        let restart = RestartCapacityFixture::new();
+        let writer = append_validated_control_fixture(
+            internal.ready(),
+            std::iter::once(external_capacity_request(0)),
+            false,
+        )
+        .expect("生成 internal catalog");
+        let writer = append_validated_control_fixture(
+            writer,
+            (0..9_999).map(|index| restart.request(index)),
+            false,
+        )
+        .expect("生成 9,999 internal durable Prepared");
+        assert_eq!(writer.projection().capacity().internal_restart, 9_999);
+        let tenthousandth = restart.request(9_999);
+        let (writer, appended) = prepare_ok(writer, tenthousandth.clone());
+        assert!(appended.appended);
+        let before_duplicate = fs::read(internal.log_path()).expect("读取 internal 幂等前日志");
+        let (writer, duplicate) = prepare_ok(writer, tenthousandth);
+        assert!(!duplicate.appended);
+        assert_eq!(
+            fs::read(internal.log_path()).expect("读取 internal 幂等后日志"),
+            before_duplicate
+        );
+        let writer = assert_prepare_rejected_without_append(
+            writer,
+            restart.request(10_000),
+            &internal.log_path(),
+        );
+        assert_eq!(writer.projection().capacity().internal_restart, 10_000);
+        println!("prepare internal: 9,999 -> 10,000 -> 10,001 rejected");
+
+        let physical = Fixture::new();
+        let writer = append_validated_control_fixture(
+            physical.ready(),
+            (0..10_000).map(external_capacity_request),
+            false,
+        )
+        .expect("生成 10,000 external physical fixture");
+        let writer = append_validated_control_fixture(
+            writer,
+            (0..9_999).map(|index| restart.request(index)),
+            false,
+        )
+        .expect("生成 19,999 physical durable Prepared");
+        assert_eq!(writer.projection().capacity().total, 19_999);
+        let (writer, appended) = prepare_ok(writer, restart.request(9_999));
+        assert!(appended.appended);
+        let writer = assert_prepare_rejected_without_append(
+            writer,
+            restart.request(10_000),
+            &physical.log_path(),
+        );
+        assert_eq!(writer.projection().capacity().total, 20_000);
+        println!("prepare physical: 19,999 -> 20,000 -> 20,001 rejected");
+
+        let reverse_physical = Fixture::new();
+        let writer = append_validated_control_fixture(
+            reverse_physical.ready(),
+            (0..9_999).map(external_capacity_request),
+            false,
+        )
+        .expect("生成 9,999 external 反向 physical fixture");
+        let writer = append_validated_control_fixture(
+            writer,
+            (0..10_000).map(|index| restart.request(index)),
+            false,
+        )
+        .expect("生成 10,000 internal 反向 physical fixture");
+        assert_eq!(
+            writer.projection().capacity(),
+            ControlCapacity {
+                external: 9_999,
+                internal_restart: 10_000,
+                total: 19_999,
+            }
+        );
+        let last_external = external_capacity_request(9_999);
+        let (writer, appended) = prepare_ok(writer, last_external.clone());
+        assert!(appended.appended);
+        let stable_reply = appended.stable_reply;
+        assert_eq!(
+            writer.projection().capacity(),
+            ControlCapacity {
+                external: 10_000,
+                internal_restart: 10_000,
+                total: 20_000,
+            }
+        );
+        let before_duplicate_capacity = writer.projection().capacity();
+        let before_duplicate =
+            fs::read(reverse_physical.log_path()).expect("读取反向满载幂等前日志");
+        let (writer, duplicate) = prepare_ok(writer, last_external);
+        assert!(!duplicate.appended);
+        assert_eq!(duplicate.stable_reply, stable_reply);
+        assert_eq!(writer.projection().capacity(), before_duplicate_capacity);
+        assert_eq!(
+            fs::read(reverse_physical.log_path()).expect("读取反向满载幂等后日志"),
+            before_duplicate
+        );
+        let writer = assert_prepare_rejected_without_append(
+            writer,
+            external_capacity_request(10_000),
+            &reverse_physical.log_path(),
+        );
+        assert_eq!(
+            writer.projection().capacity(),
+            ControlCapacity {
+                external: 10_000,
+                internal_restart: 10_000,
+                total: 20_000,
+            }
+        );
+        println!(
+            "prepare reverse physical: 9,999/10,000/19,999 -> 10,000/10,000/20,000 -> 20,001 rejected; full-load duplicate unchanged"
+        );
+    }
+
+    fn seed_replay_fixture(
+        fixture: &Fixture,
+        restart: &RestartCapacityFixture,
+        kind: &str,
+        checkpoint: bool,
+    ) -> ReadyControlWriter {
+        let writer = fixture.ready();
+        let writer = match kind {
+            "external" | "internal" | "physical" | "reverse-physical" => {
+                append_validated_control_fixture(
+                    writer,
+                    std::iter::once(external_capacity_request(0)),
+                    false,
+                )
+            }
+            _ => panic!("未知容量 fixture：{kind}"),
+        }
+        .expect("写入容量 fixture checkpoint 前缀");
+        if checkpoint {
+            writer.write_checkpoint().expect("写入有效容量 checkpoint");
+        }
+        match kind {
+            "external" => append_validated_control_fixture(
+                writer,
+                (1..9_999).map(external_capacity_request),
+                false,
+            ),
+            "internal" => append_validated_control_fixture(
+                writer,
+                (0..9_999).map(|index| restart.request(index)),
+                false,
+            ),
+            "physical" => {
+                let writer = append_validated_control_fixture(
+                    writer,
+                    (1..10_000).map(external_capacity_request),
+                    false,
+                )
+                .expect("写入 physical external fixture");
+                append_validated_control_fixture(
+                    writer,
+                    (0..9_999).map(|index| restart.request(index)),
+                    false,
+                )
+            }
+            "reverse-physical" => {
+                let writer = append_validated_control_fixture(
+                    writer,
+                    (1..9_999).map(external_capacity_request),
+                    false,
+                )
+                .expect("写入 reverse physical external fixture");
+                append_validated_control_fixture(
+                    writer,
+                    (0..10_000).map(|index| restart.request(index)),
+                    false,
+                )
+            }
+            _ => unreachable!(),
+        }
+        .expect("写入容量 fixture tail")
+    }
+
+    #[test]
+    fn durable_backend_capacity_real_control_replay_boundaries() {
+        let restart = RestartCapacityFixture::new();
+        for checkpoint in [false, true] {
+            for kind in ["external", "internal", "physical", "reverse-physical"] {
+                let fixture = Fixture::new();
+                let writer = seed_replay_fixture(&fixture, &restart, kind, checkpoint);
+                drop(writer);
+                let (before, at, overflow) = match kind {
+                    "external" => (
+                        ControlCapacity {
+                            external: 9_999,
+                            internal_restart: 0,
+                            total: 9_999,
+                        },
+                        ControlCapacity {
+                            external: 10_000,
+                            internal_restart: 0,
+                            total: 10_000,
+                        },
+                        external_capacity_request(10_000),
+                    ),
+                    "internal" => (
+                        ControlCapacity {
+                            external: 1,
+                            internal_restart: 9_999,
+                            total: 10_000,
+                        },
+                        ControlCapacity {
+                            external: 1,
+                            internal_restart: 10_000,
+                            total: 10_001,
+                        },
+                        restart.request(10_000),
+                    ),
+                    "physical" => (
+                        ControlCapacity {
+                            external: 10_000,
+                            internal_restart: 9_999,
+                            total: 19_999,
+                        },
+                        ControlCapacity {
+                            external: 10_000,
+                            internal_restart: 10_000,
+                            total: 20_000,
+                        },
+                        restart.request(10_000),
+                    ),
+                    "reverse-physical" => (
+                        ControlCapacity {
+                            external: 9_999,
+                            internal_restart: 10_000,
+                            total: 19_999,
+                        },
+                        ControlCapacity {
+                            external: 10_000,
+                            internal_restart: 10_000,
+                            total: 20_000,
+                        },
+                        external_capacity_request(10_000),
+                    ),
+                    _ => unreachable!(),
+                };
+                let writer = open_capacity(
+                    &fixture,
+                    before,
+                    checkpoint,
+                    &format!("replay {kind} before"),
+                );
+                let boundary = match kind {
+                    "external" | "reverse-physical" => external_capacity_request(9_999),
+                    "internal" | "physical" => restart.request(9_999),
+                    _ => unreachable!(),
+                };
+                let (writer, outcome) = prepare_ok(writer, boundary);
+                assert!(outcome.appended);
+                drop(writer);
+                let writer = open_capacity(&fixture, at, checkpoint, &format!("replay {kind} at"));
+                append_canonical_over_limit_fixture_tail(writer, overflow)
+                    .expect("追加 canonical 超限 tail");
+                reset_checkpoint_load_observed();
+                assert!(matches!(
+                    open_control_writer(fixture.root.path(), Arc::downgrade(&fixture.health)),
+                    Err(ControlStoreError::ResourceLimit)
+                ));
+                assert_eq!(checkpoint_load_observed(), checkpoint);
+                println!(
+                    "replay {kind} overflow rejected before writer publish: checkpoint={checkpoint}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn durable_backend_capacity_duplicate_prepare_does_not_consume_capacity() {
+        let fixture = Fixture::new();
+        let (writer, first) = prepare_ok(
+            fixture.ready(),
+            combined_prepare("command-capacity-duplicate", 'b'),
+        );
+        assert!(first.appended);
+        let before = writer.projection().capacity();
+        let (writer, duplicate) =
+            prepare_ok(writer, combined_prepare("command-capacity-duplicate", 'b'));
+        assert!(!duplicate.appended);
+        assert_eq!(writer.projection().capacity(), before);
+    }
+
+    #[test]
+    fn pending_transactions_preserve_control_prepare_order() {
+        let fixture = Fixture::new();
+        let first_tx = format!("global-{}", "f".repeat(32));
+        let second_tx = format!("global-{}", "0".repeat(32));
+        let (writer, _) = prepare_ok(
+            fixture.ready(),
+            PrepareControlRequest {
+                project_allocation: Some(project("project-control")),
+                session_allocation: Some(SessionAllocation {
+                    session_id: SessionId("session-control".to_owned()),
+                    project_id: ProjectId("project-control".to_owned()),
+                }),
+                prepared: prepared_with(&first_tx, command("command-order-first", 'a'), true, true),
+            },
+        );
+        let (writer, _) = prepare_ok(
+            writer,
+            PrepareControlRequest {
+                project_allocation: None,
+                session_allocation: None,
+                prepared: prepared_with(
+                    &second_tx,
+                    command("command-order-second", 'b'),
+                    true,
+                    true,
+                ),
+            },
+        );
+        assert_eq!(
+            writer
+                .projection()
+                .pending()
+                .into_iter()
+                .map(|prepared| prepared.global_tx_id)
+                .collect::<Vec<_>>(),
+            vec![first_tx, second_tx]
         );
     }
 
@@ -2312,6 +3105,28 @@ mod tests {
         let reopened = fixture.ready();
         assert_eq!(reopened.projection().prepared.len(), 1);
         drop(reopened);
+
+        let mut forged: StoredControlCheckpointV1 = serde_json::from_slice(
+            &fs::read(fixture.checkpoint_path()).expect("read control checkpoint"),
+        )
+        .expect("decode control checkpoint");
+        forged.projection.commands.clear();
+        forged.projection.prepared.clear();
+        forged.projection.prepared_order.clear();
+        forged.projection.committed.clear();
+        forged.projection.external_prepared_count = 0;
+        forged.projection.internal_restart_prepared_count = 0;
+        forged.checksum = control_checkpoint_checksum(&forged).expect("rechecksum forged cache");
+        fs::write(
+            fixture.checkpoint_path(),
+            serde_json::to_vec(&forged).expect("encode forged cache"),
+        )
+        .expect("write forged cache");
+        let anchored = fixture.ready();
+        assert_eq!(anchored.projection().prepared.len(), 1);
+        assert_eq!(anchored.projection().capacity().external, 1);
+        drop(anchored);
+
         fs::write(fixture.checkpoint_path(), b"{broken").expect("corrupt checkpoint");
         let fallback = fixture.ready();
         assert_eq!(fallback.projection().prepared.len(), 1);

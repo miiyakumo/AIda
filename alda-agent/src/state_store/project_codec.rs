@@ -1,12 +1,13 @@
-//! Versioned stored-event DTOs isolated from live domain capabilities.
+//! 与 live domain capability 隔离的带版本 stored-event DTO。
 //!
-//! Every deserializable field is a primitive or a codec-owned enum. Conversion
-//! into the domain always re-enters the domain validation boundary.
+//! 每个可反序列化字段都是 primitive 或 codec 自有 enum；转换进 domain 时始终重新进入
+//! domain validation boundary。
 
 use serde::{Deserialize, Serialize};
 
 use crate::artifact_store::{
-    ArtifactAuditPlanV1, ArtifactRecoveryGuard, ArtifactStore, RecoveredArtifactCapability,
+    ArtifactAuditPlanV1, ArtifactRecoveryGuard, ArtifactStore, CommittedOccurrenceFact,
+    RecoveredArtifactCapability,
 };
 use crate::domain::{
     ArtifactAvailability, ArtifactHash, ArtifactRecord, BranchId, BriefRevisionId, CommandId,
@@ -787,10 +788,10 @@ impl StoredProjectEventV1 {
     }
 }
 
-/// Primitive-only Project redo plan frozen in the control WAL.
+/// 冻结在 control WAL 中、只含 primitive 的 Project redo plan。
 ///
-/// Deserialization reconstructs no live Artifact capability. Registered
-/// Artifact facts must be supplied separately after a same-handle Store audit.
+/// 反序列化不会重建 live Artifact capability；registered Artifact fact 必须在同一 handle
+/// 通过 Store audit 后另行提供。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredProjectPlanV1 {
@@ -871,6 +872,32 @@ impl StoredProjectPlanV1 {
             .collect()
     }
 
+    /// 证明当前 stored plan 的唯一 Artifact event 与 Prepared audit plan 全字段一致。
+    pub(crate) fn committed_occurrence_fact(
+        &self,
+        expected_control_transaction_id: &str,
+        audit_plan: &ArtifactAuditPlanV1,
+    ) -> Result<CommittedOccurrenceFact, StateStoreError> {
+        self.validate_shape()?;
+        let mut registered = self.events.iter().filter_map(|event| match event {
+            StoredProjectEventV1::ArtifactRegistered(record) => Some(record),
+            _ => None,
+        });
+        let Some(stored_record) = registered.next() else {
+            return Err(StateStoreError::ArtifactRecoveryRejected);
+        };
+        if registered.next().is_some() {
+            return Err(StateStoreError::ArtifactRecoveryRejected);
+        }
+        let stored_record = stored_record
+            .clone()
+            .into_domain()
+            .map_err(|_| StateStoreError::ArtifactRecoveryRejected)?;
+        audit_plan
+            .match_committed_record(expected_control_transaction_id, &stored_record)
+            .map_err(|_| StateStoreError::ArtifactRecoveryRejected)
+    }
+
     pub(crate) fn into_append_request(
         self,
         recovered_artifacts: Vec<ProjectEvent>,
@@ -934,8 +961,8 @@ impl StoredProjectPlanV1 {
                     .map_err(|_| StateStoreError::ProjectionRejected)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // A complete digest check is deferred until audited Artifact facts are
-        // supplied; plans without Artifact registration can be checked now.
+        // 完整 digest 校验推迟到 audited Artifact fact 已提供时；不含 Artifact registration
+        // 的 plan 可以立即校验。
         if self.registered_artifact_events().is_empty() {
             let request = AppendRequest {
                 transaction_id: self.transaction_id.clone(),
@@ -950,12 +977,12 @@ impl StoredProjectPlanV1 {
     }
 }
 
-/// Consumes one reverified Artifact capability into exactly the
-/// `ArtifactRegistered` fact frozen by the corresponding stored Project plan.
+/// 将一项重新验证的 Artifact capability 恰好消费为对应 stored Project plan 冻结的
+/// `ArtifactRegistered` 事实。
 ///
-/// Ordinary stored-log replay continues through [`StoredProjectEventV1::into_domain`].
-/// Control-WAL redo must use this handoff for an Artifact registration so that
-/// primitive audit data alone can never manufacture a live Project fact.
+/// 普通 stored-log replay 仍经由 [`StoredProjectEventV1::into_domain`]；control WAL redo
+/// 必须使用该交接入口完成 Artifact registration，确保 primitive audit data 无法单独制造
+/// live Project fact。
 pub(crate) fn recovered_artifact_registered_event(
     stored_event: StoredProjectEventV1,
     audit_plan: &ArtifactAuditPlanV1,
@@ -982,12 +1009,10 @@ pub(crate) enum RecoveredArtifactProjectHandoff {
     AlreadyCommitted(TransactionCommit),
 }
 
-/// Executes the recovery-only Artifact handoff behind the Project transaction
-/// probe.
+/// 在 Project transaction probe 之后执行仅供恢复使用的 Artifact 交接。
 ///
-/// `Absent` reaudits and yields one append event. `SamePlanCommitted` returns
-/// the durable result without minting another capability. A conflicting plan
-/// fails closed.
+/// `Absent` 会重新审计并产生一个 append event；`SamePlanCommitted` 不再铸造 capability，
+/// 直接返回 durable result；冲突 plan 会 fail closed。
 #[allow(
     clippy::too_many_arguments,
     reason = "all independent control, Project, and audit bindings are explicit at this trust boundary"
@@ -1182,6 +1207,95 @@ mod tests {
 
         assert!(matches!(
             recovered_artifact_registered_event(wrong_stored_event, &audit_plan, capability),
+            Err(StateStoreError::ArtifactRecoveryRejected)
+        ));
+    }
+
+    #[test]
+    fn committed_occurrence_fact_rejects_stored_mismatch_and_old_same_hash_record() {
+        let current_root = tempfile::tempdir().expect("current root");
+        let (current_store, _current_guard) =
+            ArtifactStore::open_for_durable_runtime(current_root.path()).expect("current Store");
+        let current_receipt = current_store
+            .put(Cursor::new(b"fixture"), None)
+            .expect("current put");
+        let audit_plan = current_receipt
+            .recovery_audit_plan("control-tx:occurrence-fact")
+            .expect("current audit plan");
+        let current_record = current_receipt.into_record().expect("current record");
+        let project_id = DomainProjectId::parse("project-occurrence-fact").expect("project");
+        let stored_plan = |record: ArtifactRecord, suffix: &str| {
+            StoredProjectPlanV1::from_append_request(
+                &project_id,
+                0,
+                None,
+                &AppendRequest {
+                    transaction_id: format!("project-tx:{suffix}"),
+                    command_record: None,
+                    events: vec![ProjectEvent::ArtifactRegistered(record)],
+                },
+            )
+            .expect("stored Project plan")
+        };
+
+        let fact = stored_plan(current_record.clone(), "valid")
+            .committed_occurrence_fact("control-tx:occurrence-fact", &audit_plan)
+            .expect("同 Prepared plan 的 stored record");
+        assert_eq!(fact.hash(), current_record.hash());
+        assert_eq!(fact.control_transaction_id(), "control-tx:occurrence-fact");
+
+        let different_record = current_store
+            .put(Cursor::new(b"different"), None)
+            .expect("different put")
+            .into_record()
+            .expect("different record");
+        assert!(matches!(
+            stored_plan(different_record, "stored-mismatch")
+                .committed_occurrence_fact("control-tx:occurrence-fact", &audit_plan),
+            Err(StateStoreError::ArtifactRecoveryRejected)
+        ));
+
+        // 旧 projection 中同 hash 的 record 不能替代当前 transaction 的 event/audit 关系。
+        let old_root = tempfile::tempdir().expect("old root");
+        let (old_store, _old_guard) =
+            ArtifactStore::open_for_durable_runtime(old_root.path()).expect("old Store");
+        let old_projection_record = old_store
+            .put(Cursor::new(b"fixture"), None)
+            .expect("old same-hash put")
+            .into_record()
+            .expect("old projection record");
+        assert_eq!(old_projection_record.hash(), current_record.hash());
+        assert_ne!(
+            old_projection_record.store_instance_id(),
+            current_record.store_instance_id()
+        );
+        assert!(matches!(
+            stored_plan(old_projection_record.clone(), "old-record")
+                .committed_occurrence_fact("control-tx:occurrence-fact", &audit_plan),
+            Err(StateStoreError::ArtifactRecoveryRejected)
+        ));
+
+        let duplicate_plan = StoredProjectPlanV1::from_append_request(
+            &project_id,
+            0,
+            None,
+            &AppendRequest {
+                transaction_id: "project-tx:duplicate".to_owned(),
+                command_record: None,
+                events: vec![
+                    ProjectEvent::ArtifactRegistered(current_record.clone()),
+                    ProjectEvent::ArtifactRegistered(current_record),
+                ],
+            },
+        )
+        .expect("duplicate stored Project plan");
+        assert!(matches!(
+            duplicate_plan.committed_occurrence_fact("control-tx:occurrence-fact", &audit_plan),
+            Err(StateStoreError::ArtifactRecoveryRejected)
+        ));
+        assert!(matches!(
+            stored_plan(old_projection_record, "wrong-control")
+                .committed_occurrence_fact("control-tx:different", &audit_plan),
             Err(StateStoreError::ArtifactRecoveryRejected)
         ));
     }

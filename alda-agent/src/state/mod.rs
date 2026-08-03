@@ -1,4 +1,4 @@
-//! Deterministic in-memory B1 reducer and coordinator.
+//! 确定性的内存 B1 reducer 与 coordinator。
 #![allow(
     clippy::missing_errors_doc,
     reason = "public mutations consistently return the domain error contract"

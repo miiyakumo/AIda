@@ -1,4 +1,10 @@
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "Rustdoc 依照仓库语言规范使用中文“错误”标题"
+)]
+
 use std::fmt::Write;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -17,6 +23,7 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::middleware::Next;
+use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
@@ -25,18 +32,30 @@ use futures_util::StreamExt;
 use rand::RngCore;
 use serde::Deserialize;
 use serde::Serialize;
+use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::time::Instant as TokioInstant;
 
 use crate::app_service::AppService;
 use crate::app_service::DownloadResolution;
 use crate::app_service::SubmitError;
+use crate::app_service::{QueryQueueCapacity, QueueCapacity};
+use crate::durable_runtime::ReadyDurableRuntime;
+use crate::production_runtime::{
+    ActorJoinError, ActorLifecycle, ActorRequestError, ActorStartError, DurableActorClient,
+    DurableActorHost,
+};
 use crate::protocol::ArtifactHash;
+use crate::protocol::ClientCommand;
+use crate::protocol::ClientCommandId;
+use crate::protocol::ClientId;
 use crate::protocol::CommandEnvelope;
 use crate::protocol::CommandOutcome;
 use crate::protocol::CommandReply;
 use crate::protocol::CommandResult;
+use crate::protocol::PROTOCOL_VERSION;
 use crate::protocol::ProjectId;
 use crate::protocol::ProtocolErrorCode;
 use crate::protocol::RecoveryAction;
@@ -45,8 +64,9 @@ use crate::protocol::StreamCursor;
 use crate::protocol::StreamKind;
 use crate::protocol::WsClientMessage;
 use crate::protocol::WsServerMessage;
+use crate::state_store::session::INTERNAL_CLIENT_PREFIX;
 
-const WS_SUBPROTOCOL: &str = "alda-agent.v1";
+const WS_SUBPROTOCOL: &str = "alda-agent.v2";
 const BROWSER_COOKIE: &str = "alda_agent_session";
 const MAX_WS_CONNECTIONS: usize = 16;
 const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
@@ -176,7 +196,7 @@ fn random_secret() -> String {
 
 #[derive(Clone)]
 struct HttpState {
-    service: AppService,
+    service: HttpService,
     auth: HttpAuth,
     bootstrap_limit: Arc<Semaphore>,
     command_limit: Arc<Semaphore>,
@@ -186,7 +206,187 @@ struct HttpState {
     csp: Arc<str>,
 }
 
+#[derive(Clone)]
+enum HttpService {
+    Memory(AppService),
+    Durable(DurableActorClient),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransportError {
+    Overloaded,
+    Unavailable,
+}
+
+impl HttpService {
+    async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReply, TransportError> {
+        match self {
+            Self::Memory(service) => service.execute(envelope).await.map_err(Into::into),
+            Self::Durable(service) if is_mutation(&envelope.command) => {
+                service.execute_command(envelope).await.map_err(Into::into)
+            }
+            Self::Durable(service) => service.execute_query(envelope).await.map_err(Into::into),
+        }
+    }
+
+    async fn resolve_session_events(
+        &self,
+        cursor: StreamCursor,
+    ) -> Result<CommandReply, TransportError> {
+        match self {
+            Self::Memory(service) => service
+                .resolve_session_events(cursor)
+                .await
+                .map_err(Into::into),
+            Self::Durable(service) => {
+                let command_id = format!(
+                    "ws-poll-{}-{}-{}",
+                    cursor.stream_id, cursor.epoch, cursor.after_sequence
+                );
+                service
+                    .execute_query(CommandEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        client_id: ClientId("ws-poller".to_owned()),
+                        client_command_id: ClientCommandId(command_id),
+                        command: ClientCommand::EventResume { cursor },
+                    })
+                    .await
+                    .map_err(Into::into)
+            }
+        }
+    }
+
+    async fn resolve_artifact_download(
+        &self,
+        project_id: ProjectId,
+        hash: ArtifactHash,
+        if_none_match: Option<String>,
+    ) -> Result<DownloadResolution, TransportError> {
+        match self {
+            Self::Memory(service) => service
+                .resolve_artifact_download(project_id, hash, if_none_match)
+                .await
+                .map_err(Into::into),
+            Self::Durable(service) => service
+                .resolve_artifact_download(project_id, hash, if_none_match)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    fn lifecycle(&self) -> ActorLifecycle {
+        match self {
+            Self::Memory(_) => ActorLifecycle::Running,
+            Self::Durable(service) => *service.subscribe_lifecycle().borrow(),
+        }
+    }
+
+    fn subscribe_lifecycle(&self) -> Option<watch::Receiver<ActorLifecycle>> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Durable(service) => Some(service.subscribe_lifecycle()),
+        }
+    }
+}
+
+impl From<SubmitError> for TransportError {
+    fn from(value: SubmitError) -> Self {
+        match value {
+            SubmitError::Overloaded => Self::Overloaded,
+            SubmitError::Closed | SubmitError::ReplyDropped => Self::Unavailable,
+        }
+    }
+}
+
+impl From<ActorRequestError> for TransportError {
+    fn from(value: ActorRequestError) -> Self {
+        match value {
+            ActorRequestError::Overloaded => Self::Overloaded,
+            ActorRequestError::Closed | ActorRequestError::Stopping | ActorRequestError::Fatal => {
+                Self::Unavailable
+            }
+        }
+    }
+}
+
+fn is_mutation(command: &ClientCommand) -> bool {
+    matches!(
+        command,
+        ClientCommand::ProjectCreate { .. }
+            | ClientCommand::SessionStart { .. }
+            | ClientCommand::TurnStart { .. }
+            | ClientCommand::TurnCancel { .. }
+            | ClientCommand::QuestionRespond { .. }
+            | ClientCommand::ApprovalRespond { .. }
+    )
+}
+
+/// production HTTP transport 与 actor 线程唯一 join 所有者。
+pub struct ProductionHttpHost {
+    actor: DurableActorHost,
+}
+
+#[derive(Debug, Error)]
+pub enum ProductionStartError {
+    #[error("durable data root preflight failed before listener startup")]
+    DataRoot,
+    #[error("failed to start durable actor before listener startup")]
+    Actor(#[source] ActorStartError),
+}
+
+impl ProductionHttpHost {
+    /// 在 bind 前启动只使用 durable backend 的 actor。
+    ///
+    /// # 错误
+    ///
+    /// OS 无法创建 actor 线程时返回错误。
+    pub fn open(
+        data_root: &FsPath,
+        command_capacity: QueueCapacity,
+        query_capacity: QueryQueueCapacity,
+    ) -> Result<Self, ProductionStartError> {
+        let runtime = ReadyDurableRuntime::open(data_root)
+            .map_err(|_error| ProductionStartError::DataRoot)?;
+        Self::start(runtime, command_capacity, query_capacity).map_err(ProductionStartError::Actor)
+    }
+
+    fn start(
+        runtime: ReadyDurableRuntime,
+        command_capacity: QueueCapacity,
+        query_capacity: QueryQueueCapacity,
+    ) -> Result<Self, ActorStartError> {
+        DurableActorHost::start(runtime, command_capacity, query_capacity)
+            .map(|actor| Self { actor })
+    }
+
+    pub fn router(&self, auth: HttpAuth) -> Router {
+        router_with_service(HttpService::Durable(self.actor.client()), auth)
+    }
+
+    #[must_use]
+    pub fn subscribe_lifecycle(&self) -> watch::Receiver<ActorLifecycle> {
+        self.actor.client().subscribe_lifecycle()
+    }
+
+    pub fn shutdown(&mut self) {
+        self.actor.shutdown();
+    }
+
+    /// 同步消费唯一 join 所有权。
+    ///
+    /// # 错误
+    ///
+    /// actor fatal、panic 或 join 已消费时返回错误。
+    pub fn shutdown_and_join(&mut self) -> Result<(), ActorJoinError> {
+        self.actor.shutdown_and_join()
+    }
+}
+
 pub fn router(service: AppService, auth: HttpAuth) -> Router {
+    router_with_service(HttpService::Memory(service), auth)
+}
+
+fn router_with_service(service: HttpService, auth: HttpAuth) -> Router {
     let command_auth = auth.clone();
     let csp = format!(
         "default-src 'self'; script-src 'self'; style-src 'self'; \
@@ -213,13 +413,13 @@ pub fn router(service: AppService, auth: HttpAuth) -> Router {
         .route("/sw.js", get(service_worker))
         .route("/health", get(health))
         .route(
-            "/v1/bootstrap",
+            "/v2/bootstrap",
             post(bootstrap)
                 .layer(axum::extract::DefaultBodyLimit::max(1024))
                 .route_layer(middleware::from_fn(ensure_no_store)),
         )
         .route(
-            "/v1/commands",
+            "/v2/commands",
             post(command)
                 .route_layer(middleware::from_fn_with_state(
                     command_auth,
@@ -227,8 +427,8 @@ pub fn router(service: AppService, auth: HttpAuth) -> Router {
                 ))
                 .layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
         )
-        .route("/v1/artifacts/{sha256_hex}", get(artifact_download))
-        .route("/v1/ws", get(websocket))
+        .route("/v2/artifacts/{sha256_hex}", get(artifact_download))
+        .route("/v2/ws", get(websocket))
         .with_state(state)
 }
 
@@ -383,35 +583,42 @@ async fn run_websocket(
     let (mut sink, mut source) = socket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<OutboundFrame>(MAX_OUTBOUND_MESSAGES);
     let (ack_tx, mut ack_rx) = mpsc::channel::<WriterAck>(MAX_OUTBOUND_MESSAGES);
+    let mut writer_lifecycle = state.service.subscribe_lifecycle();
     let writer = tokio::spawn(async move {
-        while let Some(frame) = outbound_rx.recv().await {
-            if sink.send(Message::Text(frame.json.into())).await.is_err() {
-                break;
-            }
-            if let (Some(generation), Some(session_id), Some(through_sequence)) =
-                (frame.generation, frame.session_id, frame.through_sequence)
-            {
-                if ack_tx
-                    .send(WriterAck {
-                        generation,
-                        session_id,
-                        through_sequence,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
+        loop {
+            tokio::select! {
+                frame = outbound_rx.recv() => {
+                    let Some(frame) = frame else { break };
+                    if sink.send(Message::Text(frame.json.into())).await.is_err() {
+                        break;
+                    }
+                    if let (Some(generation), Some(session_id), Some(through_sequence)) =
+                        (frame.generation, frame.session_id, frame.through_sequence)
+                        && ack_tx
+                            .send(WriterAck {
+                                generation,
+                                session_id,
+                                through_sequence,
+                            })
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
                 }
+                () = wait_for_transport_shutdown(&mut writer_lifecycle) => break,
             }
         }
     });
 
+    let mut lifecycle = state.service.subscribe_lifecycle();
     let mut subscription: Option<Subscription> = None;
     let mut next_generation = 0_u64;
     let mut poll_delay = Duration::from_millis(250);
     let mut poll_deadline = TokioInstant::now();
     loop {
         tokio::select! {
+            () = wait_for_transport_shutdown(&mut lifecycle) => break,
             inbound = source.next() => {
                 let Some(Ok(message)) = inbound else { break };
                 match message {
@@ -433,18 +640,24 @@ async fn run_websocket(
                         };
                         match message {
                             WsClientMessage::Command(envelope) => {
-                                let reply = match state.service.execute(envelope).await {
-                                    Ok(reply) => WsServerMessage::CommandReply(reply),
-                                    Err(error) => WsServerMessage::ProtocolError {
-                                        code: match error {
-                                            SubmitError::Overloaded => ProtocolErrorCode::Overloaded,
-                                            SubmitError::Closed | SubmitError::ReplyDropped => {
-                                                ProtocolErrorCode::ServiceUnavailable
-                                            }
+                                let reply = if let Some(reply) = transport_validation_reply(&envelope) {
+                                    WsServerMessage::CommandReply(reply)
+                                } else {
+                                    match state.service.execute(envelope).await {
+                                        Ok(reply) => WsServerMessage::CommandReply(reply),
+                                        Err(error) => WsServerMessage::ProtocolError {
+                                            code: match error {
+                                                TransportError::Overloaded => {
+                                                    ProtocolErrorCode::Overloaded
+                                                }
+                                                TransportError::Unavailable => {
+                                                    ProtocolErrorCode::ServiceUnavailable
+                                                }
+                                            },
+                                            message: "service transport is unavailable".to_owned(),
+                                            recovery: None,
                                         },
-                                        message: error.to_string(),
-                                        recovery: None,
-                                    },
+                                    }
                                 };
                                 if !try_send_server(&outbound_tx, reply, None) { break; }
                             }
@@ -557,17 +770,32 @@ async fn run_websocket(
                             }
                         }
                     }
-                    Err(SubmitError::Overloaded) => {
+                    Err(TransportError::Overloaded) => {
                         poll_delay = next_poll_delay(poll_delay);
                         poll_deadline = TokioInstant::now() + poll_delay;
                     }
-                    Err(SubmitError::Closed | SubmitError::ReplyDropped) => break,
+                    Err(TransportError::Unavailable) => break,
                 }
             }
         }
     }
     drop(outbound_tx);
     let _ = writer.await;
+}
+
+async fn wait_for_transport_shutdown(lifecycle: &mut Option<watch::Receiver<ActorLifecycle>>) {
+    let Some(lifecycle) = lifecycle else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *lifecycle.borrow() != ActorLifecycle::Running {
+            return;
+        }
+        if lifecycle.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 fn next_poll_delay(current: Duration) -> Duration {
@@ -649,7 +877,7 @@ async fn artifact_download(
         .await
     {
         Ok(resolution) => resolution,
-        Err(SubmitError::Overloaded | SubmitError::Closed | SubmitError::ReplyDropped) => {
+        Err(TransportError::Overloaded | TransportError::Unavailable) => {
             return artifact_response(StatusCode::SERVICE_UNAVAILABLE, Body::empty());
         }
     };
@@ -727,8 +955,20 @@ fn insert_header(headers: &mut HeaderMap, name: axum::http::HeaderName, value: &
     );
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+async fn health(State(state): State<HttpState>) -> Response {
+    let (status, label) = health_status(state.service.lifecycle());
+    let mut response = Json(HealthResponse { status: label }).into_response();
+    *response.status_mut() = status;
+    response
+}
+
+fn health_status(lifecycle: ActorLifecycle) -> (StatusCode, &'static str) {
+    match lifecycle {
+        ActorLifecycle::Running => (StatusCode::OK, "ok"),
+        ActorLifecycle::Stopping | ActorLifecycle::Fatal => {
+            (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -801,6 +1041,9 @@ async fn command(
             )),
         ));
     };
+    if let Some(reply) = transport_validation_reply(&envelope) {
+        return Ok(Json(reply));
+    }
     let client_command_id = envelope.client_command_id.clone();
     state
         .service
@@ -808,23 +1051,49 @@ async fn command(
         .await
         .map(Json)
         .map_err(|error| {
-            let (status, code) = match error {
-                SubmitError::Overloaded => (
+            let (status, code, message) = match error {
+                TransportError::Overloaded => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     ProtocolErrorCode::Overloaded,
+                    "service transport is overloaded",
                 ),
-                SubmitError::Closed | SubmitError::ReplyDropped => (
+                TransportError::Unavailable => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     ProtocolErrorCode::ServiceUnavailable,
+                    "service transport is unavailable",
                 ),
             };
             (
                 status,
-                Json(CommandReply::error(
-                    client_command_id,
-                    code,
-                    error.to_string(),
-                )),
+                Json(CommandReply::error(client_command_id, code, message)),
+            )
+        })
+}
+
+fn invalid_protocol_reply(envelope: &CommandEnvelope) -> CommandReply {
+    CommandReply::error(
+        envelope.client_command_id.clone(),
+        ProtocolErrorCode::InvalidProtocolVersion,
+        format!(
+            "protocol version {} is unsupported; upgrade the client to version {PROTOCOL_VERSION} and reconnect",
+            envelope.protocol_version
+        ),
+    )
+}
+
+fn transport_validation_reply(envelope: &CommandEnvelope) -> Option<CommandReply> {
+    if envelope.protocol_version != PROTOCOL_VERSION {
+        return Some(invalid_protocol_reply(envelope));
+    }
+    envelope
+        .client_id
+        .0
+        .starts_with(INTERNAL_CLIENT_PREFIX)
+        .then(|| {
+            CommandReply::error(
+                envelope.client_command_id.clone(),
+                ProtocolErrorCode::InvalidRequest,
+                "reserved internal client namespace is unavailable",
             )
         })
 }
@@ -858,9 +1127,88 @@ mod tests {
     use crate::protocol::CommandEnvelope;
     use crate::protocol::PROTOCOL_VERSION;
     use crate::protocol::ProjectId;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    #[test]
+    fn c3_production_surface_health_is_unavailable_for_both_terminal_states() {
+        assert_eq!(health_status(ActorLifecycle::Running).0, StatusCode::OK);
+        assert_eq!(
+            health_status(ActorLifecycle::Stopping).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            health_status(ActorLifecycle::Fatal).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn c3_production_surface_unique_join_releases_lock_and_allows_reopen() {
+        let root = tempfile::tempdir().expect("创建 production root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("设置 production root 权限");
+        let command_capacity = QueueCapacity::new(2).expect("command 容量");
+        let query_capacity = QueryQueueCapacity::new(2).expect("query 容量");
+        let mut host = ProductionHttpHost::open(root.path(), command_capacity, query_capacity)
+            .expect("首次打开 production host");
+        assert!(matches!(
+            ProductionHttpHost::open(root.path(), command_capacity, query_capacity),
+            Err(ProductionStartError::DataRoot)
+        ));
+        host.shutdown_and_join().expect("唯一 join 成功");
+
+        let mut reopened = ProductionHttpHost::open(root.path(), command_capacity, query_capacity)
+            .expect("join 后立即重开");
+        reopened.shutdown_and_join().expect("重开实例 join");
+    }
+
+    #[test]
+    fn c3_production_surface_invalid_data_roots_fail_before_host_start() {
+        let command_capacity = QueueCapacity::new(2).expect("command 容量");
+        let query_capacity = QueryQueueCapacity::new(2).expect("query 容量");
+        assert!(matches!(
+            ProductionHttpHost::open(
+                FsPath::new("relative-root"),
+                command_capacity,
+                query_capacity,
+            ),
+            Err(ProductionStartError::DataRoot)
+        ));
+
+        let weak = tempfile::tempdir().expect("创建弱权限 root");
+        fs::set_permissions(weak.path(), fs::Permissions::from_mode(0o755)).expect("设置弱权限");
+        assert!(matches!(
+            ProductionHttpHost::open(weak.path(), command_capacity, query_capacity),
+            Err(ProductionStartError::DataRoot)
+        ));
+
+        let special_root = tempfile::NamedTempFile::new().expect("创建非目录目标");
+        fs::set_permissions(special_root.path(), fs::Permissions::from_mode(0o700))
+            .expect("设置非目录目标权限");
+        assert!(matches!(
+            ProductionHttpHost::open(special_root.path(), command_capacity, query_capacity,),
+            Err(ProductionStartError::DataRoot)
+        ));
+    }
+
+    #[tokio::test]
+    async fn c3_production_surface_ws_shutdown_wait_observes_stopping_and_fatal() {
+        for terminal in [ActorLifecycle::Stopping, ActorLifecycle::Fatal] {
+            let (lifecycle_tx, lifecycle_rx) = watch::channel(ActorLifecycle::Running);
+            let mut lifecycle = Some(lifecycle_rx);
+            lifecycle_tx.send_replace(terminal);
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                wait_for_transport_shutdown(&mut lifecycle),
+            )
+            .await
+            .expect("reader、poller 与 writer 共用的终态监听及时结束");
+        }
+    }
 
     #[tokio::test]
     async fn conditional_download_rejects_corruption_before_returning_304() {
@@ -879,7 +1227,7 @@ mod tests {
         });
 
         let response = reqwest::Client::new()
-            .get(format!("{origin}/v1/artifacts/{}", hash.hex()))
+            .get(format!("{origin}/v2/artifacts/{}", hash.hex()))
             .bearer_auth("test-token")
             .header(reqwest::header::ORIGIN, &origin)
             .header("x-alda-project-id", project_id.0)
@@ -1127,7 +1475,7 @@ mod tests {
         });
         let client = reqwest::Client::new();
         let bootstrap = client
-            .post(format!("{origin}/v1/bootstrap"))
+            .post(format!("{origin}/v2/bootstrap"))
             .header(reqwest::header::ORIGIN, &origin)
             .json(&serde_json::json!({"code": bootstrap_code}))
             .send()
@@ -1140,7 +1488,7 @@ mod tests {
             .next()
             .expect("cookie pair")
             .to_owned();
-        let mut request = format!("ws://{address}/v1/ws")
+        let mut request = format!("ws://{address}/v2/ws")
             .into_client_request()
             .expect("WS request");
         request
@@ -1278,7 +1626,7 @@ mod tests {
             axum::serve(listener, app).await.expect("server");
         });
         let response = reqwest::Client::new()
-            .post(format!("{origin}/v1/bootstrap"))
+            .post(format!("{origin}/v2/bootstrap"))
             .header(reqwest::header::ORIGIN, origin)
             .json(&serde_json::json!({"code": code}))
             .send()
@@ -1356,7 +1704,7 @@ mod tests {
         });
         let client = reqwest::Client::new();
         let bootstrap = client
-            .post(format!("{origin}/v1/bootstrap"))
+            .post(format!("{origin}/v2/bootstrap"))
             .header(reqwest::header::ORIGIN, &origin)
             .json(&serde_json::json!({"code": bootstrap_code}))
             .send()
@@ -1370,7 +1718,7 @@ mod tests {
             .expect("cookie pair");
         let mut request =
             tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
-                format!("ws://{address}/v1/ws"),
+                format!("ws://{address}/v2/ws"),
             )
             .expect("WS request");
         request.headers_mut().insert(
@@ -1413,7 +1761,7 @@ mod tests {
             }
         ));
         let command = client
-            .post(format!("{origin}/v1/commands"))
+            .post(format!("{origin}/v2/commands"))
             .bearer_auth("test-token")
             .header(reqwest::header::ORIGIN, &origin)
             .json(&CommandEnvelope {
@@ -1438,7 +1786,7 @@ mod tests {
         ));
 
         let artifact = client
-            .get(format!("{origin}/v1/artifacts/{}", "0".repeat(64)))
+            .get(format!("{origin}/v2/artifacts/{}", "0".repeat(64)))
             .bearer_auth("test-token")
             .header(reqwest::header::ORIGIN, &origin)
             .header("x-alda-project-id", "project-1")

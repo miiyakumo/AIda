@@ -1,146 +1,81 @@
-# Alda Agent implementation
+# Alda Agent 本地服务
 
-This directory contains the released A1–A4 development protocol slice against
-the approved [MVP design](../docs/design/mvp-design.md). It is a development
-foundation for the remaining MVP slices, not the finished MVP.
+本 crate 实现 [MVP 设计](../docs/design/mvp-design.md) 的 Slice A 与 Slice B 基础能力。
+真实 `serve` 使用 durable v2 composition root；内存 `ServiceState` 只保留为显式测试
+backend。服务仅允许监听回环地址，不能公开暴露。
 
-Implemented now:
+当前能力包括：
 
-- versioned typed commands for projects, Session snapshots, Fake Turn
-  start/cancel, and paged Session event resume;
-- formal Turn states and structured lifecycle events with monotonic sequence
-  numbers, a fixed in-memory epoch, and machine-readable cursor recovery;
-- structured `PendingQuestion` and `PendingApproval` projections, full
-  requested/resolved/owner-abort facts, and replay through the same reducer
-  used by online command handling;
-- a bounded `bars_8`/`bars_16` creative choice followed by a separate Fake
-  Model Egress approval bound to a versioned SHA-256 subject digest;
-- an in-memory content-addressed Fake Alda fixture store: immutable blobs
-  deduplicate by hash while occurrence manifests preserve each Turn's actual
-  Project/Session/Turn provenance;
-- occurrence-based `artifact.manifest` queries and authenticated, hash-only
-  HTTP downloads resolved through the same bounded App Service actor;
-- a same-origin static PWA shell, one-time five-minute bootstrap exchange,
-  HttpOnly browser cookie, and `alda-agent.v1` WebSocket event recovery;
-- independently bounded command/query actor queues with 8:1 weighted
-  scheduling, bounded WebSocket connections, polling, frames, and outbound
-  buffering;
-- a bounded Tokio channel feeding one in-memory App Service writer;
-- an in-memory B1 domain projection with explicit Score/Take/Branch identity,
-  immutable Revision DAG rules, lifecycle/constraint gates, branch-head CAS,
-  deterministic replay digests, and versioned Project/Revision read DTOs;
-- a Linux-only descriptor-relative B2 Artifact Store with a durable instance
-  manifest, streaming SHA-256 verification, atomic no-replace deduplication,
-  same-handle reads, durable pins, and opaque commit receipts; it is not yet
-  wired into the development App Service;
-- a Linux-only B3a Project transaction-log foundation with checksummed batches,
-  byte-exact durable command replies, trusted stored-event conversion,
-  single-writer recovery/repair typestates, and validated checkpoints; it is
-  not yet wired into the development App Service;
-- a separate B3b Session Rollout foundation with authoritative prompt and
-  approval-subject replay, command-only durability, restart reconciliation,
-  cursor-stable recovery, and descriptor-relative catalog validation; it is
-  not yet wired into the development App Service;
-- per-client command idempotency, conflicting-payload rejection, and distinct
-  new-command handling when an already-terminal Turn is cancelled again;
-- a loopback-only HTTP adapter requiring exact Host and Origin plus a valid
-  bearer token; the CLI derives Origin from its validated loopback endpoint;
-- a thin CLI that calls the same HTTP command contract;
-- unit and real loopback HTTP tests.
+- version 2 typed command、Project 与 Session durable projection、命令幂等和 typed error；
+- Project/Session transaction log、control redo WAL、启动恢复、restart reconciliation 与实例锁；
+- 专用 actor OS 线程、current-thread Tokio runtime、相互独立的有界 command/query 队列；
+- Project、Session、Turn、Question、Approval 与 durable Alda fixture Artifact 流程；
+- 同源 PWA、一次性浏览器引导码、HttpOnly cookie、`alda-agent.v2` WebSocket 事件恢复；
+- 仅回环 HTTP adapter，以及复用同一 v2 command contract 的 CLI。
 
-Not implemented yet:
+尚未实现 Provider、真实 Alda 工具、播放、MIDI、音频、保留策略、GC 或 compaction。
 
-- production Project/Session persistence integration, retention/compaction,
-  and end-to-end process restart recovery;
-- a process instance lock or local IPC transport;
-- Agent Runtime, real providers, Alda tools, revisions, audition, MIDI, or
-  audio artifacts;
-- real Provider calls, permission policy, sealed action plans, or approved
-  side-effect execution.
+## 启动
 
-The server therefore labels itself as a development Local Service. It must not
-be treated as the finished MVP or exposed outside loopback.
-
-## Run
-
-Set a development-only session token in the environment, then start the server:
+data root 必须是显式绝对路径、普通目录且权限为 `0700`。服务在所有恢复、校验和
+restart reconciliation 成功后才 bind；同一 data root 同时只允许一个实例。
 
 ```bash
+mkdir -p /absolute/path/to/alda-data
+chmod 700 /absolute/path/to/alda-data
 export ALDA_AGENT_SESSION_TOKEN='replace-with-a-local-development-token'
-cargo run -- serve
+cargo run -- serve --data-root /absolute/path/to/alda-data
 ```
 
-The service prints a one-time browser bootstrap code to its trusted terminal.
-Open `http://127.0.0.1:37891/`, enter that code within five minutes, then use
-the minimal client. The browser receives an `HttpOnly; SameSite=Strict`
-process-lifetime cookie. Because this development origin is plain loopback
-HTTP, the cookie cannot reliably use `Secure`; a future HTTPS deployment must
-add it. Codes and cookie values never belong in URLs or browser storage.
+服务会向可信终端打印一次性浏览器引导码。打开 `http://127.0.0.1:37891/`，在五分钟内
+输入该码。浏览器会收到 `HttpOnly; SameSite=Strict` cookie；令牌、引导码和 cookie 值都
+不得放入 URL 或浏览器存储。
 
-The WebSocket reconnect flow is: retain the last fully processed event
-sequence, reconnect using subprotocol `alda-agent.v1`, fetch
-`session.snapshot`, then subscribe from the retained cursor. On typed cursor
-recovery errors, fetch a fresh snapshot. A disconnect does not cancel a Turn.
+WebSocket 重连流程固定为：保留客户端已完整处理的 sequence，使用 `alda-agent.v2`
+重新连接，读取 `session.snapshot`，再从保留的 cursor 订阅。收到 typed cursor 恢复错误时，
+改用新 snapshot 的覆盖范围。断线本身不会取消 Turn。
 
-In another terminal using the independent CLI bearer environment value:
+CLI 示例：
 
 ```bash
 cargo run -- project create --command-id create-1 --name 'My project'
-cargo run -- project snapshot --command-id snapshot-1 --project-id project-1
-cargo run -- session start --command-id session-1 --project-id project-1
-cargo run -- session snapshot --command-id snapshot-2 --session-id session-1
-cargo run -- turn start --command-id turn-1 --session-id session-1 \
+cargo run -- project snapshot --command-id snapshot-1 --project-id <project-id>
+cargo run -- session start --command-id session-1 --project-id <project-id>
+cargo run -- session snapshot --command-id snapshot-2 --session-id <session-id>
+cargo run -- turn start --command-id turn-1 --session-id <session-id> \
   --prompt 'Write a short etude'
-cargo run -- event resume --command-id resume-1 --session-id session-1 \
+cargo run -- event resume --command-id resume-1 --session-id <session-id> \
   --epoch 1 --after-sequence 0
-cargo run -- question respond --command-id answer-1 --session-id session-1 \
-  --question-id question-1 --choice-id bars_8
-cargo run -- approval respond --command-id approve-1 --session-id session-1 \
-  --approval-id approval-1 --digest-algorithm sha256 \
-  --digest-schema-version 1 --digest-value '<value-from-session-snapshot>' \
-  --decision approve
-cargo run -- artifact manifest --command-id manifest-1 --project-id project-1 \
-  --artifact-occurrence-id artifact-occurrence-1
 ```
 
-Alternatively, cancel a still-pending Turn before responding:
-
-```bash
-cargo run -- turn cancel --command-id cancel-1 --session-id session-1 \
-  --turn-id turn-1
-```
-
-Successful protocol replies are written to stdout. Transport and protocol
-errors are written to stderr and return a non-zero exit status.
-
-The manifest supplies the content hash. An authenticated HTTP download can be
-requested without giving the service a filename or filesystem target:
+Artifact manifest 提供内容 hash。认证下载只接受 hash path 与 Project identity：
 
 ```bash
 curl -H "Authorization: Bearer $ALDA_AGENT_SESSION_TOKEN" \
   -H 'Origin: http://127.0.0.1:37891' \
-  -H 'X-Alda-Project-Id: project-1' \
-  http://127.0.0.1:37891/v1/artifacts/<64-lowercase-sha256-hex>
+  -H 'X-Alda-Project-Id: <project-id>' \
+  http://127.0.0.1:37891/v2/artifacts/<64-lowercase-sha256-hex>
 ```
 
-All A1–A4 state, browser sessions, events, command replies, and Artifacts exist only for the lifetime
-of one service process. Epoch `1` does not imply durable recovery: restarting
-the process loses this slice's projects, sessions, turns, events, and
-idempotency records. Persistent restart recovery belongs to a later slice.
-Approving the A2 fixture only advances its in-memory Fake Turn state machine;
-it never sends model data, writes files, plays audio, or authorizes a real
-side effect.
-The A3 Alda bytes are a deterministic, size-bounded fixture. They are not
-parsed by Alda, are not a Revision, and are not stored durably. Disk staging,
-fsync/rename, Project replay, orphan cleanup, and formal Revision/Artifact
-references remain later work.
-The PWA is a development protocol client, not the slice D score workspace: it
-does not provide notation, MIDI, audition, feedback, Takes, or Accept.
+## v1 升级说明
 
-## Verify
+production 不提供 v1 path alias、WebSocket subprotocol 协商或 payload 降级。项目在 v1
+阶段没有可迁移的持久数据；升级时必须改用 v2 HTTP path、`alda-agent.v2` 和
+`protocol_version: 2`，然后重新连接。v2 transport 收到 v1 envelope 会返回 typed
+`InvalidProtocolVersion`，不会执行命令。
+
+`ArtifactDurability` wire 同时包含：
+
+- `process_lifetime_fixture`：仅显式内存测试 backend 使用；
+- `durable_local`：production durable Artifact 使用。
+
+## 验证
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo check --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+node --test web/client-state.test.js
+for source in web/*.js; do node --check "$source"; done
 ```
