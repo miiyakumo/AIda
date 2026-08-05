@@ -1,6 +1,6 @@
 ---
 name: simple-workflow
-description: Coordinate a complex task through the smallest useful Brain–Worker–Reviewer workflow, including collaborative requirement clarification and staged review. Use when the user asks to split work into thinking, execution, and independent review units; delegate a task across agents; run work in parallel; or keep a long multi-agent task moving without filling the main agent's context.
+description: Coordinate complex work through the smallest useful Brain–Worker–Reviewer workflow. Use when the user explicitly requests delegation, parallel agents, or independent review, or when a long or high-risk task has genuinely independent workstreams and delegation materially reduces latency, context pressure, or review risk. Do not trigger merely because a task has multiple steps, touches multiple files, can theoretically be staged, or asks for routine inspection or status reporting. Invoking the skill does not require spawning agents when one agent is sufficient.
 ---
 
 # Simple Agent Workflow
@@ -9,8 +9,8 @@ Treat the main agent as the Master. The Master gathers context, works with the u
 
 ## Workflow
 
-1. Decide whether decomposition helps. If one agent can handle the task well, do not split it. Before delegating a complex task, inspect the project deeply enough to give the Brain and Workers grounded context.
-2. Ask one Brain agent to examine the goal. Keep the same Brain while it challenges assumptions, identifies material ambiguity, and proposes clarifications. Relay its concise objections or questions to the user and send the user's answers back until the goal is mutually understood.
+1. Decide whether decomposition helps. Invoking this skill does not require spawning sub-agents. If one agent can handle the task well, stop the multi-agent workflow here and complete the task as Master. Before delegating a complex task, inspect the project deeply enough to give the Brain and Workers grounded context.
+2. When decomposition helps, ask one Brain agent to examine the goal. Keep the same Brain while it challenges assumptions, identifies material ambiguity, and proposes clarifications. Relay its concise objections or questions to the user and send the user's answers back until the goal is mutually understood.
 3. Have the Brain produce the fewest useful tasks. Keep each task to:
    - **Task:** what to do
    - **Done:** how to know it is complete
