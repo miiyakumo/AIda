@@ -34,9 +34,9 @@ impl Config {
                 let key = key.trim();
                 let value = value.trim().trim_matches('"').trim_matches('\'');
                 match key {
-                    "ALDA_AGENT_API_KEY" => api_key = Some(value.to_string()),
-                    "ALDA_AGENT_BASE_URL" => base_url = Some(value.to_string()),
-                    "ALDA_AGENT_MODEL" => model = Some(value.to_string()),
+                    "ALDA_AGENT_API_KEY" | "api-key" => api_key = Some(value.to_string()),
+                    "ALDA_AGENT_BASE_URL" | "base_url" => base_url = Some(value.to_string()),
+                    "ALDA_AGENT_MODEL" | "model" => model = Some(value.to_string()),
                     _ => {}
                 }
             }
