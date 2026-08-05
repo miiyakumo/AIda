@@ -470,13 +470,7 @@ mod tests {
         let runner = runner().expect("alda 未安装，跳过测试");
         let info = runner.parse(&fixture("valid_simple.alda")).unwrap();
         let target = info.duration_ms; // 精确目标
-        let checks = runner.validate(
-            &fixture("valid_simple.alda"),
-            &[],
-            &[],
-            Some(target),
-            10.0,
-        );
+        let checks = runner.validate(&fixture("valid_simple.alda"), &[], &[], Some(target), 10.0);
         let duration_check = checks.iter().find(|c| c.name == "时长").unwrap();
         assert_eq!(duration_check.status, CheckStatus::Pass);
     }

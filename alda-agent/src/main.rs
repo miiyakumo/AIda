@@ -1,4 +1,5 @@
 use alda_agent::{Cli, Command};
+use anyhow::Context;
 use clap::Parser;
 
 #[tokio::main]
@@ -9,6 +10,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor => alda_agent::doctor::run(),
         Command::Smoke => smoke().await,
         Command::AldaSmoke => smoke_alda(),
+        Command::Create {
+            file,
+            mode,
+            duration,
+            include,
+            exclude,
+            output,
+        } => create(file, mode, duration, include, exclude, output).await,
     }
 }
 
@@ -33,7 +42,9 @@ async fn smoke() -> anyhow::Result<()> {
     println!("--- 测试 1: 简单流式对话 ---");
     let messages = vec![Message {
         role: "user".to_string(),
-        content: "用一句话介绍你自己。".to_string(),
+        content: Some("用一句话介绍你自己。".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
     }];
 
     match client.chat_stream(messages, None).await {
@@ -76,7 +87,9 @@ async fn smoke() -> anyhow::Result<()> {
 
     let messages = vec![Message {
         role: "user".to_string(),
-        content: "用 Alda 写一个两小节的 C 大调和弦进行。".to_string(),
+        content: Some("用 Alda 写一个两小节的 C 大调和弦进行。".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
     }];
 
     match client.chat_stream(messages, Some(tools)).await {
@@ -91,7 +104,10 @@ async fn smoke() -> anyhow::Result<()> {
             println!();
             println!("  工具调用: {} 个, done={}", tool_calls.len(), done);
             for tc in &tool_calls {
-                if let alda_agent::deepseek::StreamEvent::ToolCall { name, arguments } = tc {
+                if let alda_agent::deepseek::StreamEvent::ToolCall {
+                    name, arguments, ..
+                } = tc
+                {
                     println!("  工具: {}, 参数长度: {} 字节", name, arguments.len());
                 }
             }
@@ -197,5 +213,101 @@ fn smoke_alda() -> anyhow::Result<()> {
     }
 
     println!("\n=== Alda 工具测试完成 ===");
+    Ok(())
+}
+
+async fn create(
+    file: Option<std::path::PathBuf>,
+    mode: String,
+    duration: Option<f64>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    output: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    use alda_agent::agent::{Agent, CreationMode, CreationRequest};
+    use alda_agent::alda::{AldaRunner, CheckStatus, find_alda};
+    use alda_agent::config::Config;
+    use alda_agent::deepseek::DeepSeekClient;
+    use std::io::Read;
+
+    // 读取素材
+    let source_material = if let Some(ref path) = file {
+        std::fs::read_to_string(path).context("无法读取素材文件")?
+    } else {
+        eprintln!("请输入创作素材（Ctrl+D 结束）:");
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("无法读取 stdin")?;
+        buf.trim().to_string()
+    };
+
+    if source_material.is_empty() {
+        anyhow::bail!("素材不能为空");
+    }
+
+    // 初始化
+    let config = Config::from_env_file()?;
+    let client = DeepSeekClient::new(
+        config.api_key.clone(),
+        config.base_url.clone(),
+        config.model.clone(),
+    )?;
+    let alda_path = find_alda().ok_or_else(|| anyhow::anyhow!("未找到 alda，请先安装"))?;
+    let runner = AldaRunner::new(alda_path);
+    let agent = Agent::new(client, runner);
+
+    let creation_mode = match mode.as_str() {
+        "full" => CreationMode::FullPiece,
+        "improv" => CreationMode::Improvisation,
+        other => anyhow::bail!("无效的创作模式: {}（应为 full 或 improv）", other),
+    };
+
+    let request = CreationRequest {
+        source_material,
+        mode: creation_mode,
+        target_duration_secs: duration,
+        included_instruments: include,
+        excluded_instruments: exclude,
+        max_rounds: 3,
+    };
+
+    println!("\n=== 开始创作 ===\n");
+
+    let result = agent.create(request).await?;
+
+    println!("\n=== 创作完成 ({}/{} 轮) ===\n", result.rounds, 3);
+    println!(
+        "状态: {}",
+        if result.success {
+            "✅ 成功"
+        } else {
+            "❌ 失败"
+        }
+    );
+    println!();
+
+    println!("校验结果:");
+    for check in &result.checks {
+        let icon = match check.status {
+            CheckStatus::Pass => "✅",
+            CheckStatus::Fail => "❌",
+            CheckStatus::Unchecked => "⏭ ",
+        };
+        println!("  {} {}: {}", icon, check.name, check.detail);
+    }
+
+    if result.success {
+        if let Some(ref code) = result.alda_code {
+            let output_file = output.join("current.alda");
+            std::fs::write(&output_file, code)?;
+            println!("\n作品已保存到: {}", output_file.display());
+        }
+    } else {
+        if result.was_truncated {
+            println!("\n⚠️  模型输出被截断，作品可能不完整。");
+        }
+    }
+
     Ok(())
 }

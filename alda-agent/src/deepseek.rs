@@ -32,7 +32,26 @@ struct ChatRequest<'a> {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Message {
     pub role: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallMsg>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolCallMsg {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub function: FunctionCallArgs,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FunctionCallArgs {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -69,6 +88,9 @@ struct Delta {
 
 #[derive(Debug, Deserialize)]
 struct ToolCallDelta {
+    #[allow(dead_code)]
+    index: Option<i32>,
+    id: Option<String>,
     function: Option<FunctionArg>,
 }
 
@@ -81,8 +103,14 @@ struct FunctionArg {
 #[derive(Debug)]
 pub enum StreamEvent {
     Text(String),
-    ToolCall { name: String, arguments: String },
-    Done { finish_reason: String },
+    ToolCall {
+        id: Option<String>,
+        name: String,
+        arguments: String,
+    },
+    Done {
+        finish_reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -174,6 +202,7 @@ impl DeepSeekClient {
 
         let mut stream = response.bytes_stream();
         let mut events = Vec::new();
+        let mut pending_tool_id: Option<String> = None;
         let mut pending_tool_name = String::new();
         let mut pending_tool_args = String::new();
         let mut buffer = String::new();
@@ -214,6 +243,9 @@ impl DeepSeekClient {
                                     }
                                     if let Some(ref tool_calls) = delta.tool_calls {
                                         for tc in tool_calls {
+                                            if let Some(ref id) = tc.id {
+                                                pending_tool_id = Some(id.clone());
+                                            }
                                             if let Some(ref func) = tc.function {
                                                 if let Some(ref name) = func.name {
                                                     pending_tool_name = name.clone();
@@ -246,6 +278,7 @@ impl DeepSeekClient {
         // 如果有收集到的工具调用，作为事件追加
         if !pending_tool_name.is_empty() {
             events.push(StreamEvent::ToolCall {
+                id: pending_tool_id,
                 name: pending_tool_name,
                 arguments: pending_tool_args,
             });
