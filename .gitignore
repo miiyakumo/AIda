@@ -99,3 +99,5 @@ ref/
 
 # Rust build artifacts
 target/
+
+.env

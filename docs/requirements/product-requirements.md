@@ -294,8 +294,19 @@ Alda 源码对用户可见，但普通用户不需要直接编辑。高级用户
 
 - OpenAI-compatible 请求与响应格式；
 - DeepSeek 模型；
-- 可配置的 `base_url`、模型标识和 API key 环境变量；
+- 通过仓库根目录 `.env` 配置 API key 和 base URL；
+- 可配置的 DeepSeek 模型标识；
 - 一个具体客户端实现。
+
+`.env` 使用每行一个 `KEY=VALUE` 的简单格式：
+
+```dotenv
+api-key=<DeepSeek API key>
+base_url=<DeepSeek OpenAI-compatible base URL>
+```
+
+OpenAI 表示请求和响应的线协议格式，不表示实际模型服务是 OpenAI。项目只解析当前需要的
+`api-key` 和 `base_url` 两个键，并提供不含真实值的 `.env.example`；`.env` 只用于本地且不得提交。
 
 首期应验证：
 
@@ -330,7 +341,7 @@ Alda 源码对用户可见，但普通用户不需要直接编辑。高级用户
 
 ## 13. 隐私与安全底线
 
-- DeepSeek API key 只从环境变量读取，不写入项目、日志或导出文件；
+- DeepSeek API key 只从本地 `.env` 的 `api-key` 读取，不写入项目数据、日志或导出文件；
 - 首次使用应明确提示诗歌、创作要求、当前乐谱和校验错误会发送给配置的模型服务；
 - 文件读写限制在当前项目目录和明确导出目标；
 - Alda 子进程具有超时、取消和输出上限；
