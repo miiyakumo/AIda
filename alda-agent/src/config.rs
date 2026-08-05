@@ -45,7 +45,7 @@ impl Config {
         Ok(Config {
             api_key: api_key.ok_or_else(|| anyhow::anyhow!(".env 中缺少 ALDA_AGENT_API_KEY"))?,
             base_url: base_url.unwrap_or_else(|| "https://api.deepseek.com".to_string()),
-            model: model.unwrap_or_else(|| "deepseek-chat".to_string()),
+            model: model.unwrap_or_else(|| "deepseek-v4-flash".to_string()),
         })
     }
 }
@@ -62,7 +62,7 @@ mod tests {
         let config = Config::from_file(&env_path).unwrap();
         assert_eq!(config.api_key, "sk-test-key");
         assert_eq!(config.base_url, "https://api.deepseek.com");
-        assert_eq!(config.model, "deepseek-chat");
+        assert_eq!(config.model, "deepseek-v4-flash");
     }
 
     #[test]
