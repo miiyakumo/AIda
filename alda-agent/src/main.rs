@@ -8,6 +8,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Doctor => alda_agent::doctor::run(),
         Command::Smoke => smoke().await,
+        Command::AldaSmoke => smoke_alda(),
     }
 }
 
@@ -103,5 +104,98 @@ async fn smoke() -> anyhow::Result<()> {
 
     println!("=== 测试摘要 ===");
     println!("本测试仅验证 API 连通性，不包含完整素材内容。");
+    Ok(())
+}
+
+fn smoke_alda() -> anyhow::Result<()> {
+    use alda_agent::alda::{AldaRunner, find_alda};
+    use std::path::PathBuf;
+
+    println!("=== Alda 工具连通测试 ===\n");
+
+    let alda_path = find_alda().ok_or_else(|| anyhow::anyhow!("未找到 alda，请先安装"))?;
+    println!("alda 路径: {}", alda_path.display());
+
+    let runner = AldaRunner::new(alda_path);
+
+    // 测试 1: 语法检查
+    println!("\n--- 测试 1: 语法检查 ---");
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures");
+    let valid = fixture_dir.join("valid_simple.alda");
+    let invalid = fixture_dir.join("invalid_syntax.alda");
+
+    match runner.parse(&valid) {
+        Ok(info) => println!(
+            "  ✅ 合法文件解析成功: {} 声部, {:.1}秒",
+            info.part_count,
+            info.duration_ms / 1000.0
+        ),
+        Err(e) => println!("  ❌ 合法文件解析失败: {}", e),
+    }
+
+    match runner.parse(&invalid) {
+        Ok(_) => println!("  ❌ 非法文件未报错"),
+        Err(e) => println!("  ✅ 非法文件正确报错: {}", e),
+    }
+
+    // 测试 2: 时长推导
+    println!("\n--- 测试 2: 时长推导 ---");
+    let valid_long = fixture_dir.join("valid_multi_part.alda");
+    match runner.parse(&valid_long) {
+        Ok(info) => {
+            println!(
+                "  {} 声部, 时长 {:.2}秒",
+                info.part_count,
+                info.duration_ms / 1000.0
+            );
+            for inst in &info.instruments {
+                println!("    - {}", inst);
+            }
+        }
+        Err(e) => println!("  ❌ 错误: {}", e),
+    }
+
+    // 测试 3: 乐器列表
+    println!("\n--- 测试 3: 乐器列表 ---");
+    match runner.list_instruments() {
+        Ok(instruments) => println!("  ✅ {} 种可用乐器", instruments.len()),
+        Err(e) => println!("  ❌ 错误: {}", e),
+    }
+
+    // 测试 4: 乐器检查（validate）
+    println!("\n--- 测试 4: 乐器检查 ---");
+    let no_constraint = runner.validate(&valid, &[], &[], None, 10.0);
+    for check in &no_constraint {
+        println!("  {}: {} — {}", check.name, check.status, check.detail);
+    }
+
+    let exclude_piano = runner.validate(&valid, &[], &["piano".to_string()], None, 10.0);
+    for check in &exclude_piano {
+        println!("  {}: {} — {}", check.name, check.status, check.detail);
+    }
+
+    // 测试 5: 时长检查
+    println!("\n--- 测试 5: 时长检查 ---");
+    let info = runner.parse(&valid)?;
+    let target = info.duration_ms as f64;
+    let checks = runner.validate(&valid, &[], &[], Some(target), 10.0);
+    for check in &checks {
+        println!("  {}: {} — {}", check.name, check.status, check.detail);
+    }
+
+    // 测试 6: MIDI 导出
+    println!("\n--- 测试 6: MIDI 导出 ---");
+    let tmp = std::env::temp_dir().join(format!("alda_smoke_{}.mid", std::process::id()));
+    match runner.export_midi(&valid, &tmp) {
+        Ok(path) => {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            println!("  ✅ MIDI 导出成功: {} ({} 字节)", path.display(), size);
+        }
+        Err(e) => println!("  ❌ 导出失败: {}", e),
+    }
+
+    println!("\n=== Alda 工具测试完成 ===");
     Ok(())
 }

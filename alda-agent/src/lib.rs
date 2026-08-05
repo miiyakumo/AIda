@@ -1,3 +1,4 @@
+pub mod alda;
 pub mod config;
 pub mod deepseek;
 pub mod doctor;
@@ -17,4 +18,6 @@ pub enum Command {
     Doctor,
     /// 运行 DeepSeek API 连通测试
     Smoke,
+    /// 运行 Alda 工具连通测试
+    AldaSmoke,
 }
