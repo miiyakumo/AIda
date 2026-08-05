@@ -1,0 +1,5 @@
+data: {"id":"chatcmpl-3","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"这是一段很长的"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-3","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":""},"finish_reason":"length"}]}
+
+data: [DONE]
