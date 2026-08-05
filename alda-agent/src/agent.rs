@@ -313,7 +313,7 @@ fn parse_alda_code_from_args(args: &str) -> Result<String> {
     Ok(code.to_string())
 }
 
-fn build_tool_feedback(checks: &[AldaCheck], tool_call_id: Option<&str>) -> String {
+fn build_tool_feedback(checks: &[AldaCheck], _tool_call_id: Option<&str>) -> String {
     let failures: Vec<_> = checks
         .iter()
         .filter(|c| c.status == CheckStatus::Fail)
@@ -324,14 +324,75 @@ fn build_tool_feedback(checks: &[AldaCheck], tool_call_id: Option<&str>) -> Stri
     }
 
     let mut msg = format!(
-        "❌ 校验失败 ({}/{} 项)  call_id: {:?}。请根据以下诊断修改作品：\n\n",
+        "校验反馈 ({}/{} 项未通过):\n\n",
         failures.len(),
         checks.len(),
-        tool_call_id
     );
+
     for c in checks {
-        msg.push_str(&format!("- {}: {} — {}\n", c.name, c.status, c.detail));
+        let icon = match c.status {
+            CheckStatus::Pass => "✅",
+            CheckStatus::Fail => "❌",
+            CheckStatus::Unchecked => "⏭",
+        };
+        msg.push_str(&format!("{} {}: {}\n", icon, c.name, c.detail));
     }
-    msg.push_str("\n请修改 Alda 乐谱后重新提交。");
+
+    // 如果有时长失败, 计算精确的倍数并给出具体操作建议
+    if let Some(dur_check) = checks.iter().find(|c| c.name == "时长" && c.status == CheckStatus::Fail)
+        && let Some((actual, target)) = parse_duration_values(&dur_check.detail)
+        && actual > 0.0
+    {
+        let multiplier = target / actual;
+        msg.push_str(&format!(
+            "\n**时长修正指南**: 当前作品约 {:.0} 秒, 需要达到 {:.0} 秒. 需要将内容量扩大到约 **{:.1}** 倍.\n",
+            actual, target, multiplier
+        ));
+        msg.push_str("具体做法:\n");
+        msg.push_str(&format!(
+            "- 将所有反复次数乘以 {:.0} (如 `*2` 变成 `*{}`)\n",
+            multiplier.ceil(),
+            (2.0 * multiplier).ceil() as u32
+        ));
+        msg.push_str(&format!(
+            "- 或者在现有 tempo 基础上降低, 例如 `(tempo {:.0})` 降低到 `(tempo {:.0})`\n",
+            120.0,
+            (120.0 / multiplier).ceil()
+        ));
+        msg.push_str("- 或者增加新的变奏段落来扩展结构\n");
+    }
+
+    msg.push_str("\n请根据以上反馈修改 Alda 乐谱后重新提交. 注意: 反馈中的具体数值和倍数建议是精确计算得出的, 请严格参考.");
     msg
+}
+
+/// 从时长检查的 detail 文本中解析实际值和目标值
+/// detail 格式: "约 46秒（目标 180秒，偏差 74%，超出容差 10%）"
+fn parse_duration_values(detail: &str) -> Option<(f64, f64)> {
+    let after_yue = detail.strip_prefix("约 ")?.split('秒').next()?;
+    let actual: f64 = after_yue.trim().parse().ok()?;
+
+    let target_start = detail.find("目标 ")?.checked_add("目标 ".len())?;
+    let target_end = detail[target_start..].find('秒')?;
+    let target: f64 = detail[target_start..target_start + target_end].trim().parse().ok()?;
+
+    Some((actual, target))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_duration() {
+        let (actual, target) = parse_duration_values("约 46秒（目标 180秒，偏差 74%，超出容差 10%）").unwrap();
+        assert_eq!(actual, 46.0);
+        assert_eq!(target, 180.0);
+    }
+
+    #[test]
+    fn test_parse_duration_no_match() {
+        assert!(parse_duration_values("未检查").is_none());
+        assert!(parse_duration_values("解析成功").is_none());
+    }
 }
