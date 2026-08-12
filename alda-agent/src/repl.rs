@@ -19,6 +19,9 @@ enum ReplCommand {
     Restore(u32),
     Reload,
     Continue,
+    StrategyShow,
+    StrategySet(String),
+    StrategyClear,
     Quit,
     NaturalLanguage(String),
     Empty,
@@ -146,6 +149,25 @@ async fn execute_command<W: Write>(
     match command {
         ReplCommand::Help => print_help(writer)?,
         ReplCommand::History => print_history(project, writer)?,
+        ReplCommand::StrategyShow => {
+            if project.creative_strategy().is_empty() {
+                writeln!(writer, "项目未设置创作策略；当前使用内置默认策略。")?;
+            } else {
+                writeln!(
+                    writer,
+                    "项目创作策略（优先于冲突的内置默认）：\n{}",
+                    project.creative_strategy()
+                )?;
+            }
+        }
+        ReplCommand::StrategySet(strategy) => {
+            project.set_creative_strategy(&strategy)?;
+            writeln!(writer, "已替换项目创作策略。")?;
+        }
+        ReplCommand::StrategyClear => {
+            project.set_creative_strategy("")?;
+            writeln!(writer, "已清除项目创作策略；将使用内置默认策略。")?;
+        }
         ReplCommand::Restore(version) => {
             project.restore_version(version)?;
             writeln!(writer, "已恢复版本 {version}；历史文件未被覆盖。")?;
@@ -242,6 +264,7 @@ async fn execute_command<W: Write>(
                     .create(CreationRequest {
                         source_material: project.source_material.clone(),
                         instructions: feedback.clone(),
+                        creative_strategy: project.creative_strategy().to_string(),
                         mode: if project.mode() == "improv" {
                             CreationMode::Improvisation
                         } else {
@@ -260,6 +283,7 @@ async fn execute_command<W: Write>(
                         source_material: project.source_material.clone(),
                         current_alda: project.version_code(project.current_version())?,
                         feedback: feedback.clone(),
+                        creative_strategy: project.creative_strategy().to_string(),
                         mode: if project.mode() == "improv" {
                             CreationMode::Improvisation
                         } else {
@@ -374,6 +398,20 @@ fn parse_command(input: &str) -> Result<ReplCommand> {
     if !input.starts_with('/') {
         return Ok(ReplCommand::NaturalLanguage(input.to_string()));
     }
+    if input == "/strategy" {
+        return Ok(ReplCommand::StrategyShow);
+    }
+    if let Some(strategy) = input.strip_prefix("/strategy ") {
+        let strategy = strategy.trim();
+        if strategy.is_empty() {
+            bail!("用法：/strategy [策略文本|clear]");
+        }
+        return if strategy.eq_ignore_ascii_case("clear") {
+            Ok(ReplCommand::StrategyClear)
+        } else {
+            Ok(ReplCommand::StrategySet(strategy.to_string()))
+        };
+    }
     let mut parts = input.split_whitespace();
     match parts.next().unwrap_or_default() {
         "/help" => Ok(ReplCommand::Help),
@@ -402,7 +440,7 @@ fn parse_command(input: &str) -> Result<ReplCommand> {
 fn print_help<W: Write>(writer: &mut W) -> Result<()> {
     writeln!(
         writer,
-        "/play       播放当前有效版本\n/stop       停止播放\n/export     导出 Alda 与 MIDI\n/history    查看有效版本\n/restore N  恢复版本 N\n/reload     校验并采用手工编辑的 current.alda\n/continue   继续上一轮失败的自动修正\n/quit       退出"
+        "/play             播放当前有效版本\n/stop             停止播放\n/export           导出 Alda 与 MIDI\n/history          查看有效版本\n/restore N        恢复版本 N\n/reload           校验并采用手工编辑的 current.alda\n/continue         继续上一轮失败的自动修正\n/strategy         查看项目创作策略\n/strategy <文本>  替换项目创作策略\n/strategy clear   清除项目创作策略\n/quit             退出"
     )?;
     Ok(())
 }
@@ -449,6 +487,18 @@ mod tests {
         );
         assert_eq!(parse_command("/reload").unwrap(), ReplCommand::Reload);
         assert_eq!(
+            parse_command("/strategy").unwrap(),
+            ReplCommand::StrategyShow
+        );
+        assert_eq!(
+            parse_command("/strategy  明亮欢快，增加随机性").unwrap(),
+            ReplCommand::StrategySet("明亮欢快，增加随机性".to_string())
+        );
+        assert_eq!(
+            parse_command("/strategy clear").unwrap(),
+            ReplCommand::StrategyClear
+        );
+        assert_eq!(
             parse_command("让结尾更明亮").unwrap(),
             ReplCommand::NaturalLanguage("让结尾更明亮".to_string())
         );
@@ -490,6 +540,27 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("尚无有效版本"));
+    }
+
+    #[tokio::test]
+    async fn strategy_commands_persist_without_loading_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
+        let input =
+            b"material\n.\n/strategy bright and playful\n/strategy\n/strategy clear\n/quit\n";
+        let mut output = Vec::new();
+        run_repl_with_io(
+            root.clone(),
+            ReplSettings::default(),
+            &input[..],
+            &mut output,
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("bright and playful"));
+        let project = Project::load_or_create(root, "ignored", "ignored").unwrap();
+        assert_eq!(project.creative_strategy(), "");
     }
 
     #[test]

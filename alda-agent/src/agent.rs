@@ -8,7 +8,8 @@ use std::fs;
 // 系统提示
 // ============================================================
 
-const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
+const PROTOCOL_PROMPT: &str = include_str!("../prompts/protocol.md");
+const DEFAULT_CREATIVE_STRATEGY: &str = include_str!("../prompts/default-creative-strategy.md");
 
 // ============================================================
 // 工具定义
@@ -25,7 +26,7 @@ fn submit_alda_tool() -> Tool {
                 "properties": {
                     "alda_code": {
                         "type": "string",
-                        "description": "完整且紧凑的 Alda 乐谱代码；复用材料时使用变量，反复必须具有音乐作用，禁止逐字展开重复段落",
+                        "description": "完整且紧凑的 Alda 乐谱代码；复用材料时使用变量，禁止逐字展开重复段落",
                         "maxLength": crate::deepseek::MAX_TOOL_ARGUMENT_BYTES
                     }
                 },
@@ -44,6 +45,8 @@ pub struct CreationRequest {
     pub source_material: String,
     /// 本次创作的自然语言要求
     pub instructions: String,
+    /// 项目级创作策略；为空时仅使用内置默认
+    pub creative_strategy: String,
     /// 创作模式
     pub mode: CreationMode,
     /// 目标时长（秒），None 不检查
@@ -99,6 +102,7 @@ pub struct ModifyRequest {
     pub source_material: String,
     pub current_alda: String,
     pub feedback: String,
+    pub creative_strategy: String,
     pub mode: CreationMode,
     pub target_duration_secs: Option<f64>,
     pub included_instruments: Vec<String>,
@@ -143,7 +147,7 @@ impl Agent {
         let messages = vec![
             Message {
                 role: "system".to_string(),
-                content: Some(SYSTEM_PROMPT.to_string()),
+                content: Some(PROTOCOL_PROMPT.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -178,7 +182,7 @@ impl Agent {
         let messages = vec![
             Message {
                 role: "system".to_string(),
-                content: Some(SYSTEM_PROMPT.to_string()),
+                content: Some(PROTOCOL_PROMPT.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -410,17 +414,12 @@ fn validate_generation_constraints(validation: &ValidationRequest) -> Result<()>
 fn build_user_message(request: &CreationRequest) -> String {
     let mut msg = String::new();
 
-    msg.push_str("创作要求：\n\n");
+    append_strategy_context(&mut msg, &request.creative_strategy);
+    msg.push_str("【创作上下文】\n");
 
     if !request.source_material.is_empty() {
         msg.push_str("【素材】\n");
         msg.push_str(&request.source_material);
-        msg.push_str("\n\n");
-    }
-
-    if !request.instructions.trim().is_empty() {
-        msg.push_str("【用户要求】\n");
-        msg.push_str(request.instructions.trim());
         msg.push_str("\n\n");
     }
 
@@ -448,29 +447,26 @@ fn build_user_message(request: &CreationRequest) -> String {
         );
     }
 
-    msg.push_str("\n请按照工作流程创作：先解读素材并说明配器理由，然后提交完整的 Alda 乐谱。");
+    msg.push_str("\n【本轮要求｜来源：当前用户输入｜最高策略优先级】\n");
+    if request.instructions.trim().is_empty() {
+        msg.push_str("根据上述素材创作完整作品。");
+    } else {
+        msg.push_str(request.instructions.trim());
+    }
     msg
 }
 
 fn build_modify_message(request: &ModifyRequest) -> String {
-    let mut msg = String::from(
-        "这是一次独立的作品修改请求。不要假定或延续此前对话中的修改方案，只以本消息提供的素材、当前乐谱、最新反馈和约束为准。\n\n",
-    );
-    msg.push_str(
-        "先判断反馈范围：\n\
-- 明确指向段落、乐器或参数时，只修改相关范围并尽量保持其余内容不变；\n\
-- 指向整体听感、艺术性、编排、结构或另一种诠释时，允许重写曲式、主题发展、织体与配器，不要被当前骨架限制；\n\
-- 如果范围确实不清楚且不同选择会显著改变作品，只提出一个简短澄清问题，不要调用 submit_alda。\n\n",
-    );
+    let mut msg = String::new();
+    append_strategy_context(&mut msg, &request.creative_strategy);
+    msg.push_str("【修改上下文】\n这是一次独立的作品修改请求。不要假定或延续此前对话中的修改方案，只以本消息提供的素材、当前乐谱、最新反馈和约束为准。\n\n");
 
     if !request.source_material.trim().is_empty() {
         msg.push_str("【原始素材】\n");
         msg.push_str(request.source_material.trim());
         msg.push_str("\n\n");
     }
-    msg.push_str("【最新反馈】\n");
-    msg.push_str(request.feedback.trim());
-    msg.push_str("\n\n【模式】");
+    msg.push_str("【模式】");
     msg.push_str(request.mode.description());
     msg.push('\n');
 
@@ -494,7 +490,20 @@ fn build_modify_message(request: &ModifyRequest) -> String {
 
     msg.push_str("\n【当前 Alda】\n");
     msg.push_str(&request.current_alda);
+    msg.push_str("\n\n【本轮要求｜来源：当前用户反馈｜最高策略优先级】\n");
+    msg.push_str(request.feedback.trim());
     msg
+}
+
+fn append_strategy_context(msg: &mut String, project_strategy: &str) {
+    msg.push_str("【默认创作策略｜来源：内置默认】\n");
+    msg.push_str(DEFAULT_CREATIVE_STRATEGY.trim());
+    msg.push_str("\n\n");
+    if !project_strategy.trim().is_empty() {
+        msg.push_str("【项目创作策略｜来源：用户项目配置｜覆盖冲突的默认策略】\n");
+        msg.push_str(project_strategy.trim());
+        msg.push_str("\n\n");
+    }
 }
 
 fn parse_alda_code_from_args(args: &str) -> Result<String> {
@@ -635,6 +644,7 @@ mod tests {
         CreationRequest {
             source_material: "素材".to_string(),
             instructions: "创作完整器乐作品".to_string(),
+            creative_strategy: "保持明亮欢快".to_string(),
             mode: CreationMode::FullPiece,
             target_duration_secs: None,
             included_instruments: Vec::new(),
@@ -648,6 +658,7 @@ mod tests {
             source_material: "原始诗歌".to_string(),
             current_alda: "midi-piano: c1".to_string(),
             feedback: "编排单调，艺术性不高".to_string(),
+            creative_strategy: "保持明亮欢快".to_string(),
             mode: CreationMode::FullPiece,
             target_duration_secs: Some(180.0),
             included_instruments: vec!["midi-cello".to_string()],
@@ -661,13 +672,31 @@ mod tests {
         let message = build_modify_message(&modify_request());
         assert!(message.contains("不要假定或延续此前对话"));
         assert!(message.contains("【原始素材】\n原始诗歌"));
-        assert!(message.contains("【最新反馈】\n编排单调，艺术性不高"));
-        assert!(message.contains("允许重写曲式、主题发展、织体与配器"));
+        assert!(message.contains("【默认创作策略｜来源：内置默认】"));
+        assert!(message.contains("【项目创作策略｜来源：用户项目配置"));
+        assert!(message.contains("保持明亮欢快"));
+        assert!(message.contains("【本轮要求｜来源：当前用户反馈｜最高策略优先级】"));
+        assert!(message.contains("可以重写曲式、主题发展、织体与配器"));
         assert!(message.contains("只提出一个简短澄清问题"));
         assert!(message.contains("【目标时长】约 3 分钟"));
         assert!(message.contains("【必须包含的乐器】midi-cello"));
         assert!(message.contains("【必须排除的乐器】midi-timpani"));
-        assert!(message.ends_with("【当前 Alda】\nmidi-piano: c1"));
+        assert!(message.ends_with("编排单调，艺术性不高"));
+    }
+
+    #[test]
+    fn protocol_and_creative_strategies_have_separate_precedence_layers() {
+        assert!(PROTOCOL_PROMPT.contains("submit_alda"));
+        assert!(!PROTOCOL_PROMPT.contains("默认创作策略"));
+        assert!(!PROTOCOL_PROMPT.contains("高潮由材料演变"));
+
+        let message = build_user_message(&request(1));
+        let default_position = message.find("【默认创作策略").unwrap();
+        let project_position = message.find("【项目创作策略").unwrap();
+        let current_position = message.find("【本轮要求").unwrap();
+        assert!(default_position < project_position);
+        assert!(project_position < current_position);
+        assert!(message.ends_with("创作完整器乐作品"));
     }
 
     #[tokio::test]

@@ -41,6 +41,7 @@ pub struct Project {
     pub source_material: String,
     pub requirements: Vec<String>,
     pub interpretation: String,
+    creative_strategy: String,
     mode: String,
     target_duration_secs: Option<f64>,
     included_instruments: Vec<String>,
@@ -77,6 +78,7 @@ impl Project {
             source_material: source_material.to_string(),
             requirements: Vec::new(),
             interpretation: String::new(),
+            creative_strategy: String::new(),
             mode: "full".to_string(),
             target_duration_secs: None,
             included_instruments: Vec::new(),
@@ -123,6 +125,21 @@ impl Project {
     #[must_use]
     pub fn excluded_instruments(&self) -> &[String] {
         &self.excluded_instruments
+    }
+
+    #[must_use]
+    pub fn creative_strategy(&self) -> &str {
+        &self.creative_strategy
+    }
+
+    pub fn set_creative_strategy(&mut self, strategy: &str) -> Result<()> {
+        let strategy = strategy.trim().to_string();
+        let previous = std::mem::replace(&mut self.creative_strategy, strategy);
+        if let Err(error) = self.write_metadata() {
+            self.creative_strategy = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn configure(
@@ -190,6 +207,9 @@ impl Project {
         }
         if checks.iter().any(|check| check.status == CheckStatus::Fail) {
             bail!("检查未全部通过，不能创建有效版本");
+        }
+        if self.current_version > 0 && self.version_code(self.current_version)? == alda_code {
+            bail!("新乐谱与当前版本相同，未创建新版本");
         }
 
         let next = self.versions.keys().next_back().copied().unwrap_or(0) + 1;
@@ -454,6 +474,56 @@ mod tests {
         assert_eq!(project.current_version, 1);
         assert_eq!(project.current_code().unwrap(), "piano: c");
         assert!(!directory.path().join("versions/0002.alda").exists());
+    }
+
+    #[test]
+    fn identical_code_does_not_create_a_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project =
+            Project::load_or_create(directory.path().to_path_buf(), "test", "material").unwrap();
+        project
+            .save_version("piano: c", "first", &passing_checks())
+            .unwrap();
+
+        let error = project
+            .save_version("piano: c", "duplicate", &passing_checks())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("与当前版本相同"));
+        assert_eq!(project.current_version(), 1);
+        assert_eq!(project.versions().len(), 1);
+        assert!(!directory.path().join("versions/0002.alda").exists());
+    }
+
+    #[test]
+    fn edited_working_file_can_be_adopted_as_a_new_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut project =
+            Project::load_or_create(directory.path().to_path_buf(), "test", "material").unwrap();
+        project
+            .save_version("piano: c", "first", &passing_checks())
+            .unwrap();
+        fs::write(directory.path().join(CURRENT_FILE), "piano: d").unwrap();
+
+        assert_eq!(
+            project
+                .save_version("piano: d", "manual edit", &passing_checks())
+                .unwrap(),
+            2
+        );
+        assert_eq!(project.version_code(2).unwrap(), "piano: d");
+    }
+
+    #[test]
+    fn creative_strategy_is_trimmed_and_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "material").unwrap();
+        project
+            .set_creative_strategy("  明亮欢快，避免机械重复  ")
+            .unwrap();
+        let reloaded = Project::load_or_create(root, "ignored", "ignored").unwrap();
+        assert_eq!(reloaded.creative_strategy(), "明亮欢快，避免机械重复");
     }
 
     #[test]

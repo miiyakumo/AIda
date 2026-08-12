@@ -106,6 +106,7 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
         .create(CreationRequest {
             source_material: source.to_string(),
             instructions: "创作约三分钟的完整纯器乐曲".to_string(),
+            creative_strategy: String::new(),
             mode: CreationMode::FullPiece,
             target_duration_secs: Some(180.0),
             included_instruments: Vec::new(),
@@ -135,6 +136,7 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
             source_material: project.source_material.clone(),
             current_alda: project.version_code(1).unwrap(),
             feedback: feedback.to_string(),
+            creative_strategy: String::new(),
             mode: CreationMode::FullPiece,
             target_duration_secs: Some(180.0),
             included_instruments: Vec::new(),

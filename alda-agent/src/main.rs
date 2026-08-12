@@ -413,6 +413,7 @@ async fn create(
     let request = CreationRequest {
         source_material,
         instructions: String::new(),
+        creative_strategy: String::new(),
         mode: creation_mode,
         target_duration_secs: duration,
         included_instruments: include,
