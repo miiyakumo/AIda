@@ -1,0 +1,197 @@
+(tempo! 71)
+
+# 核心动机
+spin1 = [c+8 d+8 c+8 e8 c+8 f8 c+8 e8]
+spin2 = [c8 d8 c8 e8 c8 f8 c8 e8]
+pad1 = [c5 e-5 g5 b5]
+pad2 = [a5 c6 e-6 g6]
+pad3 = [e-5 g5 b-5 d6]
+callUp = [g5 a-5 b-5 c6]
+callDn = [b-5 a-5 g5 f5]
+armr = [c4 d4 e-4 g4 c4 d4 e-4 g4]
+motor = [c8 r8 c8 r8 c8 r8 c8 r8]
+mtr2 = [c8 c8 r8 c8 c8 r8 c8 c8]
+coldM = [c5 c+5 d5 e-5 d5 c+5 c5 d5]
+cbass = [a-1 g1 f1 e-1]
+ascend = [c7 r8 e7 r8 g7 r8 b7 r8]
+
+# ========== I 飞旋，飞旋！(机械自转 · 64拍) ==========
+midi-glockenspiel:
+o6 (volume 68)
+spin1 * 3 spin2 * 2 spin1 spin2 * 2
+
+midi-tubular-bells:
+o4 (volume 52) motor * 8 mtr2 * 4
+
+midi-contrabass:
+o2 (volume 46) c1 * 12
+
+midi-electric-bass-finger:
+o2 (volume 60) r1 * 4 c2 g2 a-2 c2 g2 c2
+
+midi-french-horn:
+o4 (volume 58) r1 * 6 c4 e-4 g4 b-4 c5 b-4 g4 e-4
+
+midi-cello:
+o3 (volume 42) r1 * 12
+
+midi-violin:
+o5 (volume 52) r1 * 12
+
+midi-vibraphone:
+o5 (volume 58) r1 * 12
+
+midi-trumpet:
+o5 (volume 62) r1 * 12
+
+# ========== II 银白冰冷之海 (数据矩阵 · 32拍) ==========
+midi-glockenspiel:
+o6 (volume 52) r1 * 4 spin2
+
+midi-tubular-bells:
+o4 (volume 42) motor * 4 mtr2 * 2
+
+midi-contrabass:
+o2 (volume 42) c1 a-1 c1 g1 c1 a-1 c1 g1
+
+midi-electric-bass-finger:
+o2 (volume 46) r1 * 8
+
+midi-cello:
+o3 (volume 46) r1 * 4 c5 e-5 g5 b5 c6 b5 g5 e-5
+
+midi-vibraphone:
+o5 (volume 60) pad1 pad2 pad3 pad1 pad2 pad1 r2 r2
+
+midi-french-horn:
+o4 (volume 44) r1 * 4 c4 r8 e-4 r8 g4 r8 c5 r8
+
+midi-violin:
+o5 (volume 54)
+c5 d-5 e-5 f5 g5 e-5 c5 d-5 c5 d-5 e-5 f5 g5 a-5 g5 e-5
+b-4 c5 d-5 f5 e-5 c5 d-5 b-4 c5 d-5 e-5 f5 g5 e-5 c5 d-5
+
+midi-trumpet:
+o5 (volume 40) r1 * 8
+
+# ========== III 磁通呼唤悬臂 (律动苏醒 · 40拍) ==========
+midi-glockenspiel:
+o6 (volume 50) r1 * 2 coldM * 2 coldM * 2
+
+midi-tubular-bells:
+o4 (volume 58) motor * 6 mtr2 * 4
+
+midi-contrabass:
+o2 (volume 46) a-1 g1 f1 e-1 g1 f1 e-1 c1
+
+midi-electric-bass-finger:
+o2 (volume 42) r1 * 10
+
+midi-cello:
+o3 (volume 48) r1 r1 c2 e-2 g2 b-2 armr armr c2 e-2 g2 b-2
+
+midi-vibraphone:
+o5 (volume 48) r1 * 2 pad1 pad2 pad3 pad2 pad1 r2 r2
+
+midi-french-horn:
+o4 (volume 46) r1 * 4 c4 e-4 g4 b-4 c5 b-4 g4 e-4 c4 e-4 g4 b-4
+
+midi-violin:
+o5 (volume 56)
+r1 r1 c+6 d6 e-5 f5 g5 e-5 f5 e5 d5 c+5 g5 f5 e5 d5 c+5
+e-6 f6 g5 a-5 b-5 g5 c6 d6 c6 b-5 a-5 g5 a-5
+
+midi-trumpet:
+o5 (volume 60) r1 * 2 callUp callDn callDn callUp callUp callDn callUp
+
+# ========== IV 加速！加速！(材料积累冲刺 · 32拍) ==========
+(tempo! 109)
+
+midi-glockenspiel:
+o6 (volume 62) spin2 * 6 coldM * 2
+
+midi-tubular-bells:
+o4 (volume 68) [c8 r8 c8 r8] * 24
+
+midi-contrabass:
+o2 (volume 54) c2 * 16
+
+midi-electric-bass-finger:
+o2 (volume 64) c1 g1 a-1 c1 g1 c1 a-1 g1
+
+midi-cello:
+o3 (volume 56) c2 e-2 g2 b-2 c3 b-2 g2 e-2
+
+midi-vibraphone:
+o5 (volume 58) r1 * 4 pad1 pad2 pad3 pad2
+
+midi-french-horn:
+o4 (volume 60) r1 * 2 c4 e-4 g4 b-4 c5 b-4 g4 e-4 c4 e-4 g4 c5
+
+midi-violin:
+o5 (volume 64)
+c5 d-5 e-5 f5 g5 a-5 b-5 d6 e6 f6 g6 f6 e6 d6 c6
+e-6 f6 g6 a-6 b-6 c7 d7 c7 d7 c7 b-6 a-6 g6
+
+midi-trumpet:
+o5 (volume 72) callUp callUp callDn callUp callUp callDn callDn callUp
+
+# ========== V 升入明亮天国 (对比性高潮 · 32拍) ==========
+(tempo! 100)
+
+midi-glockenspiel:
+o7 (volume 80) r1 r1 ascend ascend
+
+midi-tubular-bells:
+o5 (volume 66) [c5 r8 e5 r8 g5 r8 b5 r8] * 6
+
+midi-contrabass:
+o2 (volume 56) c2 c2 a-2 c2 g2 g2 c2 c2 c2 a-2 g2 c2
+
+midi-electric-bass-finger:
+o2 (volume 70) c1 c1 a-1 c1 g1 c1 a-1 c1
+
+midi-cello:
+o3 (volume 62) c1 c1 a-1 c1 g1 g1 c1 c1 c1 a-1 g1 c1
+
+midi-vibraphone:
+o5 (volume 68) c5 e-5 g5 b5 c6 b5 g5 e-5 c6 e-6 g6 c7 b-6 g6 e-6 c6
+
+midi-violin:
+o6 (volume 78) r1 r1 c6 d6 e-6 f6 g6 a-6 b-6 c7 d7 c7 b-6 a-6
+
+midi-french-horn:
+o4 (volume 78) c4 e-4 g4 c5 e-5 c5 g4 e-4 c4 e-4 g4 c5 e-5 g5 e-5 c5
+
+midi-trumpet:
+o5 (volume 82) r1 r1 callUp callDn callDn callUp callUp callDn
+
+# ========== VI 余烬 (回归 · 24拍) ==========
+(tempo! 71)
+
+midi-glockenspiel:
+o6 (volume 52) r1 spin2 r2 r2
+
+midi-tubular-bells:
+o4 (volume 52) motor mtr2 motor mtr2 mtr2 motor
+
+midi-contrabass:
+o2 (volume 48) c1 a-1 c1 g1 c1 a-1
+
+midi-electric-bass-finger:
+o2 (volume 46) r1 * 6
+
+midi-cello:
+o3 (volume 50) c5 e-5 g5 b5 c6 b5 g5 e-5 c5 e-5 g5 b5 c6 g5 e-5 c5
+
+midi-vibraphone:
+o5 (volume 60) c5 e-5 g5 b5 c6 b5 g5 e-5 c5 e-5 g5 b5 c6 b5 g5 e-5 c5
+
+midi-violin:
+o5 (volume 56) c5 e-5 g5 c6 e-6 c6 g5 e-5 c5 e-5 g5 c6 g5 e-5 c5 e-5 g5
+
+midi-french-horn:
+o4 (volume 66) c2 e-2 g2 b-2 c2 e-2 g2 b-2 c2 e-2 g2 b-2
+
+midi-trumpet:
+o5 (volume 44) r1 * 6
