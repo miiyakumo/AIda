@@ -25,7 +25,7 @@ fn submit_alda_tool() -> Tool {
                 "properties": {
                     "alda_code": {
                         "type": "string",
-                        "description": "完整且紧凑的 Alda 乐谱代码；必须使用变量和重复，禁止展开重复段落",
+                        "description": "完整且紧凑的 Alda 乐谱代码；复用材料时使用变量，反复必须具有音乐作用，禁止逐字展开重复段落",
                         "maxLength": crate::deepseek::MAX_TOOL_ARGUMENT_BYTES
                     }
                 },
