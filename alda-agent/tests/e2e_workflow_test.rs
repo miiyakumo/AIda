@@ -132,9 +132,10 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
     let feedback = "让中段更冰冷、更机械，结尾的加速和明亮感更强";
     let modification = agent
         .modify(ModifyRequest {
+            source_material: project.source_material.clone(),
             current_alda: project.version_code(1).unwrap(),
             feedback: feedback.to_string(),
-            conversation: project.conversation.clone(),
+            mode: CreationMode::FullPiece,
             target_duration_secs: Some(180.0),
             included_instruments: Vec::new(),
             excluded_instruments: Vec::new(),

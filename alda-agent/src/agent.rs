@@ -56,6 +56,7 @@ pub struct CreationRequest {
     pub max_rounds: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum CreationMode {
     FullPiece,
     Improvisation,
@@ -90,14 +91,15 @@ pub struct CreationResult {
     pub interpretation: String,
     /// 是否被截断
     pub was_truncated: bool,
-    /// 可用于后续修改的完整消息上下文
+    /// 仅用于当前自动修正或澄清往返；新的修改请求会重建干净上下文
     pub conversation: Vec<Message>,
 }
 
 pub struct ModifyRequest {
+    pub source_material: String,
     pub current_alda: String,
     pub feedback: String,
-    pub conversation: Vec<Message>,
+    pub mode: CreationMode,
     pub target_duration_secs: Option<f64>,
     pub included_instruments: Vec<String>,
     pub excluded_instruments: Vec<String>,
@@ -173,24 +175,20 @@ impl Agent {
             bail!("修改要求不能为空");
         }
 
-        let mut messages = request.conversation;
-        if messages.is_empty() {
-            messages.push(Message {
+        let messages = vec![
+            Message {
                 role: "system".to_string(),
                 content: Some(SYSTEM_PROMPT.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
-            });
-        }
-        messages.push(Message {
-            role: "user".to_string(),
-            content: Some(format!(
-                "请根据反馈修改当前作品。只改变反馈涉及的范围，并尽量保持其余内容不变。\n\n【反馈】\n{}\n\n【当前 Alda】\n{}",
-                request.feedback, request.current_alda
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-        });
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(build_modify_message(&request)),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
 
         self.run_generation(
             messages,
@@ -454,6 +452,51 @@ fn build_user_message(request: &CreationRequest) -> String {
     msg
 }
 
+fn build_modify_message(request: &ModifyRequest) -> String {
+    let mut msg = String::from(
+        "这是一次独立的作品修改请求。不要假定或延续此前对话中的修改方案，只以本消息提供的素材、当前乐谱、最新反馈和约束为准。\n\n",
+    );
+    msg.push_str(
+        "先判断反馈范围：\n\
+- 明确指向段落、乐器或参数时，只修改相关范围并尽量保持其余内容不变；\n\
+- 指向整体听感、艺术性、编排、结构或另一种诠释时，允许重写曲式、主题发展、织体与配器，不要被当前骨架限制；\n\
+- 如果范围确实不清楚且不同选择会显著改变作品，只提出一个简短澄清问题，不要调用 submit_alda。\n\n",
+    );
+
+    if !request.source_material.trim().is_empty() {
+        msg.push_str("【原始素材】\n");
+        msg.push_str(request.source_material.trim());
+        msg.push_str("\n\n");
+    }
+    msg.push_str("【最新反馈】\n");
+    msg.push_str(request.feedback.trim());
+    msg.push_str("\n\n【模式】");
+    msg.push_str(request.mode.description());
+    msg.push('\n');
+
+    if let Some(duration) = request.target_duration_secs {
+        let _ = writeln!(msg, "【目标时长】约 {} 分钟", duration / 60.0);
+    }
+    if !request.included_instruments.is_empty() {
+        let _ = writeln!(
+            msg,
+            "【必须包含的乐器】{}",
+            request.included_instruments.join("、")
+        );
+    }
+    if !request.excluded_instruments.is_empty() {
+        let _ = writeln!(
+            msg,
+            "【必须排除的乐器】{}",
+            request.excluded_instruments.join("、")
+        );
+    }
+
+    msg.push_str("\n【当前 Alda】\n");
+    msg.push_str(&request.current_alda);
+    msg
+}
+
 fn parse_alda_code_from_args(args: &str) -> Result<String> {
     let parsed: serde_json::Value =
         serde_json::from_str(args).context("无法解析 submit_alda 参数")?;
@@ -598,6 +641,67 @@ mod tests {
             excluded_instruments: Vec::new(),
             max_rounds,
         }
+    }
+
+    fn modify_request() -> ModifyRequest {
+        ModifyRequest {
+            source_material: "原始诗歌".to_string(),
+            current_alda: "midi-piano: c1".to_string(),
+            feedback: "编排单调，艺术性不高".to_string(),
+            mode: CreationMode::FullPiece,
+            target_duration_secs: Some(180.0),
+            included_instruments: vec!["midi-cello".to_string()],
+            excluded_instruments: vec!["midi-timpani".to_string()],
+            max_rounds: 1,
+        }
+    }
+
+    #[test]
+    fn modification_prompt_routes_scope_from_clean_project_context() {
+        let message = build_modify_message(&modify_request());
+        assert!(message.contains("不要假定或延续此前对话"));
+        assert!(message.contains("【原始素材】\n原始诗歌"));
+        assert!(message.contains("【最新反馈】\n编排单调，艺术性不高"));
+        assert!(message.contains("允许重写曲式、主题发展、织体与配器"));
+        assert!(message.contains("只提出一个简短澄清问题"));
+        assert!(message.contains("【目标时长】约 3 分钟"));
+        assert!(message.contains("【必须包含的乐器】midi-cello"));
+        assert!(message.contains("【必须排除的乐器】midi-timpani"));
+        assert!(message.ends_with("【当前 Alda】\nmidi-piano: c1"));
+    }
+
+    #[tokio::test]
+    async fn modification_starts_with_only_system_and_clean_request() {
+        let (base_url, requests) = serve(vec![MockResponse::sse(text_response(
+            "你希望整体重构还是只调整配器？",
+        ))]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .modify(modify_request())
+            .await
+            .unwrap();
+        assert!(result.needs_input);
+
+        let request = requests.recv().unwrap();
+        let request = String::from_utf8_lossy(&request);
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("原始诗歌")
+        );
     }
 
     #[test]

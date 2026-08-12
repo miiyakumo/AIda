@@ -19,7 +19,8 @@
 
 - 保持单个 Rust crate，不拆分子 crate
 - 不引入数据库、事件溯源、HTTP 服务
-- 全量累积对话历史，不做摘要（等到 token 成为真实问题再解决）
+- 项目保留素材、要求和版本历史；新的修改请求从这些稳定事实重建干净上下文
+- 只有当前自动修正或澄清往返保留短期消息上下文，完成后清空
 - 实现显式 `/reload`；人工编辑只有重新读取并通过校验后才成为新版本
 
 ## 3. 架构新增
@@ -125,7 +126,11 @@ alda-agent smoke                        → 保留
 - 输入不以 `/` 开头 → 自然语言：
   - 尚无当前乐谱 → 视为创作请求（调用 `Agent::create`）
   - 已有当前乐谱 → 视为修改/反馈（调用 `Agent::modify`）
-- 对话历史全量累积（不做摘要），每次请求携带完整上下文
+- 新的修改请求只携带原始素材、当前乐谱、最新反馈和仍有效的显式约束，不回灌旧生成过程、
+  失败草稿或工具回执
+- 模型在干净请求内区分明确局部修改与整体审美反馈：前者尽量保持其余内容，后者允许重构；
+  范围确实不清且会显著改变作品时只提出一个澄清问题
+- 自动修正和澄清回答沿用当前短期消息上下文；生成成功后清空
 - 每轮 Agent 返回后，成功则创建新版本，失败则保留现状
 
 ### 5.4 状态机
@@ -156,10 +161,11 @@ alda-agent smoke                        → 保留
 
 ```rust
 pub struct ModifyRequest {
-    pub current_code: String,      // current.alda 的内容
-    pub current_interpretation: String,  // 之前的解读
-    pub instruction: String,       // 用户自然语言修改指令
-    pub history: Vec<String>,      // 最近几轮的修改摘要
+    pub source_material: String,   // 原始素材
+    pub current_alda: String,      // 当前有效版本的内容
+    pub feedback: String,          // 最新自然语言反馈
+    pub mode: CreationMode,
+    pub target_duration_secs: Option<f64>,
     pub included_instruments: Vec<String>,
     pub excluded_instruments: Vec<String>,
     pub max_rounds: usize,
@@ -168,7 +174,7 @@ pub struct ModifyRequest {
 
 `modify()` 方法内部流程与 `create()` 类似：
 
-1. 组装消息：`system` → `user`（当前乐谱 + 修改指令 + 上下文）
+1. 组装干净消息：`system` → `user`（原始素材 + 当前乐谱 + 最新反馈 + 有效约束）
 2. 调用 `chat_stream`，收集文本和工具调用
 3. 校验、反馈、最多 3 轮自动修正
 4. 返回 `CreationResult`（复用，含 alda_code + checks + interpretation）

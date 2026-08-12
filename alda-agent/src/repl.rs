@@ -218,24 +218,7 @@ async fn execute_command<W: Write>(
         ReplCommand::NaturalLanguage(feedback) => {
             let services = load_services(services)?;
             project.record_requirement(feedback.clone())?;
-            let result = if project.current_version() == 0 && project.conversation.is_empty() {
-                services
-                    .agent
-                    .create(CreationRequest {
-                        source_material: project.source_material.clone(),
-                        instructions: feedback.clone(),
-                        mode: if project.mode() == "improv" {
-                            CreationMode::Improvisation
-                        } else {
-                            CreationMode::FullPiece
-                        },
-                        target_duration_secs: project.target_duration_secs(),
-                        included_instruments: project.included_instruments().to_vec(),
-                        excluded_instruments: project.excluded_instruments().to_vec(),
-                        max_rounds: 3,
-                    })
-                    .await?
-            } else if project.current_version() == 0 {
+            let result = if conversation_awaits_input(&project.conversation) {
                 let mut conversation = project.conversation.clone();
                 conversation.push(Message {
                     role: "user".to_string(),
@@ -253,13 +236,35 @@ async fn execute_command<W: Write>(
                         max_rounds: 3,
                     })
                     .await?
+            } else if project.current_version() == 0 {
+                services
+                    .agent
+                    .create(CreationRequest {
+                        source_material: project.source_material.clone(),
+                        instructions: feedback.clone(),
+                        mode: if project.mode() == "improv" {
+                            CreationMode::Improvisation
+                        } else {
+                            CreationMode::FullPiece
+                        },
+                        target_duration_secs: project.target_duration_secs(),
+                        included_instruments: project.included_instruments().to_vec(),
+                        excluded_instruments: project.excluded_instruments().to_vec(),
+                        max_rounds: 3,
+                    })
+                    .await?
             } else {
                 services
                     .agent
                     .modify(ModifyRequest {
+                        source_material: project.source_material.clone(),
                         current_alda: project.version_code(project.current_version())?,
                         feedback: feedback.clone(),
-                        conversation: project.conversation.clone(),
+                        mode: if project.mode() == "improv" {
+                            CreationMode::Improvisation
+                        } else {
+                            CreationMode::FullPiece
+                        },
                         target_duration_secs: project.target_duration_secs(),
                         included_instruments: project.included_instruments().to_vec(),
                         excluded_instruments: project.excluded_instruments().to_vec(),
@@ -298,7 +303,7 @@ fn apply_result<W: Write>(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("成功结果缺少 Alda 代码"))?;
         let version = project.save_version(code, summary, &result.checks)?;
-        project.update_context(interpretation, result.conversation)?;
+        project.update_context(interpretation, Vec::new())?;
         writeln!(writer, "已保存有效版本 {version}（{} 轮）。", result.rounds)?;
     } else {
         project.update_context(interpretation, result.conversation)?;
@@ -309,6 +314,17 @@ fn apply_result<W: Write>(
         )?;
     }
     Ok(())
+}
+
+fn conversation_awaits_input(conversation: &[Message]) -> bool {
+    conversation.last().is_some_and(|message| {
+        message.role == "assistant"
+            && message.tool_calls.is_none()
+            && message
+                .content
+                .as_deref()
+                .is_some_and(|content| !content.trim().is_empty())
+    })
 }
 
 fn open_project<R: BufRead, W: Write>(
@@ -438,6 +454,25 @@ mod tests {
         );
         assert!(parse_command("/restore ../2").is_err());
         assert!(parse_command("/unknown").is_err());
+    }
+
+    #[test]
+    fn only_plain_assistant_reply_is_treated_as_pending_clarification() {
+        let question = Message {
+            role: "assistant".to_string(),
+            content: Some("你希望整体重构还是只改中段？".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        assert!(conversation_awaits_input(&[question]));
+
+        let tool_result = Message {
+            role: "tool".to_string(),
+            content: Some("所有检查通过".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+        };
+        assert!(!conversation_awaits_input(&[tool_result]));
     }
 
     #[tokio::test]
