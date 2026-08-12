@@ -4,7 +4,7 @@
 >
 > 需求基线：`docs/requirements/product-requirements.md` §5–§9
 >
-> 状态：已确认
+> 状态：已实现并按进度审计修订
 
 ## 1. 目标
 
@@ -20,7 +20,7 @@
 - 保持单个 Rust crate，不拆分子 crate
 - 不引入数据库、事件溯源、HTTP 服务
 - 全量累积对话历史，不做摘要（等到 token 成为真实问题再解决）
-- 不实现手工源码编辑路径（`/reload`，延后）
+- 实现显式 `/reload`；人工编辑只有重新读取并通过校验后才成为新版本
 
 ## 3. 架构新增
 
@@ -89,7 +89,7 @@ project-dir/
 ### 4.4 版本管理规则
 
 1. **首次通过检查** → `save_version(alda_code, summary)`：写入 `versions/0001.alda`，更新 `project.json`
-2. **成功修改** → 同上，版本号递增
+2. **成功修改** → 同上，版本号取历史最大值加一
 3. **失败修改** → 不创建版本，不修改 `project.json`，不覆盖 `current.alda`
 4. **恢复** → `restore_version(n)`：把 `versions/{n:04}.alda` 复制到 `current.alda`，更新 `current_version`
 5. 版本号从 1 开始单调递增
@@ -194,7 +194,6 @@ pub struct ModifyRequest {
 
 ## 8. 非目标
 
-- 不实现 `/reload`（手工编辑后重新校验，延后）
 - 不实现分支、Take、合并
 - 不实现对话摘要/压缩
 - 不实现多项目同时打开

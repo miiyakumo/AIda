@@ -1,10 +1,121 @@
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::error::Error as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 static PRIVACY_SHOWN: AtomicBool = AtomicBool::new(false);
+const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingMode {
+    Enabled,
+    Disabled,
+}
+
+impl ThinkingMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningEffort {
+    Low,
+    High,
+    Max,
+}
+
+impl ReasoningEffort {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkingOptions {
+    mode: ThinkingMode,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl ThinkingOptions {
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            mode: ThinkingMode::Disabled,
+            reasoning_effort: None,
+        }
+    }
+
+    pub fn from_config(mode: Option<&str>, reasoning_effort: Option<&str>) -> Result<Self> {
+        let mode = match mode.unwrap_or("disabled") {
+            "enabled" => ThinkingMode::Enabled,
+            "disabled" => ThinkingMode::Disabled,
+            value => bail!("ALDA_AGENT_THINKING 必须是 enabled 或 disabled，当前为 {value:?}"),
+        };
+        let reasoning_effort = reasoning_effort
+            .map(|value| match value {
+                "low" => Ok(ReasoningEffort::Low),
+                "high" => Ok(ReasoningEffort::High),
+                "max" => Ok(ReasoningEffort::Max),
+                _ => bail!("ALDA_AGENT_REASONING_EFFORT 必须是 low、high 或 max，当前为 {value:?}"),
+            })
+            .transpose()?;
+        if mode == ThinkingMode::Disabled && reasoning_effort.is_some() {
+            bail!("thinking=disabled 时不能设置 ALDA_AGENT_REASONING_EFFORT");
+        }
+        Ok(Self {
+            mode,
+            reasoning_effort,
+        })
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> &'static str {
+        self.mode.as_str()
+    }
+
+    #[must_use]
+    pub const fn reasoning_effort(&self) -> Option<&'static str> {
+        match self.reasoning_effort {
+            Some(effort) => Some(effort.as_str()),
+            None => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ThinkingOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reasoning_effort() {
+            Some(effort) => write!(f, "{}（effort={effort}）", self.mode()),
+            None => f.write_str(self.mode()),
+        }
+    }
+}
+
+fn reqwest_error_detail(error: &reqwest::Error) -> String {
+    let mut detail = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !detail.contains(&message) {
+            detail.push_str(": ");
+            detail.push_str(&message);
+        }
+        source = cause.source();
+    }
+    detail
+}
 
 fn show_privacy_notice() {
     if !PRIVACY_SHOWN.swap(true, Ordering::SeqCst) {
@@ -18,6 +129,13 @@ pub struct DeepSeekClient {
     api_key: String,
     base_url: String,
     model: String,
+    thinking: ThinkingOptions,
+}
+
+#[derive(Debug, Serialize)]
+struct ThinkingRequest<'a> {
+    #[serde(rename = "type")]
+    ty: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -25,6 +143,9 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<Message>,
     stream: bool,
+    thinking: ThinkingRequest<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Tool>>,
 }
@@ -100,7 +221,7 @@ struct FunctionArg {
     arguments: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     Text(String),
     ToolCall {
@@ -119,25 +240,119 @@ pub enum ChatError {
     RateLimit(String),
     Network(String),
     ModelReject(String),
-    Truncated(String),
 }
 
 impl std::fmt::Display for ChatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChatError::Auth(msg) => write!(f, "认证失败：{}", msg),
-            ChatError::RateLimit(msg) => write!(f, "请求限流：{}", msg),
-            ChatError::Network(msg) => write!(f, "网络错误：{}", msg),
-            ChatError::ModelReject(msg) => write!(f, "模型拒绝：{}", msg),
-            ChatError::Truncated(msg) => write!(f, "输出截断：{}", msg),
+            ChatError::Auth(msg) => write!(f, "认证失败：{msg}"),
+            ChatError::RateLimit(msg) => write!(f, "请求限流：{msg}"),
+            ChatError::Network(msg) => write!(f, "网络错误：{msg}"),
+            ChatError::ModelReject(msg) => write!(f, "模型拒绝：{msg}"),
         }
     }
 }
 
 impl std::error::Error for ChatError {}
 
+#[derive(Default)]
+struct SseParser {
+    events: Vec<StreamEvent>,
+    pending_tool_id: Option<String>,
+    pending_tool_name: String,
+    pending_tool_args: String,
+    finish_reason: Option<String>,
+}
+
+impl SseParser {
+    fn push_line(&mut self, line: &str) -> Result<Vec<String>> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') || line == "data: [DONE]" {
+            return Ok(Vec::new());
+        }
+
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(Vec::new());
+        };
+        let chunk: ChatChunk =
+            serde_json::from_str(data.trim()).context("无法解析模型服务返回的 SSE 数据")?;
+        let mut text_chunks = Vec::new();
+
+        for choice in chunk.choices {
+            if let Some(delta) = choice.delta {
+                if let Some(content) = delta.content
+                    && !content.is_empty()
+                {
+                    text_chunks.push(content.clone());
+                    self.events.push(StreamEvent::Text(content));
+                }
+                if let Some(tool_calls) = delta.tool_calls {
+                    for tool_call in tool_calls {
+                        if let Some(id) = tool_call.id {
+                            self.pending_tool_id = Some(id);
+                        }
+                        if let Some(function) = tool_call.function {
+                            if let Some(name) = function.name {
+                                self.pending_tool_name = name;
+                            }
+                            if let Some(arguments) = function.arguments {
+                                if self.pending_tool_args.len().saturating_add(arguments.len())
+                                    > MAX_TOOL_ARGUMENT_BYTES
+                                {
+                                    bail!(
+                                        "模型返回的工具参数超过 {} KiB 上限",
+                                        MAX_TOOL_ARGUMENT_BYTES / 1024
+                                    );
+                                }
+                                self.pending_tool_args.push_str(&arguments);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(reason) = choice.finish_reason {
+                self.finish_reason = Some(reason);
+            }
+        }
+
+        Ok(text_chunks)
+    }
+
+    fn finish(mut self) -> Vec<StreamEvent> {
+        if !self.pending_tool_name.is_empty() {
+            self.events.push(StreamEvent::ToolCall {
+                id: self.pending_tool_id,
+                name: self.pending_tool_name,
+                arguments: self.pending_tool_args,
+            });
+        }
+        self.events.push(StreamEvent::Done {
+            finish_reason: self.finish_reason.unwrap_or_else(|| "stop".to_string()),
+        });
+        self.events
+    }
+}
+
+#[cfg(test)]
+fn parse_sse(input: &str) -> Result<Vec<StreamEvent>> {
+    let mut parser = SseParser::default();
+    for line in input.lines() {
+        parser.push_line(line)?;
+    }
+    Ok(parser.finish())
+}
+
 impl DeepSeekClient {
     pub fn new(api_key: String, base_url: String, model: String) -> Result<Self> {
+        Self::new_with_thinking(api_key, base_url, model, ThinkingOptions::disabled())
+    }
+
+    pub fn new_with_thinking(
+        api_key: String,
+        base_url: String,
+        model: String,
+        thinking: ThinkingOptions,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -148,6 +363,7 @@ impl DeepSeekClient {
             api_key,
             base_url,
             model,
+            thinking,
         })
     }
 
@@ -158,15 +374,16 @@ impl DeepSeekClient {
     ) -> Result<Vec<StreamEvent>> {
         show_privacy_notice();
 
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = chat_completions_url(&self.base_url);
 
         let request = ChatRequest {
             model: &self.model,
             messages,
             stream: true,
+            thinking: ThinkingRequest {
+                ty: self.thinking.mode(),
+            },
+            reasoning_effort: self.thinking.reasoning_effort(),
             tools,
         };
 
@@ -178,7 +395,7 @@ impl DeepSeekClient {
             .json(&request)
             .send()
             .await
-            .context("发送请求失败")?;
+            .map_err(|error| anyhow::anyhow!(ChatError::Network(reqwest_error_detail(&error))))?;
 
         // 错误分类
         let status = response.status();
@@ -194,219 +411,144 @@ impl DeepSeekClient {
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!(ChatError::Network(format!("HTTP {}: {}", status, body)));
+            bail!(ChatError::Network(format!("HTTP {status}: {body}")));
         }
 
         // 读取 SSE 流
-        use futures_util::StreamExt;
-
         let mut stream = response.bytes_stream();
-        let mut events = Vec::new();
-        let mut pending_tool_id: Option<String> = None;
-        let mut pending_tool_name = String::new();
-        let mut pending_tool_args = String::new();
+        let mut parser = SseParser::default();
         let mut buffer = String::new();
+        let mut received_bytes = 0_usize;
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.context("读取流数据失败")?;
+            let chunk = chunk_result.map_err(|error| {
+                anyhow::anyhow!(ChatError::Network(format!(
+                    "{}（已接收 {received_bytes} 字节）",
+                    reqwest_error_detail(&error)
+                )))
+            })?;
+            received_bytes = received_bytes.saturating_add(chunk.len());
+            if received_bytes > MAX_STREAM_BYTES {
+                bail!(ChatError::Network(format!(
+                    "流式响应超过 {} MiB 上限",
+                    MAX_STREAM_BYTES / 1024 / 1024
+                )));
+            }
             let text = String::from_utf8_lossy(&chunk);
             buffer.push_str(&text);
 
             while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].trim().to_string();
+                let line = buffer[..line_end].to_string();
                 buffer = buffer[line_end + 1..].to_string();
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                if line == "data: [DONE]" {
-                    events.push(StreamEvent::Done {
-                        finish_reason: "stop".into(),
-                    });
-                    continue;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    match serde_json::from_str::<ChatChunk>(data) {
-                        Ok(chunk) => {
-                            for choice in &chunk.choices {
-                                if let Some(ref delta) = choice.delta {
-                                    if let Some(ref content) = delta.content
-                                        && !content.is_empty()
-                                    {
-                                        // 实时打印
-                                        use std::io::{self, Write};
-                                        print!("{}", content);
-                                        io::stdout().flush().ok();
-                                        events.push(StreamEvent::Text(content.clone()));
-                                    }
-                                    if let Some(ref tool_calls) = delta.tool_calls {
-                                        for tc in tool_calls {
-                                            if let Some(ref id) = tc.id {
-                                                pending_tool_id = Some(id.clone());
-                                            }
-                                            if let Some(ref func) = tc.function {
-                                                if let Some(ref name) = func.name {
-                                                    pending_tool_name = name.clone();
-                                                }
-                                                if let Some(ref args) = func.arguments {
-                                                    pending_tool_args.push_str(args);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some(ref reason) = choice.finish_reason
-                                    && reason == "length"
-                                {
-                                    events.push(StreamEvent::Done {
-                                        finish_reason: "length".into(),
-                                    });
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // 忽略解析失败的单行（可能是注释或其他非标准事件）
-                            let _ = e;
-                        }
-                    }
+                for text in parser.push_line(&line)? {
+                    use std::io::{self, Write};
+                    print!("{text}");
+                    io::stdout().flush().ok();
                 }
             }
         }
 
-        // 如果有收集到的工具调用，作为事件追加
-        if !pending_tool_name.is_empty() {
-            events.push(StreamEvent::ToolCall {
-                id: pending_tool_id,
-                name: pending_tool_name,
-                arguments: pending_tool_args,
-            });
+        if !buffer.trim().is_empty() {
+            for text in parser.push_line(&buffer)? {
+                use std::io::{self, Write};
+                print!("{text}");
+                io::stdout().flush().ok();
+            }
         }
 
-        Ok(events)
+        Ok(parser.finish())
+    }
+}
+
+fn chat_completions_url(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/v1") {
+        format!("{base_url}/chat/completions")
+    } else {
+        format!("{base_url}/v1/chat/completions")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{MockResponse, serve};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_parse_stream_text() {
-        let input = r#"data: {"id":"1","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}
-
-data: {"id":"1","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"！"},"finish_reason":"stop"}]}
-
-data: [DONE]
-"#;
-        let lines: Vec<&str> = input.lines().filter(|l| !l.trim().is_empty()).collect();
-        let mut contents = Vec::new();
-        let mut finish_reasons = Vec::new();
-
-        for line in &lines {
-            let line = line.trim();
-            if line == "data: [DONE]" {
-                finish_reasons.push("DONE".to_string());
-                continue;
-            }
-            if let Some(data) = line.strip_prefix("data: ")
-                && let Ok(chunk) = serde_json::from_str::<ChatChunk>(data)
-            {
-                for choice in &chunk.choices {
-                    if let Some(ref delta) = choice.delta
-                        && let Some(ref content) = delta.content
-                        && !content.is_empty()
-                    {
-                        contents.push(content.clone());
-                    }
-                    if let Some(ref reason) = choice.finish_reason
-                        && reason != "null"
-                    {
-                        finish_reasons.push(reason.clone());
-                    }
+        let events = parse_sse(include_str!("../tests/fixtures/stream_text.txt")).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Text("你好".to_string()),
+                StreamEvent::Text("！".to_string()),
+                StreamEvent::Done {
+                    finish_reason: "stop".to_string()
                 }
-            }
-        }
+            ]
+        );
+    }
 
-        assert_eq!(contents, vec!["你好".to_string(), "！".to_string()]);
-        assert!(finish_reasons.contains(&"stop".to_string()));
+    #[test]
+    fn chat_url_accepts_origin_or_versioned_base() {
+        assert_eq!(
+            chat_completions_url("https://service.example"),
+            "https://service.example/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://service.example/v1/"),
+            "https://service.example/v1/chat/completions"
+        );
     }
 
     #[test]
     fn test_parse_tool_call() {
-        let input = r#"data: {"id":"2","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"submit_alda","arguments":""}}]},"finish_reason":null}]}
-
-data: {"id":"2","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{\"alda_code\":\"c d e f\"}"}}]},"finish_reason":null}]}
-
-data: {"id":"2","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":null},"finish_reason":"tool_calls"}]}
-
-data: [DONE]
-"#;
-        let lines: Vec<&str> = input.lines().filter(|l| !l.trim().is_empty()).collect();
-        let mut tool_names = Vec::new();
-        let mut tool_args = Vec::new();
-
-        for line in &lines {
-            let line = line.trim();
-            if line == "data: [DONE]" {
-                continue;
-            }
-            if let Some(data) = line.strip_prefix("data: ")
-                && let Ok(chunk) = serde_json::from_str::<ChatChunk>(data)
-            {
-                for choice in &chunk.choices {
-                    if let Some(ref delta) = choice.delta
-                        && let Some(ref tool_calls) = delta.tool_calls
-                    {
-                        for tc in tool_calls {
-                            if let Some(ref func) = tc.function {
-                                if let Some(ref name) = func.name {
-                                    tool_names.push(name.clone());
-                                }
-                                if let Some(ref args) = func.arguments {
-                                    tool_args.push(args.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        assert_eq!(tool_names, vec!["submit_alda".to_string()]);
-        assert!(!tool_args.is_empty());
-        assert!(tool_args.iter().any(|a| a.contains("alda_code")));
+        let events = parse_sse(include_str!("../tests/fixtures/stream_tool_call.txt")).unwrap();
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ToolCall { id: Some(id), name, arguments }
+                if id == "call_1" && name == "submit_alda" && arguments.contains("alda_code")
+        ));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::Done { finish_reason } if finish_reason == "tool_calls"
+        ));
     }
 
     #[test]
     fn test_truncated_response() {
-        let input = r#"data: {"id":"3","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"text"},"finish_reason":"length"}]}
+        let events = parse_sse(include_str!("../tests/fixtures/truncated.txt")).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { finish_reason }) if finish_reason == "length"
+        ));
+    }
 
-data: [DONE]
-"#;
-        let lines: Vec<&str> = input.lines().filter(|l| !l.trim().is_empty()).collect();
-        let mut finish_reasons = Vec::new();
-
-        for line in &lines {
-            let line = line.trim();
-            if line == "data: [DONE]" {
-                continue;
-            }
-            if let Some(data) = line.strip_prefix("data: ")
-                && let Ok(chunk) = serde_json::from_str::<ChatChunk>(data)
-            {
-                for choice in &chunk.choices {
-                    if let Some(ref reason) = choice.finish_reason
-                        && reason != "null"
-                    {
-                        finish_reasons.push(reason.clone());
-                    }
-                }
-            }
-        }
-
-        assert!(finish_reasons.contains(&"length".to_string()));
+    #[test]
+    fn oversized_tool_arguments_are_rejected_while_streaming() {
+        let arguments = "x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1);
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "submit_alda",
+                            "arguments": arguments
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        let mut parser = SseParser::default();
+        let error = parser.push_line(&format!("data: {chunk}")).unwrap_err();
+        assert!(error.to_string().contains("64 KiB"));
     }
 
     #[test]
@@ -415,7 +557,6 @@ data: [DONE]
         assert!(format!("{}", ChatError::RateLimit("x".into())).contains("限流"));
         assert!(format!("{}", ChatError::Network("x".into())).contains("网络错误"));
         assert!(format!("{}", ChatError::ModelReject("x".into())).contains("拒绝"));
-        assert!(format!("{}", ChatError::Truncated("x".into())).contains("截断"));
     }
 
     #[test]
@@ -427,5 +568,147 @@ data: [DONE]
         let second = PRIVACY_SHOWN.load(Ordering::SeqCst);
         assert!(first);
         assert!(second);
+    }
+
+    #[tokio::test]
+    async fn production_http_path_sends_configured_model_and_parses_stream() {
+        let fixture = include_str!("../tests/fixtures/stream_text.txt");
+        let (base_url, request) = serve(vec![MockResponse::sse(fixture.to_string())]);
+        let client = DeepSeekClient::new(
+            "secret-test-value".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let events = client
+            .chat_stream(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("hello".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Done { finish_reason }) if finish_reason == "stop")
+        );
+
+        let request = String::from_utf8(request.recv().unwrap()).unwrap();
+        assert!(request.starts_with("POST /v1/chat/completions "));
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["model"], "example-model");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn production_http_path_sends_enabled_thinking_effort() {
+        let fixture = include_str!("../tests/fixtures/stream_text.txt");
+        let (base_url, request) = serve(vec![MockResponse::sse(fixture.to_string())]);
+        let thinking = ThinkingOptions::from_config(Some("enabled"), Some("low")).unwrap();
+        let client = DeepSeekClient::new_with_thinking(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+            thinking,
+        )
+        .unwrap();
+        client.chat_stream(Vec::new(), None).await.unwrap();
+
+        let request = String::from_utf8(request.recv().unwrap()).unwrap();
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "low");
+    }
+
+    #[tokio::test]
+    async fn http_errors_are_classified() {
+        for (status, expected) in [
+            ("401 Unauthorized", "认证失败"),
+            ("429 Too Many Requests", "限流"),
+            ("400 Bad Request", "模型拒绝"),
+            ("503 Service Unavailable", "网络错误"),
+        ] {
+            let (base_url, _request) = serve(vec![MockResponse::error(status, "error-body")]);
+            let client = DeepSeekClient::new(
+                "test-key".to_string(),
+                base_url,
+                "example-model".to_string(),
+            )
+            .unwrap();
+            let error = client.chat_stream(Vec::new(), None).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{status}: {error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_chat_future_cancels_the_open_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (closed_sender, closed_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .unwrap();
+            started_sender.send(()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0_u8; 1024];
+            let closed = loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break true,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break false;
+                    }
+                    Err(_) => break true,
+                }
+            };
+            closed_sender.send(closed).unwrap();
+        });
+
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            format!("http://{address}"),
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move { client.chat_stream(Vec::new(), None).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match started_receiver.try_recv() {
+                Ok(()) => break,
+                Err(mpsc::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("mock stream did not start: {error}"),
+            }
+        }
+        task.abort();
+        let _ = task.await;
+        assert!(
+            closed_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            "aborting the chat future left the HTTP stream open"
+        );
     }
 }

@@ -7,9 +7,38 @@
 #
 # 用法:
 #   ./scripts/install-linux.sh
+#   ./scripts/install-linux.sh --check
 #
 
 set -euo pipefail
+
+if [[ "${1:-}" == "--help" ]]; then
+    echo "用法: $0 [--check]"
+    echo "  --check  只检查 Java、Alda 与 Rust，不安装或提权"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--check" ]]; then
+    failures=0
+    for program in java alda rustc; do
+        if command -v "$program" >/dev/null 2>&1; then
+            echo "[OK] $program: $(command -v "$program")"
+        else
+            echo "[ERR] 未找到 $program" >&2
+            failures=$((failures + 1))
+        fi
+    done
+    if command -v alda >/dev/null 2>&1; then
+        alda version || failures=$((failures + 1))
+    fi
+    exit "$failures"
+fi
+
+if [[ $# -gt 0 ]]; then
+    echo "未知参数: $1" >&2
+    echo "用法: $0 [--check]" >&2
+    exit 2
+fi
 
 # ──────────────────────────────────────────────
 # 颜色输出
@@ -134,20 +163,9 @@ install_alda() {
     fi
 
     warn "未检测到 Alda。"
-    if ! confirm_sudo "通过 curl 安装 Alda"; then
-        err "Alda 未安装，无法继续。请从 https://alda.io/install 手动安装后重新运行。"
-        return 1
-    fi
-
-    info "正在通过官方脚本安装 Alda..."
-    curl -sSL https://raw.githubusercontent.com/alda-lang/alda/master/client/scripts/install.sh | bash
-
-    if command -v alda &>/dev/null; then
-        ok "Alda 安装成功。"
-    else
-        err "Alda 安装失败，请从 https://alda.io/install 手动安装。"
-        return 1
-    fi
+    err "脚本不会自动执行远程 curl | bash。"
+    err "请从 https://alda.io/install 检查官方安装步骤，安装后重新运行本脚本。"
+    return 1
 }
 
 # ──────────────────────────────────────────────

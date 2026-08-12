@@ -298,15 +298,17 @@ Alda 源码对用户可见，但普通用户不需要直接编辑。高级用户
 - 可配置的 DeepSeek 模型标识；
 - 一个具体客户端实现。
 
-`.env` 使用每行一个 `KEY=VALUE` 的简单格式：
+`.env` 使用每行一个 `KEY=VALUE` 的简单格式，规范键名为：
 
 ```dotenv
-api-key=<DeepSeek API key>
-base_url=<DeepSeek OpenAI-compatible base URL>
+ALDA_AGENT_API_KEY=<DeepSeek API key>
+ALDA_AGENT_BASE_URL=<DeepSeek OpenAI-compatible base URL>
+ALDA_AGENT_MODEL=<model id>
 ```
 
-OpenAI 表示请求和响应的线协议格式，不表示实际模型服务是 OpenAI。项目只解析当前需要的
-`api-key` 和 `base_url` 两个键，并提供不含真实值的 `.env.example`；`.env` 只用于本地且不得提交。
+OpenAI 表示请求和响应的线协议格式，不表示实际模型服务是 OpenAI。项目解析上述三个规范键，
+并兼容早期的 `api-key`、`base_url` 和 `model` 别名；`.env.example` 不含真实值，`.env` 只用于
+本地且不得提交。三项配置缺失或为空时均应在网络请求前失败。
 
 首期应验证：
 
@@ -341,7 +343,7 @@ OpenAI 表示请求和响应的线协议格式，不表示实际模型服务是 
 
 ## 13. 隐私与安全底线
 
-- DeepSeek API key 只从本地 `.env` 的 `api-key` 读取，不写入项目数据、日志或导出文件；
+- DeepSeek API key 只从本地 `.env` 的 `ALDA_AGENT_API_KEY` 读取，不写入项目数据、日志或导出文件；
 - 首次使用应明确提示诗歌、创作要求、当前乐谱和校验错误会发送给配置的模型服务；
 - 文件读写限制在当前项目目录和明确导出目标；
 - Alda 子进程具有超时、取消和输出上限；

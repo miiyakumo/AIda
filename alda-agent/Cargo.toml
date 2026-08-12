@@ -2,6 +2,15 @@
 name = "alda-agent"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -9,7 +18,7 @@ anyhow = "1"
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 futures-util = "0.3"
 tempfile = "3"
 

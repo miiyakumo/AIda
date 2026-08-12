@@ -1,7 +1,7 @@
-data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"submit_alda","arguments":""}}]},"finish_reason":null}]}
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"example-model","choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"submit_alda","arguments":""}}]},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{\"alda_code\":\"piano: c d e f\"}"}}]},"finish_reason":null}]}
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"example-model","choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{\"alda_code\":\"piano: c d e f\"}"}}]},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":null},"finish_reason":"tool_calls"}]}
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"example-model","choices":[{"index":0,"delta":{"content":null},"finish_reason":"tool_calls"}]}
 
 data: [DONE]
