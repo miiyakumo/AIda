@@ -498,32 +498,26 @@ fn build_tool_feedback(checks: &[AldaCheck], _tool_call_id: Option<&str>) -> Str
         let _ = writeln!(msg, "{} {}: {}", icon, c.name, c.detail);
     }
 
-    // 如果有时长失败, 计算精确的倍数并给出具体操作建议
+    // 时长与 tempo 成反比。优先做确定性的 tempo 比例校准，避免模型反复重写已通过的结构。
     if let Some(dur_check) = checks
         .iter()
         .find(|c| c.name == "时长" && c.status == CheckStatus::Fail)
         && let Some((actual, target)) = parse_duration_values(&dur_check.detail)
         && actual > 0.0
     {
-        let multiplier = target / actual;
+        let tempo_multiplier = actual / target;
         let _ = writeln!(
             msg,
-            "\n**时长修正指南**: 当前作品约 {actual:.0} 秒, 需要达到 {target:.0} 秒. 需要将内容量扩大到约 **{multiplier:.1}** 倍."
-        );
-        msg.push_str("具体做法:\n");
-        let _ = writeln!(
-            msg,
-            "- 将所有反复次数乘以 {:.0} (如 `*2` 变成 `*{:.0}`)",
-            multiplier.ceil(),
-            (2.0 * multiplier).ceil()
+            "\n**时长修正指南**: 当前作品约 {actual:.0} 秒，目标 {target:.0} 秒。保持音符、段落和配器不变，只把每个显式 tempo 乘以 **{tempo_multiplier:.3}**。"
         );
         let _ = writeln!(
             msg,
-            "- 或者在现有 tempo 基础上降低, 例如 `(tempo {:.0})` 降低到 `(tempo {:.0})`",
-            120.0,
-            (120.0 / multiplier).ceil()
+            "公式：`新 tempo = 旧 tempo × {actual:.0} ÷ {target:.0}`。例如 `(tempo! 120)` 改为 `(tempo! {:.0})`。",
+            120.0 * tempo_multiplier
         );
-        msg.push_str("- 或者增加新的变奏段落来扩展结构\n");
+        msg.push_str(
+            "作品过长时提高 tempo，过短时降低 tempo；不要重新规划、增删或展开乐谱内容。\n",
+        );
     }
 
     msg.push_str("\n请根据以上反馈修改 Alda 乐谱后重新提交. 注意: 反馈中的具体数值和倍数建议是精确计算得出的, 请严格参考.");
@@ -618,6 +612,22 @@ mod tests {
     fn test_parse_duration_no_match() {
         assert!(parse_duration_values("未检查").is_none());
         assert!(parse_duration_values("解析成功").is_none());
+    }
+
+    #[test]
+    fn duration_failure_recommends_exact_tempo_scaling() {
+        let feedback = build_tool_feedback(
+            &[AldaCheck {
+                name: "时长",
+                status: CheckStatus::Fail,
+                detail: "约 227秒（目标 180秒，偏差 26%，超出容差 10%）".to_string(),
+            }],
+            None,
+        );
+
+        assert!(feedback.contains("乘以 **1.261**"));
+        assert!(feedback.contains("(tempo! 151)"));
+        assert!(feedback.contains("不要重新规划、增删或展开乐谱内容"));
     }
 
     #[tokio::test]
