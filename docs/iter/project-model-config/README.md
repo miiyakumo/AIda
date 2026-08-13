@@ -1,0 +1,32 @@
+# 项目级模型配置
+
+> 需求日期：2026-08-13
+>
+> 状态：代码实施完成，自动化验证通过，待真实终端验收
+
+## 需求与最终语义
+
+模型配置不再来自仓库 `.env` 或进程环境变量，而是每个音乐项目自己的持久设置。当前最小配置为模型
+名称、OpenAI-compatible Base URL 和 API 密钥；三项全部存在时模型能力才可用。不同项目可以选择不同
+端点和模型。
+
+项目内命令为：
+
+```text
+/project config model NAME
+/project config url URL
+/project config key
+```
+
+密钥命令不接受参数，而是在 TTY 中继续隐藏输入，防止密钥进入 reedline 历史。`/project config` 和
+`/project` 只显示密钥“已设置”或“未设置”，不回显实际内容。非 TTY 模式拒绝设置密钥。
+
+配置保存在项目根目录的 `model.json`，与作品元数据分离，在 Unix 上以 `0600` 权限原子写入。
+`project.json`、版本文件和输入历史均不包含密钥。当前未引入系统密钥环或加密存储；本地文件安全边界
+依赖操作系统用户权限。
+
+自然语言 Agent 操作、一次性 `compose` 和 `doctor --probe model` 使用同一项目配置。Shell 入口通过
+`--project PATH` 或 `--name NAME` 选择项目；未指定时使用当前目录。普通 `doctor` 只检查本地 Java、
+Alda 和 Rust，不再检查全局模型配置。
+
+旧 `.env` 机制和示例文件已直接删除，不读取、回退或迁移旧值。

@@ -102,7 +102,10 @@ fn check_alda(exec: &impl Fn(&str, &[&str]) -> Option<String>) -> CheckResult {
     }
 }
 
-pub fn run() -> anyhow::Result<()> {
+pub async fn run(
+    probe: Option<crate::ProbeTarget>,
+    project_root: std::path::PathBuf,
+) -> anyhow::Result<()> {
     let exec = |program: &str, args: &[&str]| -> Option<String> {
         let output = std::process::Command::new(program)
             .args(args)
@@ -119,8 +122,7 @@ pub fn run() -> anyhow::Result<()> {
         }
     };
 
-    let mut results = vec![check_config()];
-    results.extend(run_checks(exec));
+    let results = run_checks(exec);
     print_results(&results);
     let failed = results
         .iter()
@@ -129,27 +131,67 @@ pub fn run() -> anyhow::Result<()> {
     if failed > 0 {
         anyhow::bail!("环境检查有 {failed} 项失败");
     }
+    if let Some(probe) = probe {
+        run_probe(probe, &project_root).await?;
+    }
     Ok(())
 }
 
-fn check_config() -> CheckResult {
-    match crate::config::Config::from_env_file() {
-        Ok(config) => CheckResult {
-            name: "模型配置",
-            status: CheckStatus::Pass,
-            detail: format!(
-                "端点={}，模型={}，thinking={}",
-                config.base_url, config.model, config.thinking
-            ),
-            suggestion: None,
-        },
-        Err(error) => CheckResult {
-            name: "模型配置",
-            status: CheckStatus::Fail,
-            detail: error.to_string(),
-            suggestion: Some("复制 .env.example 为 .env，并填写规范配置".to_string()),
-        },
+async fn run_probe(
+    probe: crate::ProbeTarget,
+    project_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    if matches!(probe, crate::ProbeTarget::Model | crate::ProbeTarget::All) {
+        probe_model(project_root).await?;
     }
+    if matches!(probe, crate::ProbeTarget::Alda | crate::ProbeTarget::All) {
+        probe_alda().await?;
+    }
+    Ok(())
+}
+
+async fn probe_model(project_root: &std::path::Path) -> anyhow::Result<()> {
+    use crate::deepseek::{DeepSeekClient, Message, StreamEvent};
+    let config = crate::config::ModelConfig::load(project_root)?.resolve()?;
+    let client = DeepSeekClient::new(config.api_key, config.base_url, config.model)?;
+    let events = client
+        .chat_stream(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("只回复 OK。".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            None,
+        )
+        .await?;
+    if !events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::Text(_)))
+    {
+        anyhow::bail!("模型探测未返回文本");
+    }
+    println!("✓ 模型真实连通探测通过");
+    Ok(())
+}
+
+async fn probe_alda() -> anyhow::Result<()> {
+    use crate::alda::{AldaRunner, find_alda};
+    let path = find_alda().ok_or_else(|| anyhow::anyhow!("未找到 alda"))?;
+    let score_dir = tempfile::tempdir()?;
+    let score = score_dir.path().join("probe.alda");
+    std::fs::write(&score, "piano: c")?;
+    let checks = AldaRunner::new(path)
+        .validate_async(score, Vec::new(), Vec::new(), None, 10.0)
+        .await?;
+    if checks
+        .iter()
+        .any(|check| check.status == crate::alda::CheckStatus::Fail)
+    {
+        anyhow::bail!("Alda 真实探测未通过校验");
+    }
+    println!("✓ Alda 真实连通探测通过");
+    Ok(())
 }
 
 fn print_results(results: &[CheckResult]) {

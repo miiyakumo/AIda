@@ -1,6 +1,9 @@
 pub mod agent;
 pub mod alda;
+pub mod application;
+pub mod command;
 pub mod config;
+pub mod conversation;
 pub mod deepseek;
 pub mod doctor;
 pub mod project;
@@ -8,49 +11,34 @@ pub mod repl;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "alda-agent", about = "Alda Music Agent")]
 pub struct Cli {
+    /// 在默认项目目录中打开此名称
+    #[arg(long, conflicts_with = "project")]
+    pub name: Option<String>,
+    /// 打开或创建指定项目目录
+    #[arg(long, conflicts_with = "name")]
+    pub project: Option<PathBuf>,
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
-#[derive(clap::Subcommand)]
+#[derive(Subcommand)]
 pub enum Command {
     /// 列出默认目录中的项目
-    List,
-    /// 进入单进程交互式项目
-    Repl {
-        /// 项目目录；默认使用当前目录
-        #[arg(short, long, conflicts_with = "name")]
-        project: Option<PathBuf>,
-        /// 在默认项目目录中打开此名称
-        #[arg(short, long, conflicts_with = "project")]
-        name: Option<String>,
-        /// 设置项目创作模式: full（完整曲目）或 improv（即兴片段）
-        #[arg(short, long)]
-        mode: Option<String>,
-        /// 设置项目目标时长（秒）
-        #[arg(long)]
-        duration: Option<f64>,
-        /// 设置项目必须包含的乐器（可重复指定）
-        #[arg(long = "include")]
-        include: Vec<String>,
-        /// 设置项目必须排除的乐器（可重复指定）
-        #[arg(long = "exclude")]
-        exclude: Vec<String>,
-    },
+    Projects,
     /// 检查运行时环境
-    Doctor,
-    /// 运行 `DeepSeek` API 连通测试
-    Smoke,
-    /// 运行 Alda 工具连通测试
-    AldaSmoke,
-    /// 基于素材创作 Alda 音乐作品
-    Create {
+    Doctor {
+        /// 额外执行真实连通探测；不指定时只检查本地环境
+        #[arg(long, value_enum)]
+        probe: Option<ProbeTarget>,
+    },
+    /// 一次性创作 Alda 音乐作品
+    Compose {
         /// 素材文本文件路径（不指定则从 stdin 读取）
         #[arg(short, long)]
         file: Option<PathBuf>,
@@ -70,4 +58,11 @@ pub enum Command {
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ProbeTarget {
+    Model,
+    Alda,
+    All,
 }

@@ -1,108 +1,100 @@
 # 当前架构
 
-> 代码基线：`5177919`（2026-08-13）
+> 代码基线：CLI 交互体验改进实现（2026-08-13）
 >
-> 本文描述当前源码实际行为，不描述未来设计。
+> 本文描述当前源码实际行为。
 
 ## 总体结构
 
-项目是一个 Rust 2024 单 crate、单进程 CLI。没有本地服务、数据库、后台任务系统或通用 Provider
-抽象。运行时只连接一个显式配置的 OpenAI-compatible 模型端点，并通过本机 `alda` 进程处理乐谱。
+项目是 Rust 2024 单 crate、单进程 CLI。`Application` 是 UI 无关的应用入口；终端只是一个适配器：
 
 ```text
-CLI（main.rs）
-├── 一次性 create
-├── 项目 REPL（repl.rs）
-│   ├── Project（project.rs）：项目元数据、有效版本、恢复、导出路径
-│   ├── Agent（agent.rs）：创作、修改、澄清、校验反馈和自动修正
-│   │   ├── DeepSeekClient（deepseek.rs）：流式模型请求与工具调用解析
-│   │   └── AldaRunner（alda.rs）：解析、检查、播放、停止和 MIDI 导出
-│   └── 项目级默认/自定义创作策略
-├── doctor：配置和本机依赖检查
-└── smoke / alda-smoke：模型端点与 Alda 的真实连通检查
+Shell CLI（main.rs）
+├── 默认进入项目交互
+├── projects / compose / doctor
+└── Terminal adapter（repl.rs）
+    ├── command.rs：分层动作解析、帮助与补全目录
+    ├── application.rs：动作执行、能力装载、双视图快照
+    ├── project.rs + conversation.rs：项目聚合与持久对话
+    ├── agent.rs + deepseek.rs：模型生成、事件报告与协议转换
+    └── alda.rs：校验、播放、停止、导出与单操作取消
 ```
 
-模块职责如下：
+终端不直接修改 Project，也不编排 Agent 生成循环。它把输入解析为 `UserAction`，调用
+`Application::execute`，再读取 `ProjectView` 和 `ConversationView` 渲染提示符与结果。未来界面可以
+直接复用这一入口。
 
-| 模块 | 当前职责 |
-|---|---|
-| `main.rs` / `lib.rs` | CLI 参数、子命令调度、一次性创作与 Ctrl+C 取消边界 |
-| `config.rs` | 从仓库根目录 `.env` 读取模型端点、模型名和 thinking 配置 |
-| `deepseek.rs` | 发送 OpenAI-compatible 流式请求，解析文本和 `submit_alda` 工具调用，分类常见 HTTP 错误 |
-| `agent.rs` | 构造创作/修改上下文，最多三轮生成、Alda 校验和反馈，区分成功、失败与待澄清 |
-| `alda.rs` | 调用 Alda 解析乐谱，检查内容、时长和乐器约束，管理子进程超时、输出上限及取消 |
-| `project.rs` | 保存项目设置、上下文、线性版本与导出文件，维护版本不覆盖等不变量 |
-| `repl.rs` | 读取自然语言和斜杠命令，按项目状态选择创作、修改或继续生成 |
-| `doctor.rs` | 检查模型配置、Java、Alda 和 Rust 工具链 |
+## Shell 与项目内命令
 
-## 创作数据流
-
-一次创作或修改遵循同一条主路径：
-
-1. CLI/REPL 读取素材、当前有效乐谱、用户要求和项目约束。
-2. `Agent` 组合稳定协议、默认创作策略和可选项目策略，向模型提供 `submit_alda` 工具。
-3. `DeepSeekClient` 流式接收说明文本和完整 Alda 工具参数。
-4. 候选写入临时目录，`AldaRunner` 在阻塞线程中调用 `alda parse`。
-5. 程序检查语法、非空声部/事件/时长、目标时长和乐器约束。
-6. 存在失败项时，诊断作为 tool 结果返回模型；单次操作最多尝试三轮。
-7. 全部必要检查通过后才返回成功。REPL 仅将成功候选保存为新版本；失败候选不会覆盖有效版本。
-
-模型只返回说明文本而没有提交乐谱时，结果被视为澄清问题。REPL 保存这段短期会话，用户下一条
-自然语言输入会继续该上下文。完成一次生成后会话清空；新的修改从素材、当前乐谱、最新反馈和当前
-约束重建干净上下文，避免累积旧草稿和工具回执。
-
-## 校验语义
-
-每项检查有三种状态：`通过`、`失败`、`未检查`。当前客观检查包括：
-
-- Alda 能否解析；
-- 是否至少有一个声部、一个可播放事件和正时长；
-- 指定目标时长时，是否落在固定的 ±10% 容差内；
-- 是否包含或排除了用户指定的乐器。乐器约束当前按 Alda stock instrument 名称做大小写无关的
-  子串匹配。
-
-审美、结构完整感和修改效果不属于机器校验结果，必须通过试听判断。
-
-## 项目模型
-
-`repl --name NAME` 使用 `~/.alda-agent/projects/NAME/`；`repl --project PATH` 使用显式目录。
-一个目录就是一个项目：
+Shell 入口只有：
 
 ```text
-project/
+alda-agent [--name NAME | --project PATH]
+alda-agent projects
+alda-agent compose [OPTIONS]
+alda-agent doctor [--probe model|alda|all] # 无 probe 时只做本地环境检查
+```
+
+项目内命令按职责分组：自然语言输入进入 Agent；`/alda` 只执行本地工具动作；`/project` 查看和修改
+持久项目；`/help` 提供分层帮助；`/quit` 退出。旧的扁平命令已删除。
+
+TTY 使用 reedline 0.49，支持 bracketed paste、多行输入、项目级 500 条历史和 Tab 补全。Alt+Enter、
+Shift+Enter 插入换行，普通 Enter 提交。非 TTY 使用逐行纯文本适配器，不输出控制序列或动画。
+indicatif 0.18 只负责 TTY 活动指示；所有阶段和结果仍是稳定的语义事件与文本。
+
+## 项目聚合与双视图
+
+`Project` 是聚合根，持有项目设置、当前有效版本、线性版本元数据和一条供应商无关的
+`Conversation`。Conversation 保存用户、模型和 Agent 内部工具消息，以及 `ready`、
+`awaiting_input`、`revision_available` 状态。项目领域不依赖模型传输消息；Agent 边界负责转换。
+
+用户第一条消息在模型或 Alda 前置条件检查之前持久化，失败和取消不会丢失输入。`ProjectView` 展示
+项目事实、版本、设置和能力；`ConversationView` 展示消息、待处理状态和下一步建议。两者每次从
+Project 与进程内能力状态派生，不是新的事实来源。
+
+## 能力与降级
+
+项目、Alda 和模型能力独立：打开项目不创建模型客户端；自然语言操作才读取项目内 `model.json` 并
+创建客户端。模型名称、OpenAI-compatible URL 和密钥必须全部设置；模型失败不会阻止 `/project` 或
+可用的 `/alda` 操作。Alda 缺失时仍可导出版本的 Alda 源码；请求 MIDI 或 all 会明确报告 MIDI 未完成。
+
+模型名称和 URL 由普通 `/project config` 命令设置。密钥使用 `/project config key` 后的隐藏输入，避免
+进入 `.repl-history`；配置视图只显示密钥是否存在。`model.json` 在 Unix 上以 `0600` 权限原子写入。
+程序不读取 `.env` 或模型环境变量。`compose` 与 `doctor --probe model` 通过 Shell 的 `--project` 或
+`--name` 选择同一个项目配置，未指定时使用当前目录。
+
+Alda 操作使用每次前台操作独立的 `CancellationToken`。Ctrl+C 在模型阶段丢弃 HTTP future；在 Alda
+阶段设置 token 并等待子进程组终止后才返回提示符。Ctrl+C 编辑输入只清空缓冲，Ctrl+D 或 `/quit`
+退出。
+
+## 生成与输出边界
+
+Agent 在每轮报告轮次开始、模型文本增量、Alda 校验开始、完整检查结果和自动修正。模型传输层不写
+stdout/stderr；SSE 文本经 callback 实时交给应用 reporter。终端统一渲染模型、Agent、Alda、项目结果
+和错误。
+
+只有必要检查均未失败的候选才能调用 `Project::save_version`。失败候选、被取消候选和外部文件校验失败
+都不会覆盖 `current.alda`。版本切换不删除后续历史，新版本号始终递增。
+
+## 持久化布局
+
+```text
+project-root/
 ├── project.json
+├── model.json                 # 项目模型配置，Unix 0600
 ├── current.alda
-├── versions/
-│   ├── 0001.alda
-│   └── 0002.alda
-└── exports/
-    ├── version-0002.alda
-    └── version-0002.mid
+├── .repl-history
+├── versions/0001.alda ...
+└── exports/version-0001.alda|mid ...
 ```
 
-`project.json` 保存原始素材、累计要求、解读、创作策略、模式、时长和乐器约束、当前版本、版本元数据
-以及尚待继续的短期会话，不保存模型 API key。版本号取历史最大值加一，因此恢复旧版后继续修改不会
-覆盖既有版本。`/reload` 用于校验并采用人工修改的 `current.alda`；失败时恢复当前有效版本。
+项目尚未发布，本次元数据为破坏性更新，不迁移旧的 `source_material`、`requirements`、
+`interpretation` 或供应商消息数组格式。
 
-元数据采用同目录临时文件后重命名的方式写入。当前没有数据库、文件锁、事务日志、分支版本或多进程
-并发编辑协议。
+## 验证基线
 
-## 外部边界与保护
+- `cargo test`：自动化测试通过；
+- `cargo clippy --all-targets --all-features -- -D warnings`：通过；
+- `cargo +1.85.0 check --locked`：通过；锁文件固定 Rust 1.85 可用的依赖链。
 
-- 模型请求超时为 120 秒；整个 SSE 响应上限 16 MiB，单个工具参数上限 64 KiB。
-- Alda 命令默认超时 60 秒，stdout 和 stderr 各受 10 MiB 上限保护。
-- Ctrl+C 会取消当前异步操作；活动 Alda 进程组会被终止，模型流 future 被丢弃后连接关闭。
-- `doctor` 只证明配置可读取、可执行文件存在，不证明模型 API 可用；`smoke` 才发起真实模型请求。
-- 安装脚本不会自动执行远程 `curl | bash`；Alda 缺失时引导用户查看官方安装方式。
-
-## 已知边界
-
-- `Services` 当前把模型客户端和 Alda runner 一起延迟初始化，因此 REPL 的 `/play`、`/stop`、
-  `/export`、`/reload` 也要求 `.env` 模型配置有效，即使这些操作本身不访问模型。
-- 配置文件位置固定为仓库根目录 `.env`，尚不读取环境变量、用户级配置或项目级配置。
-- 当前 REPL 直接使用标准输入输出：单行 `> ` 提示、静态 `/help` 和模型文本直出；没有行编辑、
-  历史导航、补全、持续状态区或结构化进度展示。真实验收已确认这套交互不符合人体工程学。
-- 真实模型的工具调用兼容性和作品质量由所选端点与模型决定；首期已有一次真实验收，后续模型变更
-  仍需针对性回归，离线测试不能替代这种兼容性检查。
-- 仓库目前没有 CI 配置或发行包；质量门禁需要在本地执行，程序从源码通过 Cargo 运行。
-- 产品当前只面向 Linux 终端；GUI 仍是远期方向。
+真实模型、真实 Alda 播放和完整人体工程学流程仍需在 Linux 终端进行最终验收。

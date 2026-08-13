@@ -4,7 +4,7 @@
 >
 > 方案日期：2026-08-13
 >
-> 状态：评审通过，待实施
+> 状态：代码实施完成，自动化验证通过，待真实终端验收
 
 > 兼容性前提：项目尚未发布，本次允许删除和重命名现有命令，也允许为清晰的交互边界重构实现；不为
 > 未形成的使用习惯保留兼容别名或弃用周期。
@@ -199,6 +199,9 @@ Shift+Enter 插入换行。命令只有在去除前导空白后以 `/` 开头时
 /project config include INST...|none # 替换必须包含的乐器列表
 /project config exclude INST...|none # 替换必须排除的乐器列表
 /project config strategy TEXT|default
+/project config model NAME
+/project config url URL
+/project config key                 # 隐藏输入，不进入历史
 ```
 
 `/project adopt PATH` 取代“直接编辑 `current.alda` 后 `/reload`”的流程。该项目操作先调用 Alda 校验，
@@ -211,7 +214,8 @@ Shift+Enter 插入换行。命令只有在去除前导空白后以 `/` 开头时
 
 `/project config` 每次只修改一个键并立即校验、持久化。`include` 和 `exclude` 是替换语义，不使用容易
 产生累计误解的隐式追加；`none` 清空列表或时长，`default` 清除自定义创作策略。冲突的乐器约束在写入
-前拒绝，原配置保持不变。
+前拒绝，原配置保持不变。模型名称、URL 和密钥是项目级配置；密钥命令后续使用隐藏输入，不能把密钥
+写入命令参数、历史或状态输出。
 
 `/help` 显示自然语言输入及上述四个顶层入口；`/help alda` 显示 Alda 子命令；`/help alda export` 显示参数、默认值、
 前置条件和示例。输入 `/`、`/alda ` 或 `/project ` 后按 Tab 分层补全；`/alda play `、
@@ -320,7 +324,7 @@ Alda 能力：校验、播放、停止、MIDI 导出
 会话；用户再次发起模型操作时重新读取配置并重试，但程序不在同一次操作中自动重试可能产生费用的
 请求。
 
-例如 `.env` 无效但本机 Alda 可用时：
+例如项目模型配置不完整但本机 Alda 可用时：
 
 ```text
 mechanical-drive-poem · v2 · 完整曲目 · 180 秒 · +piano · -violin
@@ -454,6 +458,20 @@ Application::conversation_view() -> ConversationView
 前两步先稳定能力和输出语义，行编辑器只负责输入体验；这样终端组件不会反向控制项目和 Agent 逻辑。
 
 ## 验收场景
+
+### 实施结果（2026-08-13）
+
+方案已落地到 `alda-agent`：Shell 与项目内命令完成破坏性替换；`Application`、双视图和供应商无关的
+Conversation 已建立；reedline 历史、多行输入和分层补全、indicatif 活动指示、Agent 流式语义事件、
+模型/Alda 能力解耦以及单操作取消均已实现。旧项目元数据不迁移，符合本方案兼容性前提。
+
+自动化测试、严格 Clippy 和 Rust 1.85 锁定构建均通过。下面的真实终端验收仍需使用真实模型端点和
+Alda 播放环境完成；在此之前不把本迭代标为最终验收关闭。
+
+首次真实终端运行验证了新项目首轮创作、流式模型输出、Alda 校验、版本保存和退出闭环，同时发现并
+修复两项问题：Agent 与 Tool 阶段行曾随活动指示一起清除，现改为持久阶段行与临时 spinner 分离；
+`full`、`improv` 模式曾在模型提示中隐含固定时长范围，现只描述作品组织方式，时长仅由显式
+`duration` 和用户本轮要求决定。其他真实终端场景仍按下述清单继续验收。
 
 ### 自动化验收
 

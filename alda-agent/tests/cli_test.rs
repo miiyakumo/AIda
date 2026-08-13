@@ -1,60 +1,33 @@
-use alda_agent::{Cli, Command};
+use alda_agent::{Cli, Command, ProbeTarget};
 use clap::Parser;
 
 #[test]
-fn test_doctor_subcommand() {
-    let cli = Cli::try_parse_from(["alda-agent", "doctor"]).unwrap();
-    assert!(matches!(cli.command, Command::Doctor));
+fn default_and_project_entries_have_no_subcommand() {
+    let cli = Cli::try_parse_from(["alda-agent"]).unwrap();
+    assert!(cli.command.is_none());
+    let cli = Cli::try_parse_from(["alda-agent", "--project", "/tmp/project"]).unwrap();
+    assert_eq!(
+        cli.project.unwrap(),
+        std::path::PathBuf::from("/tmp/project")
+    );
+    let cli = Cli::try_parse_from(["alda-agent", "--name", "poem"]).unwrap();
+    assert_eq!(cli.name.as_deref(), Some("poem"));
 }
 
 #[test]
-fn test_project_commands() {
-    let cli = Cli::try_parse_from(["alda-agent", "list"]).unwrap();
-    assert!(matches!(cli.command, Command::List));
-
-    let cli = Cli::try_parse_from(["alda-agent", "repl", "--project", "/tmp/project"]).unwrap();
+fn new_shell_commands_parse_and_removed_ones_fail() {
+    let cli = Cli::try_parse_from(["alda-agent", "projects"]).unwrap();
+    assert!(matches!(cli.command, Some(Command::Projects)));
+    let cli = Cli::try_parse_from(["alda-agent", "doctor", "--probe", "alda"]).unwrap();
     assert!(matches!(
         cli.command,
-        Command::Repl {
-            project: Some(path),
-            name: None,
-            ..
-        } if path == *"/tmp/project"
+        Some(Command::Doctor {
+            probe: Some(ProbeTarget::Alda)
+        })
     ));
-
-    let cli = Cli::try_parse_from(["alda-agent", "repl", "--name", "poem"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Command::Repl {
-            project: None,
-            name: Some(name),
-            ..
-        } if name == "poem"
-    ));
-
-    let cli = Cli::try_parse_from([
-        "alda-agent",
-        "repl",
-        "--name",
-        "poem",
-        "--mode",
-        "full",
-        "--duration",
-        "180",
-        "--include",
-        "piano",
-        "--exclude",
-        "violin",
-    ])
-    .unwrap();
-    assert!(matches!(
-        cli.command,
-        Command::Repl {
-            mode: Some(mode),
-            duration: Some(180.0),
-            include,
-            exclude,
-            ..
-        } if mode == "full" && include == ["piano"] && exclude == ["violin"]
-    ));
+    assert!(Cli::try_parse_from(["alda-agent", "repl"]).is_err());
+    assert!(Cli::try_parse_from(["alda-agent", "list"]).is_err());
+    assert!(Cli::try_parse_from(["alda-agent", "create"]).is_err());
+    assert!(Cli::try_parse_from(["alda-agent", "smoke"]).is_err());
+    assert!(Cli::try_parse_from(["alda-agent", "alda-smoke"]).is_err());
 }

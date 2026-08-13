@@ -3,10 +3,8 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error as _;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-static PRIVACY_SHOWN: AtomicBool = AtomicBool::new(false);
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 
@@ -61,18 +59,18 @@ impl ThinkingOptions {
         let mode = match mode.unwrap_or("disabled") {
             "enabled" => ThinkingMode::Enabled,
             "disabled" => ThinkingMode::Disabled,
-            value => bail!("ALDA_AGENT_THINKING 必须是 enabled 或 disabled，当前为 {value:?}"),
+            value => bail!("thinking 必须是 enabled 或 disabled，当前为 {value:?}"),
         };
         let reasoning_effort = reasoning_effort
             .map(|value| match value {
                 "low" => Ok(ReasoningEffort::Low),
                 "high" => Ok(ReasoningEffort::High),
                 "max" => Ok(ReasoningEffort::Max),
-                _ => bail!("ALDA_AGENT_REASONING_EFFORT 必须是 low、high 或 max，当前为 {value:?}"),
+                _ => bail!("reasoning effort 必须是 low、high 或 max，当前为 {value:?}"),
             })
             .transpose()?;
         if mode == ThinkingMode::Disabled && reasoning_effort.is_some() {
-            bail!("thinking=disabled 时不能设置 ALDA_AGENT_REASONING_EFFORT");
+            bail!("thinking=disabled 时不能设置 reasoning effort");
         }
         Ok(Self {
             mode,
@@ -115,12 +113,6 @@ fn reqwest_error_detail(error: &reqwest::Error) -> String {
         source = cause.source();
     }
     detail
-}
-
-fn show_privacy_notice() {
-    if !PRIVACY_SHOWN.swap(true, Ordering::SeqCst) {
-        eprintln!("注意：诗歌、创作要求、当前乐谱和校验错误将会发送到配置的模型服务。");
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -280,11 +272,11 @@ impl SseParser {
 
         for choice in chunk.choices {
             if let Some(delta) = choice.delta {
-                if let Some(content) = delta.content
-                    && !content.is_empty()
-                {
-                    text_chunks.push(content.clone());
-                    self.events.push(StreamEvent::Text(content));
+                if let Some(content) = delta.content {
+                    if !content.is_empty() {
+                        text_chunks.push(content.clone());
+                        self.events.push(StreamEvent::Text(content));
+                    }
                 }
                 if let Some(tool_calls) = delta.tool_calls {
                     for tool_call in tool_calls {
@@ -372,8 +364,15 @@ impl DeepSeekClient {
         messages: Vec<Message>,
         tools: Option<Vec<Tool>>,
     ) -> Result<Vec<StreamEvent>> {
-        show_privacy_notice();
+        self.chat_stream_with(messages, tools, |_| {}).await
+    }
 
+    pub async fn chat_stream_with(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<Tool>>,
+        mut on_text: impl FnMut(&str),
+    ) -> Result<Vec<StreamEvent>> {
         let url = chat_completions_url(&self.base_url);
 
         let request = ChatRequest {
@@ -400,7 +399,7 @@ impl DeepSeekClient {
         // 错误分类
         let status = response.status();
         if status == 401 {
-            bail!(ChatError::Auth("请检查 ALDA_AGENT_API_KEY 是否正确".into()));
+            bail!(ChatError::Auth("请检查当前项目的模型密钥是否正确".into()));
         }
         if status == 429 {
             bail!(ChatError::RateLimit("请稍后重试".into()));
@@ -441,18 +440,14 @@ impl DeepSeekClient {
                 let line = buffer[..line_end].to_string();
                 buffer = buffer[line_end + 1..].to_string();
                 for text in parser.push_line(&line)? {
-                    use std::io::{self, Write};
-                    print!("{text}");
-                    io::stdout().flush().ok();
+                    on_text(&text);
                 }
             }
         }
 
         if !buffer.trim().is_empty() {
             for text in parser.push_line(&buffer)? {
-                use std::io::{self, Write};
-                print!("{text}");
-                io::stdout().flush().ok();
+                on_text(&text);
             }
         }
 
@@ -557,17 +552,6 @@ mod tests {
         assert!(format!("{}", ChatError::RateLimit("x".into())).contains("限流"));
         assert!(format!("{}", ChatError::Network("x".into())).contains("网络错误"));
         assert!(format!("{}", ChatError::ModelReject("x".into())).contains("拒绝"));
-    }
-
-    #[test]
-    fn test_privacy_notice_only_once() {
-        PRIVACY_SHOWN.store(false, Ordering::SeqCst);
-        show_privacy_notice();
-        let first = PRIVACY_SHOWN.load(Ordering::SeqCst);
-        show_privacy_notice();
-        let second = PRIVACY_SHOWN.load(Ordering::SeqCst);
-        assert!(first);
-        assert!(second);
     }
 
     #[tokio::test]

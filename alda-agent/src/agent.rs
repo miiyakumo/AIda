@@ -1,4 +1,5 @@
 use crate::alda::{AldaCheck, AldaRunner, CheckStatus};
+use crate::conversation::{ConversationMessage, ConversationRole, ConversationToolCall};
 use crate::deepseek::{DeepSeekClient, FunctionDef, Message, StreamEvent, Tool};
 use anyhow::{Context, Result, bail};
 use std::fmt::Write as _;
@@ -68,8 +69,12 @@ pub enum CreationMode {
 impl CreationMode {
     fn description(&self) -> &str {
         match self {
-            CreationMode::FullPiece => "完整曲目，约 2-5 分钟，有明确的起承转合",
-            CreationMode::Improvisation => "即兴片段，约 30 秒 - 2 分钟，自由发展",
+            CreationMode::FullPiece => {
+                "完整曲目：强调结构完整、材料发展和明确收束；模式本身不预设时长"
+            }
+            CreationMode::Improvisation => {
+                "即兴片段：强调自由发展，允许开放式收束；模式本身不预设时长"
+            }
         }
     }
 }
@@ -118,6 +123,17 @@ pub struct ContinueRequest {
     pub max_rounds: usize,
 }
 
+pub struct ProjectPromptRequest {
+    pub conversation: Vec<ConversationMessage>,
+    pub current_alda: Option<String>,
+    pub creative_strategy: String,
+    pub mode: CreationMode,
+    pub target_duration_secs: Option<f64>,
+    pub included_instruments: Vec<String>,
+    pub excluded_instruments: Vec<String>,
+    pub max_rounds: usize,
+}
+
 struct ValidationRequest {
     target_duration_ms: Option<f64>,
     included_instruments: Vec<String>,
@@ -134,6 +150,95 @@ pub struct Agent {
     runner: AldaRunner,
 }
 
+pub trait AgentReporter {
+    fn report(&mut self, event: AgentEvent);
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    PrivacyNotice,
+    RoundStarted {
+        round: usize,
+        max_rounds: usize,
+    },
+    ModelText(String),
+    ValidationStarted {
+        round: usize,
+        max_rounds: usize,
+    },
+    ValidationCompleted(Vec<AldaCheck>),
+    RevisionStarted {
+        next_round: usize,
+        max_rounds: usize,
+        failures: usize,
+    },
+}
+
+struct SilentReporter;
+
+impl AgentReporter for SilentReporter {
+    fn report(&mut self, _event: AgentEvent) {}
+}
+
+#[must_use]
+pub fn to_provider_messages(messages: &[ConversationMessage]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| Message {
+            role: match message.role {
+                ConversationRole::User => "user",
+                ConversationRole::Assistant => "assistant",
+                ConversationRole::System => "system",
+                ConversationRole::Tool => "tool",
+            }
+            .to_string(),
+            content: message.content.clone(),
+            tool_calls: (!message.tool_calls.is_empty()).then(|| {
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|call| crate::deepseek::ToolCallMsg {
+                        id: call.id.clone(),
+                        ty: "function".to_string(),
+                        function: crate::deepseek::FunctionCallArgs {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    })
+                    .collect()
+            }),
+            tool_call_id: message.tool_call_id.clone(),
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn from_provider_messages(messages: Vec<Message>) -> Vec<ConversationMessage> {
+    messages
+        .into_iter()
+        .map(|message| ConversationMessage {
+            role: match message.role.as_str() {
+                "user" => ConversationRole::User,
+                "system" => ConversationRole::System,
+                "tool" => ConversationRole::Tool,
+                _ => ConversationRole::Assistant,
+            },
+            content: message.content,
+            tool_calls: message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(|call| ConversationToolCall {
+                    id: call.id,
+                    name: call.function.name,
+                    arguments: call.function.arguments,
+                })
+                .collect(),
+            tool_call_id: message.tool_call_id,
+        })
+        .collect()
+}
+
 impl Agent {
     #[must_use]
     pub fn new(client: DeepSeekClient, runner: AldaRunner) -> Self {
@@ -141,6 +246,49 @@ impl Agent {
     }
 
     pub async fn create(&self, request: CreationRequest) -> Result<CreationResult> {
+        self.create_with_reporter(request, &mut SilentReporter)
+            .await
+    }
+
+    pub async fn respond_with_reporter(
+        &self,
+        request: ProjectPromptRequest,
+        reporter: &mut impl AgentReporter,
+    ) -> Result<CreationResult> {
+        if request.conversation.is_empty() {
+            bail!("对话不能为空");
+        }
+        let mut messages = vec![Message {
+            role: "system".to_string(),
+            content: Some(PROTOCOL_PROMPT.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        messages.push(Message {
+            role: "system".to_string(),
+            content: Some(build_project_context(&request)),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        messages.extend(to_provider_messages(&request.conversation));
+        self.run_generation(
+            messages,
+            ValidationRequest {
+                target_duration_ms: request.target_duration_secs.map(|seconds| seconds * 1000.0),
+                included_instruments: request.included_instruments,
+                excluded_instruments: request.excluded_instruments,
+                max_rounds: request.max_rounds,
+            },
+            reporter,
+        )
+        .await
+    }
+
+    pub async fn create_with_reporter(
+        &self,
+        request: CreationRequest,
+        reporter: &mut impl AgentReporter,
+    ) -> Result<CreationResult> {
         if request.source_material.trim().is_empty() && request.instructions.trim().is_empty() {
             bail!("创作素材与要求不能同时为空");
         }
@@ -167,11 +315,21 @@ impl Agent {
                 excluded_instruments: request.excluded_instruments,
                 max_rounds: request.max_rounds,
             },
+            reporter,
         )
         .await
     }
 
     pub async fn modify(&self, request: ModifyRequest) -> Result<CreationResult> {
+        self.modify_with_reporter(request, &mut SilentReporter)
+            .await
+    }
+
+    pub async fn modify_with_reporter(
+        &self,
+        request: ModifyRequest,
+        reporter: &mut impl AgentReporter,
+    ) -> Result<CreationResult> {
         if request.current_alda.trim().is_empty() {
             bail!("当前乐谱为空，无法修改");
         }
@@ -202,11 +360,21 @@ impl Agent {
                 excluded_instruments: request.excluded_instruments,
                 max_rounds: request.max_rounds,
             },
+            reporter,
         )
         .await
     }
 
     pub async fn continue_generation(&self, request: ContinueRequest) -> Result<CreationResult> {
+        self.continue_with_reporter(request, &mut SilentReporter)
+            .await
+    }
+
+    pub async fn continue_with_reporter(
+        &self,
+        request: ContinueRequest,
+        reporter: &mut impl AgentReporter,
+    ) -> Result<CreationResult> {
         if request.conversation.is_empty() {
             bail!("没有可继续的生成上下文");
         }
@@ -218,6 +386,7 @@ impl Agent {
                 excluded_instruments: request.excluded_instruments,
                 max_rounds: request.max_rounds,
             },
+            reporter,
         )
         .await
     }
@@ -228,6 +397,7 @@ impl Agent {
         &self,
         mut messages: Vec<Message>,
         validation: ValidationRequest,
+        reporter: &mut impl AgentReporter,
     ) -> Result<CreationResult> {
         validate_generation_constraints(&validation)?;
         let max_rounds = validation.max_rounds.max(1);
@@ -238,12 +408,18 @@ impl Agent {
         let mut last_was_truncated = false;
 
         for round in 0..max_rounds {
+            reporter.report(AgentEvent::RoundStarted {
+                round: round + 1,
+                max_rounds,
+            });
             let mut was_truncated = false;
             let tools = vec![submit_alda_tool()];
 
             let events = self
                 .client
-                .chat_stream(messages.clone(), Some(tools))
+                .chat_stream_with(messages.clone(), Some(tools), |text| {
+                    reporter.report(AgentEvent::ModelText(text.to_string()));
+                })
                 .await?;
 
             // 收集文本和工具调用
@@ -304,6 +480,11 @@ impl Agent {
             let tmp_score = tmp_dir.path().join("candidate.alda");
             fs::write(&tmp_score, &alda_code)?;
 
+            reporter.report(AgentEvent::ValidationStarted {
+                round: round + 1,
+                max_rounds,
+            });
+
             let mut checks = self
                 .runner
                 .validate_async(
@@ -323,6 +504,7 @@ impl Agent {
                     detail: "模型输出被截断（达到 token 限制），作品可能不完整".to_string(),
                 });
             }
+            reporter.report(AgentEvent::ValidationCompleted(checks.clone()));
 
             // 检查是否全部通过
             let all_pass = checks.iter().all(|c| c.status != CheckStatus::Fail);
@@ -365,6 +547,14 @@ impl Agent {
                     conversation: messages,
                 });
             }
+            reporter.report(AgentEvent::RevisionStarted {
+                next_round: round + 2,
+                max_rounds,
+                failures: checks
+                    .iter()
+                    .filter(|check| check.status == CheckStatus::Fail)
+                    .count(),
+            });
         }
 
         // 达到上限
@@ -454,6 +644,38 @@ fn build_user_message(request: &CreationRequest) -> String {
         msg.push_str(request.instructions.trim());
     }
     msg
+}
+
+fn build_project_context(request: &ProjectPromptRequest) -> String {
+    let mut message = String::new();
+    append_strategy_context(&mut message, &request.creative_strategy);
+    message.push_str("【项目设置】\n【模式】");
+    message.push_str(request.mode.description());
+    message.push('\n');
+    if let Some(duration) = request.target_duration_secs {
+        let _ = writeln!(message, "【目标时长】约 {} 分钟", duration / 60.0);
+    }
+    if !request.included_instruments.is_empty() {
+        let _ = writeln!(
+            message,
+            "【必须包含的乐器】{}",
+            request.included_instruments.join("、")
+        );
+    }
+    if !request.excluded_instruments.is_empty() {
+        let _ = writeln!(
+            message,
+            "【必须排除的乐器】{}",
+            request.excluded_instruments.join("、")
+        );
+    }
+    if let Some(score) = &request.current_alda {
+        message.push_str("\n【当前有效 Alda】\n");
+        message.push_str(score);
+    } else {
+        message.push_str("\n项目尚无有效版本；请根据对话中的用户请求创作。\n");
+    }
+    message
 }
 
 fn build_modify_message(request: &ModifyRequest) -> String {
@@ -551,12 +773,11 @@ fn build_tool_feedback(checks: &[AldaCheck], _tool_call_id: Option<&str>) -> Str
     }
 
     // 时长与 tempo 成反比。优先做确定性的 tempo 比例校准，避免模型反复重写已通过的结构。
-    if let Some(dur_check) = checks
+    let duration_values = checks
         .iter()
         .find(|c| c.name == "时长" && c.status == CheckStatus::Fail)
-        && let Some((actual, target)) = parse_duration_values(&dur_check.detail)
-        && actual > 0.0
-    {
+        .and_then(|check| parse_duration_values(&check.detail));
+    if let Some((actual, target)) = duration_values.filter(|(actual, _)| *actual > 0.0) {
         let tempo_multiplier = actual / target;
         let _ = writeln!(
             msg,
@@ -697,6 +918,19 @@ mod tests {
         assert!(default_position < project_position);
         assert!(project_position < current_position);
         assert!(message.ends_with("创作完整器乐作品"));
+    }
+
+    #[test]
+    fn creation_mode_describes_form_without_implying_duration() {
+        let full = CreationMode::FullPiece.description();
+        let improv = CreationMode::Improvisation.description();
+
+        assert!(full.contains("结构完整"));
+        assert!(improv.contains("自由发展"));
+        assert!(full.contains("不预设时长"));
+        assert!(improv.contains("不预设时长"));
+        assert!(!full.contains("分钟"));
+        assert!(!improv.contains("分钟"));
     }
 
     #[tokio::test]

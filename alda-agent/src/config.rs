@@ -1,69 +1,175 @@
-use crate::deepseek::ThinkingOptions;
-use std::fs;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
-#[derive(Debug)]
-pub struct Config {
-    pub api_key: String,
-    pub base_url: String,
-    pub model: String,
-    pub thinking: ThinkingOptions,
+const MODEL_CONFIG_FILE: &str = "model.json";
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelConfig {
+    model: String,
+    base_url: String,
+    api_key: String,
 }
 
-impl Config {
-    /// 从 `../.env` 读取配置。缺失字段返回错误。
-    pub fn from_env_file() -> anyhow::Result<Self> {
-        let env_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join(".env");
-        Self::from_file(&env_path)
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedModelConfig {
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for ModelConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelConfig")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.has_api_key().then_some("<redacted>"))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ResolvedModelConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedModelConfig")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ModelConfig {
+    pub fn load(project_root: &Path) -> Result<Self> {
+        let path = project_root.join(MODEL_CONFIG_FILE);
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("无法读取项目模型配置 {}", path.display()))?;
+        let config: Self = serde_json::from_str(&content)
+            .with_context(|| format!("无法解析项目模型配置 {}", path.display()))?;
+        config.validate_present_values()?;
+        Ok(config)
     }
 
-    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-        let content = fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("无法读取 .env 文件 ({}): {}", path.display(), e))?;
+    pub fn save(&self, project_root: &Path) -> Result<()> {
+        self.validate_present_values()?;
+        let contents = serde_json::to_vec_pretty(self).context("无法序列化项目模型配置")?;
+        write_private_atomic(&project_root.join(MODEL_CONFIG_FILE), &contents)
+    }
 
-        let mut api_key = None;
-        let mut base_url = None;
-        let mut model = None;
-        let mut thinking = None;
-        let mut reasoning_effort = None;
+    pub fn set_model(&mut self, value: &str) -> Result<()> {
+        self.model = required(value, "模型名称")?;
+        Ok(())
+    }
 
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim().trim_matches('"').trim_matches('\'');
-                match key {
-                    "ALDA_AGENT_API_KEY" => api_key = Some(value.to_string()),
-                    "ALDA_AGENT_BASE_URL" => base_url = Some(value.to_string()),
-                    "ALDA_AGENT_MODEL" => model = Some(value.to_string()),
-                    "ALDA_AGENT_THINKING" => thinking = Some(value.to_string()),
-                    "ALDA_AGENT_REASONING_EFFORT" => reasoning_effort = Some(value.to_string()),
-                    _ => {}
-                }
-            }
+    pub fn set_base_url(&mut self, value: &str) -> Result<()> {
+        let value = required(value, "模型 URL")?;
+        validate_base_url(&value)?;
+        self.base_url = value;
+        Ok(())
+    }
+
+    pub fn set_api_key(&mut self, value: &str) -> Result<()> {
+        self.api_key = required(value, "模型密钥")?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        (!self.model.is_empty()).then_some(self.model.as_str())
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        (!self.base_url.is_empty()).then_some(self.base_url.as_str())
+    }
+
+    #[must_use]
+    pub fn has_api_key(&self) -> bool {
+        !self.api_key.is_empty()
+    }
+
+    pub fn resolve(&self) -> Result<ResolvedModelConfig> {
+        let mut missing = Vec::new();
+        if self.model.is_empty() {
+            missing.push("model");
         }
-
-        let required = |value: Option<String>, key: &str| {
-            value
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!(".env 中缺少或未填写 {key}"))
-        };
-
-        let thinking =
-            ThinkingOptions::from_config(thinking.as_deref(), reasoning_effort.as_deref())?;
-
-        Ok(Config {
-            api_key: required(api_key, "ALDA_AGENT_API_KEY")?,
-            base_url: required(base_url, "ALDA_AGENT_BASE_URL")?,
-            model: required(model, "ALDA_AGENT_MODEL")?,
-            thinking,
+        if self.base_url.is_empty() {
+            missing.push("url");
+        }
+        if self.api_key.is_empty() {
+            missing.push("key");
+        }
+        if !missing.is_empty() {
+            bail!("项目模型配置不完整：缺少 {}", missing.join("、"));
+        }
+        Ok(ResolvedModelConfig {
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
         })
     }
+
+    fn validate_present_values(&self) -> Result<()> {
+        if !self.base_url.is_empty() {
+            validate_base_url(&self.base_url)?;
+        }
+        if self.model.trim() != self.model || self.api_key.trim() != self.api_key {
+            bail!("项目模型配置包含未规范化的首尾空白");
+        }
+        Ok(())
+    }
+}
+
+fn required(value: &str, name: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{name}不能为空");
+    }
+    Ok(value.to_string())
+}
+
+fn validate_base_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).context("模型 URL 无效")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("模型 URL 必须是包含主机名的 http 或 https 地址");
+    }
+    Ok(())
+}
+
+fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("无效文件路径：{}", path.display()))?
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("无法创建临时配置 {}", temporary.display()))?;
+        file.write_all(contents).context("无法写入项目模型配置")?;
+        file.sync_all().context("无法同步项目模型配置")?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("无法更新项目模型配置 {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -71,131 +177,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_fields_are_required() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join(".env");
-        fs::write(&env_path, "ALDA_AGENT_API_KEY=sk-test-key\n").unwrap();
-        let error = Config::from_file(&env_path).unwrap_err();
-        assert!(error.to_string().contains("ALDA_AGENT_BASE_URL"));
-    }
-
-    #[test]
-    fn test_parse_full_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join(".env");
-        fs::write(
-            &env_path,
-            "ALDA_AGENT_API_KEY=sk-abc\nALDA_AGENT_BASE_URL=https://api.example.com\nALDA_AGENT_MODEL=example-model\nALDA_AGENT_THINKING=enabled\nALDA_AGENT_REASONING_EFFORT=low\n",
-        )
-        .unwrap();
-        let config = Config::from_file(&env_path).unwrap();
-        assert_eq!(config.api_key, "sk-abc");
-        assert_eq!(config.base_url, "https://api.example.com");
-        assert_eq!(config.model, "example-model");
-        assert_eq!(config.thinking.mode(), "enabled");
-        assert_eq!(config.thinking.reasoning_effort(), Some("low"));
-    }
-
-    #[test]
-    fn test_parse_with_quotes_and_comments() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join(".env");
-        fs::write(
-            &env_path,
-            "# 注释行\nALDA_AGENT_API_KEY=\"sk-quoted\"\n\nALDA_AGENT_BASE_URL='https://api.quoted.com'\nALDA_AGENT_MODEL='example-model'\n",
-        )
-        .unwrap();
-        let config = Config::from_file(&env_path).unwrap();
-        assert_eq!(config.api_key, "sk-quoted");
-        assert_eq!(config.base_url, "https://api.quoted.com");
-        assert_eq!(config.model, "example-model");
-        assert_eq!(config.thinking.mode(), "disabled");
-        assert_eq!(config.thinking.reasoning_effort(), None);
-    }
-
-    #[test]
-    fn test_missing_api_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join(".env");
-        fs::write(
-            &env_path,
-            "ALDA_AGENT_BASE_URL=https://api.example.com\nALDA_AGENT_MODEL=example-model\n",
-        )
-        .unwrap();
-        let result = Config::from_file(&env_path);
-        assert!(result.is_err());
+    fn partial_configuration_persists_and_resolves_only_when_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ModelConfig::default();
+        config.set_model("example-model").unwrap();
+        config.save(directory.path()).unwrap();
         assert!(
-            result
+            config
+                .resolve()
                 .unwrap_err()
                 .to_string()
-                .contains("ALDA_AGENT_API_KEY")
+                .contains("url、key")
         );
+
+        let mut loaded = ModelConfig::load(directory.path()).unwrap();
+        loaded.set_base_url("https://api.example.com/v1").unwrap();
+        loaded.set_api_key("secret-test-value").unwrap();
+        loaded.save(directory.path()).unwrap();
+
+        let resolved = ModelConfig::load(directory.path())
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(resolved.model, "example-model");
+        assert_eq!(resolved.base_url, "https://api.example.com/v1");
+        assert_eq!(resolved.api_key, "secret-test-value");
     }
 
     #[test]
-    fn test_empty_model_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join(".env");
-        fs::write(
-            &env_path,
-            "ALDA_AGENT_API_KEY=test-key\nALDA_AGENT_BASE_URL=https://api.example.com\nALDA_AGENT_MODEL=\n",
-        )
-        .unwrap();
+    fn invalid_urls_are_rejected_without_changing_config() {
+        let mut config = ModelConfig::default();
+        assert!(config.set_base_url("file:///tmp/model").is_err());
+        assert_eq!(config.base_url(), None);
+    }
 
-        let error = Config::from_file(&env_path).unwrap_err();
-        assert!(error.to_string().contains("ALDA_AGENT_MODEL"));
+    #[cfg(unix)]
+    #[test]
+    fn persisted_model_config_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ModelConfig::default();
+        config.set_api_key("secret-test-value").unwrap();
+        config.save(directory.path()).unwrap();
+        let mode = fs::metadata(directory.path().join(MODEL_CONFIG_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
-    fn legacy_aliases_are_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join(".env");
-        fs::write(
-            &env_path,
-            "api-key=test-key\nbase_url=https://api.example.com\nmodel=example-model\n",
-        )
-        .unwrap();
+    fn debug_output_redacts_api_key() {
+        let mut config = ModelConfig::default();
+        config.set_model("example-model").unwrap();
+        config.set_base_url("https://api.example.com").unwrap();
+        config.set_api_key("secret-test-value").unwrap();
 
-        let error = Config::from_file(&env_path).unwrap_err();
-        assert!(error.to_string().contains("ALDA_AGENT_API_KEY"));
-    }
-
-    #[test]
-    fn invalid_thinking_settings_are_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join(".env");
-        let required = "ALDA_AGENT_API_KEY=test-key\nALDA_AGENT_BASE_URL=https://api.example.com\nALDA_AGENT_MODEL=example-model\n";
-
-        fs::write(&env_path, format!("{required}ALDA_AGENT_THINKING=maybe\n")).unwrap();
-        assert!(
-            Config::from_file(&env_path)
-                .unwrap_err()
-                .to_string()
-                .contains("ALDA_AGENT_THINKING")
-        );
-
-        fs::write(
-            &env_path,
-            format!("{required}ALDA_AGENT_THINKING=disabled\nALDA_AGENT_REASONING_EFFORT=low\n"),
-        )
-        .unwrap();
-        assert!(
-            Config::from_file(&env_path)
-                .unwrap_err()
-                .to_string()
-                .contains("不能设置")
-        );
-
-        fs::write(
-            &env_path,
-            format!("{required}ALDA_AGENT_THINKING=enabled\nALDA_AGENT_REASONING_EFFORT=extreme\n"),
-        )
-        .unwrap();
-        assert!(
-            Config::from_file(&env_path)
-                .unwrap_err()
-                .to_string()
-                .contains("ALDA_AGENT_REASONING_EFFORT")
-        );
+        let unresolved_debug = format!("{config:?}");
+        let resolved_debug = format!("{:?}", config.resolve().unwrap());
+        assert!(!unresolved_debug.contains("secret-test-value"));
+        assert!(!resolved_debug.contains("secret-test-value"));
+        assert!(unresolved_debug.contains("<redacted>"));
+        assert!(resolved_debug.contains("<redacted>"));
     }
 }

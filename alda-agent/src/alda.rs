@@ -4,7 +4,10 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -51,14 +54,14 @@ pub struct ScoreInfo {
 }
 
 /// 检查项结果
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AldaCheck {
     pub name: &'static str,
     pub status: CheckStatus,
     pub detail: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckStatus {
     Pass,
     Fail,
@@ -79,13 +82,26 @@ impl std::fmt::Display for CheckStatus {
 // Alda 命令执行器
 // ============================================================
 
-static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Clone)]
 pub struct AldaRunner {
     alda_path: PathBuf,
     timeout: Duration,
     max_output_bytes: usize,
+    cancellation: CancellationToken,
 }
 
 struct CapturedOutput {
@@ -103,7 +119,14 @@ impl AldaRunner {
             alda_path,
             timeout: Duration::from_secs(60),
             max_output_bytes: 10 * 1024 * 1024, // 10MB
+            cancellation: CancellationToken::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     #[must_use]
@@ -378,7 +401,7 @@ impl AldaRunner {
         duration_tolerance_pct: f64,
     ) -> Result<Vec<AldaCheck>> {
         let runner = self.clone();
-        tokio::task::spawn_blocking(move || {
+        let checks = tokio::task::spawn_blocking(move || {
             runner.validate(
                 &score_path,
                 &included_instruments,
@@ -388,7 +411,36 @@ impl AldaRunner {
             )
         })
         .await
-        .context("Alda 校验任务异常退出")
+        .context("Alda 校验任务异常退出")?;
+        if self.cancellation.is_cancelled() {
+            bail!("Alda 校验已由用户取消，子进程已终止");
+        }
+        Ok(checks)
+    }
+
+    pub async fn play_async(&self, score_path: PathBuf) -> Result<()> {
+        let runner = self.clone();
+        tokio::task::spawn_blocking(move || runner.play(&score_path))
+            .await
+            .context("Alda 播放任务异常退出")?
+    }
+
+    pub async fn stop_async(&self) -> Result<()> {
+        let runner = self.clone();
+        tokio::task::spawn_blocking(move || runner.stop())
+            .await
+            .context("Alda 停止任务异常退出")?
+    }
+
+    pub async fn export_midi_async(
+        &self,
+        score_path: PathBuf,
+        output_path: PathBuf,
+    ) -> Result<PathBuf> {
+        let runner = self.clone();
+        tokio::task::spawn_blocking(move || runner.export_midi(&score_path, &output_path))
+            .await
+            .context("Alda 导出任务异常退出")?
     }
 
     // ============================================================
@@ -452,7 +504,7 @@ impl AldaRunner {
             if let Some(status) = child.try_wait().context("无法等待 alda 子进程")? {
                 break status;
             }
-            if CANCELLATION_REQUESTED.load(Ordering::SeqCst) {
+            if self.cancellation.is_cancelled() {
                 terminate_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
@@ -485,14 +537,6 @@ impl AldaRunner {
             stderr,
         })
     }
-}
-
-pub fn reset_cancellation() {
-    CANCELLATION_REQUESTED.store(false, Ordering::SeqCst);
-}
-
-pub fn request_cancellation() {
-    CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 fn terminate_process_group(process_id: u32) {
@@ -747,6 +791,22 @@ fi
         let runner = runner.with_limits(Duration::from_millis(50), 1024);
         let error = runner.parse(&fixture("slow.alda")).unwrap_err();
         assert!(error.to_string().contains("超时"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_async_validation_returns_an_error() {
+        let (_directory, runner) = runner();
+        let cancellation = CancellationToken::default();
+        let runner = runner.with_cancellation(cancellation.clone());
+        let task = tokio::spawn(async move {
+            runner
+                .validate_async(fixture("slow.alda"), Vec::new(), Vec::new(), None, 10.0)
+                .await
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        cancellation.cancel();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("取消"));
     }
 
     #[test]

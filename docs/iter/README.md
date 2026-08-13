@@ -5,3 +5,6 @@ description：首期需求范围、完成状态、验证证据、真实验收结
 
 [CLI 交互体验改进方案](cli-ergonomics/README.md)
 description：增强型滚动 REPL、项目与对话双视图、能力解耦、实现边界和验收标准。
+
+[项目级模型配置](project-model-config/README.md)
+description：模型名称、URL 与密钥的项目内持久化、安全输入及 Shell 入口复用规则。

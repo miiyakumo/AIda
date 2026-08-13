@@ -1,5 +1,5 @@
 use crate::alda::{AldaCheck, CheckStatus};
-use crate::deepseek::Message;
+use crate::conversation::{Conversation, ConversationMessage, ConversationState};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -38,9 +38,6 @@ pub struct VersionMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub project_name: String,
-    pub source_material: String,
-    pub requirements: Vec<String>,
-    pub interpretation: String,
     creative_strategy: String,
     mode: String,
     target_duration_secs: Option<f64>,
@@ -48,7 +45,7 @@ pub struct Project {
     excluded_instruments: Vec<String>,
     current_version: u32,
     versions: BTreeMap<u32, VersionMeta>,
-    pub conversation: Vec<Message>,
+    conversation: Conversation,
     #[serde(skip)]
     root: PathBuf,
 }
@@ -57,7 +54,7 @@ impl Project {
     pub fn load_or_create(
         root: PathBuf,
         project_name: &str,
-        source_material: &str,
+        _initial_content: &str,
     ) -> Result<Self> {
         ensure_safe_project_name(project_name)?;
         let project_file = root.join(PROJECT_FILE);
@@ -75,9 +72,6 @@ impl Project {
         fs::create_dir_all(root.join("exports")).context("无法创建 exports 目录")?;
         let project = Self {
             project_name: project_name.to_string(),
-            source_material: source_material.to_string(),
-            requirements: Vec::new(),
-            interpretation: String::new(),
             creative_strategy: String::new(),
             mode: "full".to_string(),
             target_duration_secs: None,
@@ -85,7 +79,7 @@ impl Project {
             excluded_instruments: Vec::new(),
             current_version: 0,
             versions: BTreeMap::new(),
-            conversation: Vec::new(),
+            conversation: Conversation::default(),
             root,
         };
         project.write_metadata()?;
@@ -130,6 +124,39 @@ impl Project {
     #[must_use]
     pub fn creative_strategy(&self) -> &str {
         &self.creative_strategy
+    }
+
+    #[must_use]
+    pub fn conversation(&self) -> &Conversation {
+        &self.conversation
+    }
+
+    pub fn add_user_message(&mut self, content: &str) -> Result<()> {
+        if content.trim().is_empty() {
+            bail!("对话消息不能为空");
+        }
+        self.conversation.add_user_message(content.to_string());
+        self.write_metadata()
+    }
+
+    pub fn finish_agent_turn(
+        &mut self,
+        assistant_text: String,
+        state: ConversationState,
+    ) -> Result<()> {
+        self.conversation.add_assistant_message(assistant_text);
+        self.conversation.set_state(state);
+        self.write_metadata()
+    }
+
+    pub fn replace_conversation(
+        &mut self,
+        messages: Vec<ConversationMessage>,
+        state: ConversationState,
+    ) -> Result<()> {
+        self.conversation.replace_messages(messages);
+        self.conversation.set_state(state);
+        self.write_metadata()
     }
 
     pub fn set_creative_strategy(&mut self, strategy: &str) -> Result<()> {
@@ -244,32 +271,18 @@ impl Project {
         self.write_metadata()
     }
 
-    pub fn update_context(
-        &mut self,
-        interpretation: String,
-        conversation: Vec<Message>,
-    ) -> Result<()> {
-        self.interpretation = interpretation;
-        self.conversation = conversation;
-        self.write_metadata()
-    }
-
-    pub fn record_requirement(&mut self, requirement: String) -> Result<()> {
-        if !requirement.trim().is_empty() {
-            self.requirements.push(requirement);
-            self.write_metadata()?;
-        }
-        Ok(())
-    }
-
-    pub fn export_alda(&self) -> Result<PathBuf> {
-        let code = self.version_code(self.current_version)?;
+    pub fn export_alda_version(&self, version: u32) -> Result<PathBuf> {
+        let code = self.version_code(version)?;
         let path = self
             .root
             .join("exports")
-            .join(format!("version-{:04}.alda", self.current_version));
+            .join(format!("version-{version:04}.alda"));
         write_atomic(&path, code.as_bytes())?;
         Ok(path)
+    }
+
+    pub fn export_alda(&self) -> Result<PathBuf> {
+        self.export_alda_version(self.current_version)
     }
 
     pub fn midi_export_path(&self) -> Result<PathBuf> {
@@ -282,6 +295,23 @@ impl Project {
             .join(format!("version-{:04}.mid", self.current_version)))
     }
 
+    pub fn midi_export_path_for(&self, version: u32) -> Result<PathBuf> {
+        if !self.versions.contains_key(&version) {
+            bail!("版本 {version} 不存在");
+        }
+        Ok(self
+            .root
+            .join("exports")
+            .join(format!("version-{version:04}.mid")))
+    }
+
+    pub fn version_path_for(&self, version: u32) -> Result<PathBuf> {
+        if !self.versions.contains_key(&version) {
+            bail!("版本 {version} 不存在");
+        }
+        Ok(self.version_path(version))
+    }
+
     fn version_path(&self, version: u32) -> PathBuf {
         self.root
             .join("versions")
@@ -291,6 +321,7 @@ impl Project {
     fn validate_metadata(&self) -> Result<()> {
         ensure_safe_project_name(&self.project_name)?;
         self.validate_settings()?;
+        self.conversation.validate()?;
         if self.current_version == 0 {
             if !self.versions.is_empty() {
                 bail!("project.json 损坏：存在历史版本但当前版本为 0");
@@ -532,7 +563,7 @@ mod tests {
         assert!(Project::load_or_create(directory.path().join("x"), "../x", "").is_err());
         fs::write(
             directory.path().join(PROJECT_FILE),
-            r#"{"project_name":"test","source_material":"","requirements":[],"interpretation":"","mode":"full","target_duration_secs":null,"included_instruments":[],"excluded_instruments":[],"current_version":1,"versions":{},"conversation":[]}"#,
+            r#"{"project_name":"test","creative_strategy":"","mode":"full","target_duration_secs":null,"included_instruments":[],"excluded_instruments":[],"current_version":1,"versions":{},"conversation":{"messages":[],"state":"ready"}}"#,
         )
         .unwrap();
         assert!(Project::load_or_create(directory.path().to_path_buf(), "test", "").is_err());

@@ -1,5 +1,7 @@
+use alda_agent::agent::from_provider_messages;
 use alda_agent::agent::{Agent, CreationMode, CreationRequest, ModifyRequest};
 use alda_agent::alda::AldaRunner;
+use alda_agent::conversation::ConversationState;
 use alda_agent::deepseek::DeepSeekClient;
 use alda_agent::project::Project;
 use std::fs;
@@ -127,13 +129,16 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
         1
     );
     project
-        .update_context(creation.interpretation, creation.conversation)
+        .replace_conversation(
+            from_provider_messages(creation.conversation),
+            ConversationState::Ready,
+        )
         .unwrap();
 
     let feedback = "让中段更冰冷、更机械，结尾的加速和明亮感更强";
     let modification = agent
         .modify(ModifyRequest {
-            source_material: project.source_material.clone(),
+            source_material: source.to_string(),
             current_alda: project.version_code(1).unwrap(),
             feedback: feedback.to_string(),
             creative_strategy: String::new(),
@@ -157,7 +162,10 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
         2
     );
     project
-        .update_context(modification.interpretation, modification.conversation)
+        .replace_conversation(
+            from_provider_messages(modification.conversation),
+            ConversationState::Ready,
+        )
         .unwrap();
 
     project.restore_version(1).unwrap();
@@ -175,7 +183,7 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
     let restarted = Project::load_or_create(root, "ignored", "ignored").unwrap();
     assert_eq!(restarted.current_version(), 2);
     assert_eq!(restarted.versions().len(), 2);
-    assert_eq!(restarted.source_material, source);
+    assert!(!restarted.conversation().messages().is_empty());
     let metadata = fs::read_to_string(restarted.root().join("project.json")).unwrap();
     assert!(!metadata.contains("secret-test-value"));
 }
