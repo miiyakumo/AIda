@@ -65,6 +65,7 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
         Ok(history) => editor = editor.with_history(Box::new(history)),
         Err(error) => eprintln!("! 无法加载项目输入历史，将使用会话内历史：{error}"),
     }
+    let mut basic_input = false;
     loop {
         let project = application.project_view();
         if let Ok(mut candidates) = versions.write() {
@@ -76,7 +77,21 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
         }
         let conversation = application.conversation_view();
         let prompt = InputPrompt::active(&project, &conversation.next_step);
-        match editor.read_line(&prompt) {
+        let signal = if basic_input {
+            read_basic_terminal_line(&prompt)
+        } else {
+            match editor.read_line(&prompt) {
+                Err(error) if is_cursor_position_timeout(&error) => {
+                    basic_input = true;
+                    eprintln!(
+                        "\n! 当前终端未响应光标位置查询，已切换到基础输入模式；当前会话和生成结果不受影响。"
+                    );
+                    read_basic_terminal_line(&prompt)
+                }
+                result => result.map_err(anyhow::Error::from),
+            }
+        };
+        match signal {
             Ok(Signal::Success(line)) => {
                 if !execute_line(application, &line, &mut TerminalReporter::new(true)).await? {
                     break;
@@ -89,6 +104,32 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
         }
     }
     Ok(())
+}
+
+fn is_cursor_position_timeout(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Other
+        && error.to_string() == "The cursor position could not be read within a normal duration"
+}
+
+fn read_basic_terminal_line(prompt: &InputPrompt) -> Result<Signal> {
+    let mut output = std::io::stdout().lock();
+    write!(
+        output,
+        "{}{}",
+        prompt.render_prompt_left(),
+        prompt.render_prompt_indicator(PromptEditMode::Default)
+    )?;
+    output.flush()?;
+    drop(output);
+
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        return Ok(Signal::CtrlD);
+    }
+    while matches!(line.chars().last(), Some('\n' | '\r')) {
+        line.pop();
+    }
+    Ok(Signal::Success(line))
 }
 
 #[derive(Clone)]

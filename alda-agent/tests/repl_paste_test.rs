@@ -10,6 +10,7 @@ struct PtyProcess {
     output: mpsc::Receiver<Vec<u8>>,
     transcript: Vec<u8>,
     answered_cursor_queries: usize,
+    cursor_query_limit: Option<usize>,
 }
 
 impl PtyProcess {
@@ -18,6 +19,15 @@ impl PtyProcess {
     }
 
     fn spawn_with_size(project: &std::path::Path, rows: u16, cols: u16) -> Self {
+        Self::spawn_with_cursor_query_limit(project, rows, cols, None)
+    }
+
+    fn spawn_with_cursor_query_limit(
+        project: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        cursor_query_limit: Option<usize>,
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -54,6 +64,7 @@ impl PtyProcess {
             output,
             transcript: Vec::new(),
             answered_cursor_queries: 0,
+            cursor_query_limit,
         }
     }
 
@@ -77,7 +88,11 @@ impl PtyProcess {
                         .windows(4)
                         .filter(|window| *window == b"\x1b[6n")
                         .count();
-                    while self.answered_cursor_queries < queries {
+                    while self.answered_cursor_queries < queries
+                        && self
+                            .cursor_query_limit
+                            .is_none_or(|limit| self.answered_cursor_queries < limit)
+                    {
                         self.send(b"\x1b[1;1R");
                         self.answered_cursor_queries += 1;
                     }
@@ -180,4 +195,19 @@ fn narrow_terminal_keeps_project_status_and_input_markers() {
     process.wait_for("项目 · narrow-project".as_bytes());
     process.wait_for("状态 · 仅本地".as_bytes());
     process.wait_for("› ".as_bytes());
+}
+
+#[test]
+fn cursor_query_timeout_falls_back_without_ending_the_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("cursor-timeout-project");
+    let mut process = PtyProcess::spawn_with_cursor_query_limit(&project, 30, 100, Some(1));
+    process.wait_for("› ".as_bytes());
+
+    process.send(b"/project\r");
+    process.wait_for("项目：cursor-timeout-project".as_bytes());
+    process.wait_for("已切换到基础输入模式".as_bytes());
+    process.send(b"/help\n");
+    process.wait_for("自然语言输入".as_bytes());
+    process.send(b"/quit\n");
 }

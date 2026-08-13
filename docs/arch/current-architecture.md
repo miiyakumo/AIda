@@ -77,6 +77,9 @@ TTY 使用 reedline 0.49，并显式启用 bracketed paste，使多行粘贴先�
 一条请求提交；同时支持多行输入、项目级 500 条历史和 Tab 补全。Alt+Enter、
 Shift+Enter 插入换行，普通 Enter 提交。非 TTY 使用逐行纯文本适配器，不输出控制序列或动画。
 indicatif 0.18 只负责 TTY 活动指示；所有阶段和结果仍是稳定的语义事件与文本。
+reedline 每轮输入前会查询终端光标位置；如果终端没有响应并触发该查询超时，TTY 适配器会在当前会话
+内切换为基础逐行输入，而不是终止进程。此降级只失去多行编辑、历史导航和补全，不影响项目状态、
+working score 或后续命令执行；其他 reedline I/O 错误仍作为真实故障返回。
 
 TTY 的活动输入块分为 `项目 ·`、`状态 ·` 和 `›` 三层。项目行来自 `ProjectView`，状态行来自
 `ConversationView::next_step`，输入和多行续行分别使用 `›`、`·` 标记。reedline transient prompt 在提交
