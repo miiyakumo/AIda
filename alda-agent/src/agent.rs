@@ -16,22 +16,30 @@ const DEFAULT_CREATIVE_STRATEGY: &str = include_str!("../prompts/default-creativ
 // 工具定义
 // ============================================================
 
-fn submit_alda_tool() -> Tool {
+fn submit_result_tool() -> Tool {
     Tool {
         ty: "function".to_string(),
         function: FunctionDef {
-            name: "submit_alda".to_string(),
-            description: "提交一段 Alda 乐谱代码以供校验。校验通过后才能成为有效作品。".to_string(),
+            name: "submit_result".to_string(),
+            description: "明确提交普通回答、澄清、创作计划、草稿或完整候选。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["answer", "clarification", "plan", "draft", "candidate"]
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "回答、澄清或计划正文；乐谱结果的简短说明"
+                    },
                     "alda_code": {
                         "type": "string",
-                        "description": "完整且紧凑的 Alda 乐谱代码；复用材料时使用变量，禁止逐字展开重复段落",
+                        "description": "draft 或 candidate 的紧凑 Alda 乐谱代码",
                         "maxLength": crate::deepseek::MAX_TOOL_ARGUMENT_BYTES
                     }
                 },
-                "required": ["alda_code"]
+                "required": ["kind", "message"]
             }),
         },
     }
@@ -91,6 +99,8 @@ pub struct CreationResult {
     pub success: bool,
     /// 模型提出澄清问题，尚未生成候选
     pub needs_input: bool,
+    /// 模型显式声明的结果类型
+    pub kind: AgentResultKind,
     /// 最后一轮的检查结果
     pub checks: Vec<AldaCheck>,
     /// 通过时的 Alda 源码
@@ -101,6 +111,15 @@ pub struct CreationResult {
     pub was_truncated: bool,
     /// 仅用于当前自动修正或澄清往返；新的修改请求会重建干净上下文
     pub conversation: Vec<Message>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentResultKind {
+    Answer,
+    Clarification,
+    Plan,
+    Draft,
+    Candidate,
 }
 
 pub struct ModifyRequest {
@@ -126,6 +145,7 @@ pub struct ContinueRequest {
 pub struct ProjectPromptRequest {
     pub conversation: Vec<ConversationMessage>,
     pub current_alda: Option<String>,
+    pub working_alda: Option<String>,
     pub creative_strategy: String,
     pub mode: CreationMode,
     pub target_duration_secs: Option<f64>,
@@ -406,6 +426,7 @@ impl Agent {
         let mut last_alda_code: Option<String> = None;
         let mut last_checks: Vec<AldaCheck> = Vec::new();
         let mut last_was_truncated = false;
+        let mut score_kind: Option<AgentResultKind> = None;
 
         for round in 0..max_rounds {
             reporter.report(AgentEvent::RoundStarted {
@@ -413,7 +434,7 @@ impl Agent {
                 max_rounds,
             });
             let mut was_truncated = false;
-            let tools = vec![submit_alda_tool()];
+            let tools = vec![submit_result_tool()];
 
             let events = self
                 .client
@@ -437,7 +458,7 @@ impl Agent {
                         name,
                         arguments,
                     } => {
-                        if name == "submit_alda" {
+                        if name == "submit_result" {
                             tool_call_args = Some((id.clone(), name.clone(), arguments.clone()));
                         }
                     }
@@ -449,31 +470,50 @@ impl Agent {
                 }
             }
 
-            // 检查是否有工具调用
             let Some((tool_id, _, tool_args)) = tool_call_args else {
-                if round_text.trim().is_empty() {
-                    bail!("模型既未提交 Alda 乐谱，也未返回可显示的澄清问题");
-                }
+                bail!("模型未通过 submit_result 明确返回结果类型");
+            };
+
+            let submitted = parse_submitted_result(&tool_args)?;
+            if round_text.trim().is_empty() {
+                reporter.report(AgentEvent::ModelText(submitted.message.clone()));
+            }
+            if matches!(
+                submitted.kind,
+                AgentResultKind::Answer | AgentResultKind::Clarification | AgentResultKind::Plan
+            ) {
                 messages.push(Message {
                     role: "assistant".to_string(),
-                    content: Some(round_text),
+                    content: Some(submitted.message.clone()),
                     tool_calls: None,
                     tool_call_id: None,
                 });
                 return Ok(CreationResult {
                     rounds: round + 1,
                     success: false,
-                    needs_input: true,
+                    needs_input: submitted.kind == AgentResultKind::Clarification,
+                    kind: submitted.kind,
                     checks: Vec::new(),
                     alda_code: None,
-                    interpretation,
+                    interpretation: submitted.message,
                     was_truncated,
                     conversation: messages,
                 });
-            };
+            }
 
-            // 解析 alda_code
-            let alda_code = parse_alda_code_from_args(&tool_args)?;
+            if let Some(previous) = score_kind {
+                if previous != submitted.kind {
+                    bail!(
+                        "自动修正不能把结果类型从 {previous:?} 改为 {:?}",
+                        submitted.kind
+                    );
+                }
+            }
+            score_kind = Some(submitted.kind);
+
+            let alda_code = submitted
+                .alda_code
+                .context("草稿或完整候选缺少 alda_code")?;
 
             // 写入临时文件并校验
             let tmp_dir = tempfile::tempdir().context("创建临时目录失败")?;
@@ -491,7 +531,11 @@ impl Agent {
                     tmp_score,
                     validation.included_instruments.clone(),
                     validation.excluded_instruments.clone(),
-                    validation.target_duration_ms,
+                    if submitted.kind == AgentResultKind::Candidate {
+                        validation.target_duration_ms
+                    } else {
+                        None
+                    },
                     10.0,
                 )
                 .await?;
@@ -522,7 +566,7 @@ impl Agent {
                     id: tool_call_id.clone(),
                     ty: "function".to_string(),
                     function: crate::deepseek::FunctionCallArgs {
-                        name: "submit_alda".to_string(),
+                        name: "submit_result".to_string(),
                         arguments: tool_args,
                     },
                 }]),
@@ -540,6 +584,7 @@ impl Agent {
                     rounds: round + 1,
                     success: true,
                     needs_input: false,
+                    kind: submitted.kind,
                     checks,
                     alda_code: Some(alda_code),
                     interpretation,
@@ -562,6 +607,7 @@ impl Agent {
             rounds: max_rounds,
             success: false,
             needs_input: false,
+            kind: score_kind.unwrap_or(AgentResultKind::Candidate),
             checks: last_checks,
             alda_code: last_alda_code,
             interpretation,
@@ -669,7 +715,10 @@ fn build_project_context(request: &ProjectPromptRequest) -> String {
             request.excluded_instruments.join("、")
         );
     }
-    if let Some(score) = &request.current_alda {
+    if let Some(score) = &request.working_alda {
+        message.push_str("\n【当前工作 Alda｜优先继续发展】\n");
+        message.push_str(score);
+    } else if let Some(score) = &request.current_alda {
         message.push_str("\n【当前有效 Alda】\n");
         message.push_str(score);
     } else {
@@ -728,13 +777,38 @@ fn append_strategy_context(msg: &mut String, project_strategy: &str) {
     }
 }
 
-fn parse_alda_code_from_args(args: &str) -> Result<String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(args).context("无法解析 submit_alda 参数")?;
+struct SubmittedResult {
+    kind: AgentResultKind,
+    message: String,
+    alda_code: Option<String>,
+}
 
-    let code = parsed["alda_code"]
+fn parse_submitted_result(args: &str) -> Result<SubmittedResult> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(args).context("无法解析 submit_result 参数")?;
+    let kind = match parsed["kind"].as_str() {
+        Some("answer") => AgentResultKind::Answer,
+        Some("clarification") => AgentResultKind::Clarification,
+        Some("plan") => AgentResultKind::Plan,
+        Some("draft") => AgentResultKind::Draft,
+        Some("candidate") => AgentResultKind::Candidate,
+        _ => bail!("submit_result.kind 无效"),
+    };
+    let message = parsed["message"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("alda_code 字段缺失或不是字符串"))?;
+        .ok_or_else(|| anyhow::anyhow!("message 字段缺失或不是字符串"))?
+        .trim()
+        .to_string();
+    if message.is_empty() {
+        bail!("submit_result.message 不能为空");
+    }
+    let Some(code) = parsed["alda_code"].as_str() else {
+        return Ok(SubmittedResult {
+            kind,
+            message,
+            alda_code: None,
+        });
+    };
 
     // 去除可能的 Markdown 代码块标记
     let code = code.trim();
@@ -744,7 +818,11 @@ fn parse_alda_code_from_args(args: &str) -> Result<String> {
         .map_or(code, str::trim);
     let code = code.strip_suffix("```").map_or(code, str::trim);
 
-    Ok(code.to_string())
+    Ok(SubmittedResult {
+        kind,
+        message,
+        alda_code: Some(code.to_string()),
+    })
 }
 
 fn build_tool_feedback(checks: &[AldaCheck], _tool_call_id: Option<&str>) -> String {
@@ -754,7 +832,8 @@ fn build_tool_feedback(checks: &[AldaCheck], _tool_call_id: Option<&str>) -> Str
         .collect();
 
     if failures.is_empty() {
-        return "✅ 所有检查通过，作品已保存。".to_string();
+        return "✅ 所有检查通过，工作乐谱可以试听；只有用户明确接受完整候选才会创建版本。"
+            .to_string();
     }
 
     let mut msg = format!(
@@ -772,24 +851,15 @@ fn build_tool_feedback(checks: &[AldaCheck], _tool_call_id: Option<&str>) -> Str
         let _ = writeln!(msg, "{} {}: {}", icon, c.name, c.detail);
     }
 
-    // 时长与 tempo 成反比。优先做确定性的 tempo 比例校准，避免模型反复重写已通过的结构。
+    // 过短通常说明内容或结构不足，不能仅靠降低 tempo 拉伸成完整作品。
     let duration_values = checks
         .iter()
         .find(|c| c.name == "时长" && c.status == CheckStatus::Fail)
         .and_then(|check| parse_duration_values(&check.detail));
     if let Some((actual, target)) = duration_values.filter(|(actual, _)| *actual > 0.0) {
-        let tempo_multiplier = actual / target;
         let _ = writeln!(
             msg,
-            "\n**时长修正指南**: 当前作品约 {actual:.0} 秒，目标 {target:.0} 秒。保持音符、段落和配器不变，只把每个显式 tempo 乘以 **{tempo_multiplier:.3}**。"
-        );
-        let _ = writeln!(
-            msg,
-            "公式：`新 tempo = 旧 tempo × {actual:.0} ÷ {target:.0}`。例如 `(tempo! 120)` 改为 `(tempo! {:.0})`。",
-            120.0 * tempo_multiplier
-        );
-        msg.push_str(
-            "作品过长时提高 tempo，过短时降低 tempo；不要重新规划、增删或展开乐谱内容。\n",
+            "\n**时长修正指南**: 当前作品约 {actual:.0} 秒，目标 {target:.0} 秒。作品过短时补充或发展材料、段落和整体结构；作品过长时优先删减冗余。仅在内容量已经合适且速度明显偏离意图时调整 tempo。"
         );
     }
 
@@ -820,7 +890,12 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn tool_response(code: &str, finish_reason: &str) -> String {
-        let arguments = serde_json::json!({ "alda_code": code }).to_string();
+        let arguments = serde_json::json!({
+            "kind": "candidate",
+            "message": "完整候选",
+            "alda_code": code
+        })
+        .to_string();
         let chunk = serde_json::json!({
             "choices": [{
                 "delta": {
@@ -828,7 +903,7 @@ mod tests {
                     "tool_calls": [{
                         "index": 0,
                         "id": "call_1",
-                        "function": { "name": "submit_alda", "arguments": arguments }
+                        "function": { "name": "submit_result", "arguments": arguments }
                     }]
                 },
                 "finish_reason": finish_reason
@@ -837,11 +912,18 @@ mod tests {
         format!("data: {chunk}\n\ndata: [DONE]\n")
     }
 
-    fn text_response(text: &str) -> String {
+    fn text_response(kind: &str, text: &str) -> String {
+        let arguments = serde_json::json!({ "kind": kind, "message": text }).to_string();
         let chunk = serde_json::json!({
             "choices": [{
-                "delta": { "content": text },
-                "finish_reason": "stop"
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": { "name": "submit_result", "arguments": arguments }
+                    }]
+                },
+                "finish_reason": "tool_calls"
             }]
         });
         format!("data: {chunk}\n\ndata: [DONE]\n")
@@ -907,7 +989,7 @@ mod tests {
 
     #[test]
     fn protocol_and_creative_strategies_have_separate_precedence_layers() {
-        assert!(PROTOCOL_PROMPT.contains("submit_alda"));
+        assert!(PROTOCOL_PROMPT.contains("submit_result"));
         assert!(!PROTOCOL_PROMPT.contains("默认创作策略"));
         assert!(!PROTOCOL_PROMPT.contains("高潮由材料演变"));
 
@@ -936,6 +1018,7 @@ mod tests {
     #[tokio::test]
     async fn modification_starts_with_only_system_and_clean_request() {
         let (base_url, requests) = serve(vec![MockResponse::sse(text_response(
+            "clarification",
             "你希望整体重构还是只调整配器？",
         ))]);
         let client = DeepSeekClient::new(
@@ -982,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn duration_failure_recommends_exact_tempo_scaling() {
+    fn duration_failure_recommends_developing_material() {
         let feedback = build_tool_feedback(
             &[AldaCheck {
                 name: "时长",
@@ -992,9 +1075,9 @@ mod tests {
             None,
         );
 
-        assert!(feedback.contains("乘以 **1.261**"));
-        assert!(feedback.contains("(tempo! 151)"));
-        assert!(feedback.contains("不要重新规划、增删或展开乐谱内容"));
+        assert!(feedback.contains("补充或发展材料"));
+        assert!(feedback.contains("删减冗余"));
+        assert!(!feedback.contains("乘以"));
     }
 
     #[tokio::test]
@@ -1039,8 +1122,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_without_tool_call_is_returned_as_clarification() {
+    async fn explicit_clarification_result_needs_input() {
         let (base_url, _requests) = serve(vec![MockResponse::sse(text_response(
+            "clarification",
             "你指的是哪一个段落？",
         ))]);
         let client = DeepSeekClient::new(

@@ -13,7 +13,7 @@ pub enum UserAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AldaAction {
-    Play(Option<u32>),
+    Play(ScoreTarget),
     Stop,
     Check(ScoreTarget),
     Export {
@@ -25,6 +25,7 @@ pub enum AldaAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScoreTarget {
     Version(Option<u32>),
+    Working,
     File(PathBuf),
 }
 
@@ -41,6 +42,8 @@ pub enum ProjectAction {
     Versions,
     Switch(u32),
     Adopt(PathBuf),
+    Accept,
+    Discard,
     Config(ConfigAction),
 }
 
@@ -59,7 +62,8 @@ pub enum ConfigAction {
 
 pub const TOP_LEVEL_COMMANDS: &[&str] = &["/alda", "/project", "/help", "/quit"];
 pub const ALDA_COMMANDS: &[&str] = &["play", "stop", "check", "export"];
-pub const PROJECT_COMMANDS: &[&str] = &["versions", "switch", "adopt", "config"];
+pub const PROJECT_COMMANDS: &[&str] =
+    &["versions", "switch", "adopt", "accept", "discard", "config"];
 pub const CONFIG_COMMANDS: &[&str] = &[
     "model", "url", "key", "mode", "duration", "include", "exclude", "strategy",
 ];
@@ -86,6 +90,8 @@ pub fn parse(input: &str) -> Result<UserAction> {
         ["/project", "adopt", path] => Ok(UserAction::Project(ProjectAction::Adopt(
             PathBuf::from(path),
         ))),
+        ["/project", "accept"] => Ok(UserAction::Project(ProjectAction::Accept)),
+        ["/project", "discard"] => Ok(UserAction::Project(ProjectAction::Discard)),
         ["/project", "config"] => Ok(UserAction::Project(ProjectAction::Config(
             ConfigAction::Show,
         ))),
@@ -136,14 +142,18 @@ pub fn parse(input: &str) -> Result<UserAction> {
         ["/project", "config", "key", ..] => {
             bail!("不要在命令中输入模型密钥；请只输入 /project config key，再通过隐藏输入设置")
         }
-        ["/alda", "play"] => Ok(UserAction::Alda(AldaAction::Play(None))),
-        ["/alda", "play", version] => Ok(UserAction::Alda(AldaAction::Play(Some(parse_version(
-            version,
-        )?)))),
+        ["/alda", "play"] => Ok(UserAction::Alda(AldaAction::Play(ScoreTarget::Version(
+            None,
+        )))),
+        ["/alda", "play", "work"] => Ok(UserAction::Alda(AldaAction::Play(ScoreTarget::Working))),
+        ["/alda", "play", version] => Ok(UserAction::Alda(AldaAction::Play(ScoreTarget::Version(
+            Some(parse_version(version)?),
+        )))),
         ["/alda", "stop"] => Ok(UserAction::Alda(AldaAction::Stop)),
         ["/alda", "check"] => Ok(UserAction::Alda(AldaAction::Check(ScoreTarget::Version(
             None,
         )))),
+        ["/alda", "check", "work"] => Ok(UserAction::Alda(AldaAction::Check(ScoreTarget::Working))),
         ["/alda", "check", "--file", path] => Ok(UserAction::Alda(AldaAction::Check(
             ScoreTarget::File(PathBuf::from(path)),
         ))),
@@ -207,9 +217,9 @@ fn parse_export(words: &[&str]) -> Result<AldaAction> {
 #[must_use]
 pub fn help(path: &[String]) -> String {
     match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        [] => "自然语言输入用于创作、修改或回答澄清。\n/alda ...     校验、播放、停止和导出\n/project ...  查看版本和修改项目设置\n/help ...     查看分层帮助\n/quit         退出".to_string(),
-        ["alda"] => "/alda play [VERSION]\n/alda stop\n/alda check [VERSION]\n/alda check --file PATH\n/alda export [VERSION] [--format alda|midi|all]".to_string(),
-        ["project"] => "/project\n/project versions\n/project switch VERSION\n/project adopt PATH\n/project config ...".to_string(),
+        [] => "自然语言输入用于讨论、规划和发展工作乐谱。\n/alda ...     校验、播放、停止和导出\n/project ...  接受候选、查看版本和修改设置\n/help ...     查看分层帮助\n/quit         退出".to_string(),
+        ["alda"] => "/alda play [VERSION|work]\n/alda stop\n/alda check [VERSION|work]\n/alda check --file PATH\n/alda export [VERSION] [--format alda|midi|all]".to_string(),
+        ["project"] => "/project\n/project accept\n/project discard\n/project versions\n/project switch VERSION\n/project adopt PATH\n/project config ...".to_string(),
         ["project", "config"] => "/project config\n/project config model NAME\n/project config url URL\n/project config key             # 隐藏输入，不进入历史\n/project config mode full|improv\n/project config duration SECONDS|none\n/project config include INST...|none\n/project config exclude INST...|none\n/project config strategy TEXT|default".to_string(),
         ["alda", "export"] => "用法：/alda export [VERSION] [--format alda|midi|all]\n默认导出当前版本的 Alda 和 MIDI。\n示例：/alda export v2 --format midi".to_string(),
         _ => "没有该帮助主题；输入 /help 查看入口".to_string(),
@@ -223,11 +233,19 @@ mod tests {
     fn parses_grouped_commands_and_rejects_old_ones() {
         assert_eq!(
             parse("/alda play v2").unwrap(),
-            UserAction::Alda(AldaAction::Play(Some(2)))
+            UserAction::Alda(AldaAction::Play(ScoreTarget::Version(Some(2))))
         );
         assert_eq!(
             parse("/project").unwrap(),
             UserAction::Project(ProjectAction::Overview)
+        );
+        assert_eq!(
+            parse("/project accept").unwrap(),
+            UserAction::Project(ProjectAction::Accept)
+        );
+        assert_eq!(
+            parse("/alda play work").unwrap(),
+            UserAction::Alda(AldaAction::Play(ScoreTarget::Working))
         );
         assert!(parse("/play").unwrap_err().to_string().contains("已删除"));
         assert_eq!(

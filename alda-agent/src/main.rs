@@ -105,7 +105,7 @@ async fn compose(
     exclude: Vec<String>,
     output: std::path::PathBuf,
 ) -> anyhow::Result<()> {
-    use alda_agent::agent::{Agent, CreationMode, CreationRequest};
+    use alda_agent::agent::{Agent, AgentResultKind, CreationMode, CreationRequest};
     use alda_agent::alda::{AldaRunner, CheckStatus, find_alda};
     use alda_agent::config::ModelConfig;
     use alda_agent::deepseek::DeepSeekClient;
@@ -178,12 +178,16 @@ async fn compose(
 
     if result.needs_input {
         anyhow::bail!("模型需要补充信息；请进入交互模式回答澄清问题");
-    } else if result.success {
+    } else if result.success && result.kind == AgentResultKind::Candidate {
         if let Some(ref code) = result.alda_code {
             let output_file = output.join("current.alda");
             std::fs::write(&output_file, code)?;
             println!("\n作品已保存到: {}", output_file.display());
         }
+    } else if matches!(result.kind, AgentResultKind::Answer | AgentResultKind::Plan) {
+        anyhow::bail!("模型返回了文字结果；请进入交互模式继续创作");
+    } else if result.kind == AgentResultKind::Draft {
+        anyhow::bail!("模型返回了草稿；请进入交互模式试听和继续发展");
     } else {
         if result.was_truncated {
             println!("\n⚠️  模型输出被截断，作品可能不完整。");

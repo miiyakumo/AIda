@@ -1,5 +1,6 @@
 use crate::agent::{
-    Agent, AgentReporter, CreationMode, ProjectPromptRequest, from_provider_messages,
+    Agent, AgentReporter, AgentResultKind, CreationMode, ProjectPromptRequest,
+    from_provider_messages,
 };
 use crate::alda::{AldaCheck, AldaRunner, CancellationToken, CheckStatus, find_alda};
 use crate::command::{
@@ -8,7 +9,7 @@ use crate::command::{
 use crate::config::ModelConfig;
 use crate::conversation::{ConversationMessage, ConversationRole, ConversationState};
 use crate::deepseek::{ChatError, DeepSeekClient};
-use crate::project::{CheckRecord, Project};
+use crate::project::{CheckRecord, Project, WorkingScoreKind};
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
@@ -17,6 +18,7 @@ pub struct ProjectView {
     pub name: String,
     pub first_request: Option<String>,
     pub current_version: Option<u32>,
+    pub working_score: Option<String>,
     pub versions: Vec<VersionView>,
     pub mode: String,
     pub target_duration_secs: Option<f64>,
@@ -50,7 +52,8 @@ pub enum ActionResult {
     Message(String),
     Checks(Vec<AldaCheck>),
     AgentCompleted {
-        version: Option<u32>,
+        kind: AgentResultKind,
+        success: bool,
         rounds: usize,
         needs_input: bool,
     },
@@ -63,7 +66,7 @@ pub struct Application {
     alda: Option<AldaRunner>,
     last_model_failure: Option<ModelFailure>,
     model_request_succeeded: bool,
-    playback_version: Option<u32>,
+    playback: Option<String>,
     privacy_shown: bool,
 }
 
@@ -104,7 +107,7 @@ impl Application {
             alda,
             last_model_failure: None,
             model_request_succeeded: false,
-            playback_version: None,
+            playback: None,
             privacy_shown: false,
         })
     }
@@ -116,7 +119,7 @@ impl Application {
             alda,
             last_model_failure: None,
             model_request_succeeded: false,
-            playback_version: None,
+            playback: None,
             privacy_shown: false,
         }
     }
@@ -142,6 +145,10 @@ impl Application {
             first_request: self.project.conversation().first_request().map(summarize),
             current_version: (self.project.current_version() > 0)
                 .then(|| self.project.current_version()),
+            working_score: self
+                .project
+                .working_score()
+                .map(|working| working.kind.to_string()),
             versions: self
                 .project
                 .versions()
@@ -186,8 +193,8 @@ impl Application {
         let config_error = ModelConfig::load(self.project.root())
             .and_then(|config| config.resolve())
             .err();
-        let next_step = if let Some(version) = self.playback_version {
-            format!("播放已发起 · v{version} · /alda stop")
+        let next_step = if let Some(label) = &self.playback {
+            format!("播放已发起 · {label} · /alda stop")
         } else if config_error.is_some() {
             "仅本地 · 模型配置不可用 · /project config".to_string()
         } else if let Some(failure) = &self.last_model_failure {
@@ -198,6 +205,15 @@ impl Application {
             "修正未完成 · 输入“继续修正”或新的要求".to_string()
         } else if state == ConversationState::RequestPending {
             "上次请求未完成 · 重试原要求或输入补充".to_string()
+        } else if let Some(working) = self.project.working_score() {
+            match working.kind {
+                WorkingScoreKind::Draft => {
+                    "草稿待发展 · /alda play work · 继续输入创作要求".to_string()
+                }
+                WorkingScoreKind::Candidate => {
+                    "完整候选待决定 · /alda play work · /project accept|discard".to_string()
+                }
+            }
         } else if self.project.current_version() == 0 {
             "新项目 · 描述作品或粘贴参考素材".to_string()
         } else {
@@ -252,6 +268,11 @@ impl Application {
                     current_alda: (self.project.current_version() > 0)
                         .then(|| self.project.current_code())
                         .transpose()?,
+                    working_alda: self
+                        .project
+                        .working_score()
+                        .map(|_| self.project.working_code())
+                        .transpose()?,
                     creative_strategy: self.project.creative_strategy().to_string(),
                     mode: if self.project.mode() == "improv" {
                         CreationMode::Improvisation
@@ -277,23 +298,27 @@ impl Application {
                 return Err(error);
             }
         };
-        let version = if result.success {
-            Some(
-                self.project.save_version(
-                    result
-                        .alda_code
-                        .as_deref()
-                        .context("成功结果缺少 Alda 代码")?,
-                    &prompt,
-                    &result.checks,
-                )?,
-            )
-        } else {
-            None
-        };
+        if result.success {
+            let kind = match result.kind {
+                AgentResultKind::Draft => WorkingScoreKind::Draft,
+                AgentResultKind::Candidate => WorkingScoreKind::Candidate,
+                _ => bail!("文本结果不能标记为校验成功"),
+            };
+            self.project.save_working_score(
+                result
+                    .alda_code
+                    .as_deref()
+                    .context("成功结果缺少 Alda 代码")?,
+                kind,
+                &prompt,
+                &result.checks,
+            )?;
+        }
         let state = if result.needs_input {
             ConversationState::AwaitingInput
-        } else if result.success {
+        } else if result.success
+            || matches!(result.kind, AgentResultKind::Answer | AgentResultKind::Plan)
+        {
             ConversationState::Ready
         } else {
             ConversationState::RevisionAvailable
@@ -302,7 +327,8 @@ impl Application {
         messages.retain(|message| message.role != ConversationRole::System);
         self.project.replace_conversation(messages, state)?;
         Ok(ActionResult::AgentCompleted {
-            version,
+            kind: result.kind,
+            success: result.success,
             rounds: result.rounds,
             needs_input: result.needs_input,
         })
@@ -310,20 +336,40 @@ impl Application {
 
     async fn execute_alda(&mut self, action: AldaAction) -> Result<ActionResult> {
         match action {
-            AldaAction::Play(version) => {
-                let version = version.unwrap_or(self.require_current()?);
-                self.runner()?
-                    .play_async(self.project.version_path_for(version)?)
-                    .await?;
-                self.playback_version = Some(version);
-                Ok(ActionResult::Message(format!("✓ 已发起播放 v{version}")))
+            AldaAction::Play(target) => {
+                let (path, label) = match target {
+                    ScoreTarget::Working => (self.project.working_path()?, "工作乐谱".to_string()),
+                    ScoreTarget::Version(version) => {
+                        let version = version.unwrap_or(self.require_current()?);
+                        (
+                            self.project.version_path_for(version)?,
+                            format!("v{version}"),
+                        )
+                    }
+                    ScoreTarget::File(_) => bail!("play 不支持外部文件"),
+                };
+                self.runner()?.play_async(path).await?;
+                self.playback = Some(label.clone());
+                Ok(ActionResult::Message(format!("✓ 已发起播放 {label}")))
             }
             AldaAction::Stop => {
                 self.runner()?.stop_async().await?;
-                self.playback_version = None;
+                self.playback = None;
                 Ok(ActionResult::Message("✓ 已请求停止播放".to_string()))
             }
             AldaAction::Check(target) => {
+                let target_duration_ms = if target == ScoreTarget::Working
+                    && self
+                        .project
+                        .working_score()
+                        .is_some_and(|working| working.kind == WorkingScoreKind::Draft)
+                {
+                    None
+                } else {
+                    self.project
+                        .target_duration_secs()
+                        .map(|value| value * 1000.0)
+                };
                 let path = self.score_path(target)?;
                 let checks = self
                     .runner()?
@@ -331,9 +377,7 @@ impl Application {
                         path,
                         self.project.included_instruments().to_vec(),
                         self.project.excluded_instruments().to_vec(),
-                        self.project
-                            .target_duration_secs()
-                            .map(|value| value * 1000.0),
+                        target_duration_ms,
                         10.0,
                     )
                     .await?;
@@ -384,6 +428,39 @@ impl Application {
                     &checks,
                 )?;
                 Ok(ActionResult::Message(format!("✓ 已采用为 v{version}")))
+            }
+            ProjectAction::Accept => {
+                match self.project.working_score() {
+                    Some(working) if working.kind == WorkingScoreKind::Candidate => {}
+                    Some(_) => bail!("当前工作乐谱是草稿，不能接受为有效版本"),
+                    None => bail!("项目没有可接受的完整候选"),
+                }
+                let checks = self
+                    .runner()?
+                    .validate_async(
+                        self.project.working_path()?,
+                        self.project.included_instruments().to_vec(),
+                        self.project.excluded_instruments().to_vec(),
+                        self.project
+                            .target_duration_secs()
+                            .map(|value| value * 1000.0),
+                        10.0,
+                    )
+                    .await?;
+                self.project.update_working_checks(&checks)?;
+                if checks.iter().any(|check| check.status == CheckStatus::Fail) {
+                    return Ok(ActionResult::Checks(checks));
+                }
+                let version = self.project.accept_working_score()?;
+                Ok(ActionResult::Message(format!(
+                    "✓ 已接受完整候选为 v{version}"
+                )))
+            }
+            ProjectAction::Discard => {
+                self.project.discard_working_score()?;
+                Ok(ActionResult::Message(
+                    "✓ 已放弃工作乐谱；当前有效版本未改变".to_string(),
+                ))
             }
             ProjectAction::Config(config) => self.configure(config),
         }
@@ -480,6 +557,7 @@ impl Application {
             ScoreTarget::Version(version) => self
                 .project
                 .version_path_for(version.unwrap_or(self.require_current()?)),
+            ScoreTarget::Working => self.project.working_path(),
             ScoreTarget::File(path) => Ok(path),
         }
     }
@@ -547,11 +625,12 @@ fn render_config(view: &ProjectView) -> String {
 }
 fn render_project(view: &ProjectView) -> String {
     format!(
-        "项目：{}\n首次请求：{}\n当前版本：{}\n{}\nAlda：{}\n模型配置：{}\n模型服务：{}",
+        "项目：{}\n首次请求：{}\n当前版本：{}\n工作乐谱：{}\n{}\nAlda：{}\n模型配置：{}\n模型服务：{}",
         view.name,
         view.first_request.as_deref().unwrap_or("无"),
         view.current_version
             .map_or_else(|| "无".to_string(), |value| format!("v{value}")),
+        view.working_score.as_deref().unwrap_or("无"),
         render_config(view),
         available(view.alda_available),
         available(view.model_configured),
@@ -573,6 +652,7 @@ fn available(value: bool) -> &'static str {
 mod tests {
     use super::*;
     use crate::agent::AgentEvent;
+    use crate::test_support::{MockResponse, serve};
 
     struct Silent;
     impl AgentReporter for Silent {
@@ -585,6 +665,47 @@ mod tests {
             status: CheckStatus::Pass,
             detail: "解析成功".to_string(),
         }]
+    }
+
+    fn passing_runner() -> (tempfile::TempDir, AldaRunner) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("alda");
+        let json = r#"{"events":[{"offset":0,"duration":180000,"audible-duration":180000,"midi-note":60,"part":"piano"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = parse ]; then printf '%s\\n' '{json}'; else exit 0; fi\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        (directory, AldaRunner::new(executable))
+    }
+
+    fn candidate_response() -> String {
+        let arguments = serde_json::json!({
+            "kind": "candidate",
+            "message": "完整候选",
+            "alda_code": "piano: c"
+        })
+        .to_string();
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": { "name": "submit_result", "arguments": arguments }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!("data: {chunk}\n\ndata: [DONE]\n")
     }
 
     #[test]
@@ -697,5 +818,53 @@ mod tests {
             reloaded.conversation().state(),
             ConversationState::RequestPending
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_accept_is_the_application_version_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("poem");
+        let mut project = Project::load_or_create(root, "poem", "").unwrap();
+        project
+            .configure("full", Some(180.0), Vec::new(), Vec::new())
+            .unwrap();
+        let (_directory, runner) = passing_runner();
+        let mut application = Application::from_project(project, Some(runner));
+        let (base_url, _requests) = serve(vec![MockResponse::sse(candidate_response())]);
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application.configure(ConfigAction::Url(base_url)).unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+
+        let result = application
+            .execute(UserAction::Agent("完成整首作品".to_string()), &mut Silent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ActionResult::AgentCompleted {
+                kind: AgentResultKind::Candidate,
+                ..
+            }
+        ));
+        assert_eq!(application.project_view().current_version, None);
+        assert_eq!(
+            application.project_view().working_score.as_deref(),
+            Some("完整候选")
+        );
+
+        let result = application
+            .execute(UserAction::Project(ProjectAction::Accept), &mut Silent)
+            .await
+            .unwrap();
+        let ActionResult::Message(message) = result else {
+            panic!("expected accept message");
+        };
+        assert!(message.contains("v1"));
+        assert_eq!(application.project_view().current_version, Some(1));
+        assert!(application.project_view().working_score.is_none());
     }
 }

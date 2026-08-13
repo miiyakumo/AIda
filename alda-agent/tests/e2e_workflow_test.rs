@@ -3,15 +3,19 @@ use alda_agent::agent::{Agent, CreationMode, CreationRequest, ModifyRequest};
 use alda_agent::alda::AldaRunner;
 use alda_agent::conversation::ConversationState;
 use alda_agent::deepseek::DeepSeekClient;
-use alda_agent::project::Project;
+use alda_agent::project::{Project, WorkingScoreKind};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::thread;
 
-fn tool_response(code: &str) -> String {
-    let arguments = serde_json::json!({ "alda_code": code }).to_string();
+fn tool_response(kind: &str, message: &str, code: Option<&str>) -> String {
+    let mut arguments = serde_json::json!({ "kind": kind, "message": message });
+    if let Some(code) = code {
+        arguments["alda_code"] = serde_json::Value::String(code.to_string());
+    }
+    let arguments = arguments.to_string();
     let chunk = serde_json::json!({
         "choices": [{
             "delta": {
@@ -19,7 +23,7 @@ fn tool_response(code: &str) -> String {
                 "tool_calls": [{
                     "index": 0,
                     "id": "call_1",
-                    "function": { "name": "submit_alda", "arguments": arguments }
+                    "function": { "name": "submit_result", "arguments": arguments }
                 }]
             },
             "finish_reason": "tool_calls"
@@ -83,10 +87,15 @@ fn fake_alda() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 #[tokio::test]
-async fn complete_versioned_workflow_is_repeatable_offline() {
-    let first = "piano: (tempo 120) c1 *360";
-    let second = "piano: (tempo 120) c1 d1 e1 *120";
-    let base_url = response_server(vec![tool_response(first), tool_response(second)]);
+#[allow(clippy::too_many_lines)]
+async fn progressive_workflow_only_versions_an_accepted_candidate() {
+    let draft = "piano: (tempo 120) c1 *4";
+    let developed = "piano: (tempo 120) c1 d1 e1 *120";
+    let base_url = response_server(vec![
+        tool_response("plan", "先建立机械脉冲，再发展中段和明亮结尾。", None),
+        tool_response("draft", "核心机械脉冲草稿。", Some(draft)),
+        tool_response("candidate", "已发展成完整候选。", Some(developed)),
+    ]);
     let client = DeepSeekClient::new(
         "secret-test-value".to_string(),
         base_url,
@@ -104,7 +113,7 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
         .configure("full", Some(180.0), Vec::new(), Vec::new())
         .unwrap();
 
-    let creation = agent
+    let plan = agent
         .create(CreationRequest {
             source_material: source.to_string(),
             instructions: "创作约三分钟的完整纯器乐曲".to_string(),
@@ -117,29 +126,45 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
         })
         .await
         .unwrap();
-    assert!(creation.success);
-    assert_eq!(
-        project
-            .save_version(
-                creation.alda_code.as_deref().unwrap(),
-                "首次创作",
-                &creation.checks
-            )
-            .unwrap(),
-        1
-    );
+    assert!(!plan.success);
+    assert!(plan.interpretation.contains("机械脉冲"));
     project
         .replace_conversation(
-            from_provider_messages(creation.conversation),
+            from_provider_messages(plan.conversation),
             ConversationState::Ready,
         )
         .unwrap();
 
-    let feedback = "让中段更冰冷、更机械，结尾的加速和明亮感更强";
-    let modification = agent
+    let draft_result = agent
+        .create(CreationRequest {
+            source_material: source.to_string(),
+            instructions: "先做核心材料草稿".to_string(),
+            creative_strategy: String::new(),
+            mode: CreationMode::FullPiece,
+            target_duration_secs: Some(180.0),
+            included_instruments: Vec::new(),
+            excluded_instruments: Vec::new(),
+            max_rounds: 3,
+        })
+        .await
+        .unwrap();
+    assert!(draft_result.success);
+    project
+        .save_working_score(
+            draft_result.alda_code.as_deref().unwrap(),
+            WorkingScoreKind::Draft,
+            "核心材料",
+            &draft_result.checks,
+        )
+        .unwrap();
+    assert_eq!(project.current_version(), 0);
+    assert_eq!(project.versions().len(), 0);
+
+    let feedback = "发展中段并完成明亮结尾";
+    let candidate = agent
         .modify(ModifyRequest {
             source_material: source.to_string(),
-            current_alda: project.version_code(1).unwrap(),
+            current_alda: project.working_code().unwrap(),
             feedback: feedback.to_string(),
             creative_strategy: String::new(),
             mode: CreationMode::FullPiece,
@@ -150,27 +175,26 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
         })
         .await
         .unwrap();
-    assert!(modification.success);
-    assert_eq!(
-        project
-            .save_version(
-                modification.alda_code.as_deref().unwrap(),
-                feedback,
-                &modification.checks,
-            )
-            .unwrap(),
-        2
-    );
+    assert!(candidate.success);
     project
-        .replace_conversation(
-            from_provider_messages(modification.conversation),
-            ConversationState::Ready,
+        .save_working_score(
+            candidate.alda_code.as_deref().unwrap(),
+            WorkingScoreKind::Candidate,
+            feedback,
+            &candidate.checks,
         )
         .unwrap();
+    assert_eq!(project.current_version(), 0);
+    drop(project);
 
-    project.restore_version(1).unwrap();
+    let mut project = Project::load_or_create(root.clone(), "ignored", "ignored").unwrap();
+    assert_eq!(
+        project.working_score().unwrap().kind,
+        WorkingScoreKind::Candidate
+    );
+    assert_eq!(project.accept_working_score().unwrap(), 1);
     assert_eq!(project.current_version(), 1);
-    project.restore_version(2).unwrap();
+    assert!(project.working_score().is_none());
     let alda_export = project.export_alda().unwrap();
     let midi_export = project.midi_export_path().unwrap();
     AldaRunner::new(alda_path)
@@ -181,8 +205,8 @@ async fn complete_versioned_workflow_is_repeatable_offline() {
     drop(project);
 
     let restarted = Project::load_or_create(root, "ignored", "ignored").unwrap();
-    assert_eq!(restarted.current_version(), 2);
-    assert_eq!(restarted.versions().len(), 2);
+    assert_eq!(restarted.current_version(), 1);
+    assert_eq!(restarted.versions().len(), 1);
     assert!(!restarted.conversation().messages().is_empty());
     let metadata = fs::read_to_string(restarted.root().join("project.json")).unwrap();
     assert!(!metadata.contains("secret-test-value"));

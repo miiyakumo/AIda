@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PROJECT_FILE: &str = "project.json";
 const CURRENT_FILE: &str = "current.alda";
+const WORK_FILE: &str = "work.alda";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckRecord {
@@ -35,6 +36,29 @@ pub struct VersionMeta {
     pub checks: Vec<CheckRecord>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingScoreKind {
+    Draft,
+    Candidate,
+}
+
+impl std::fmt::Display for WorkingScoreKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Draft => write!(f, "草稿"),
+            Self::Candidate => write!(f, "完整候选"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkingScore {
+    pub kind: WorkingScoreKind,
+    pub summary: String,
+    pub checks: Vec<CheckRecord>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub project_name: String,
@@ -45,6 +69,7 @@ pub struct Project {
     excluded_instruments: Vec<String>,
     current_version: u32,
     versions: BTreeMap<u32, VersionMeta>,
+    working_score: Option<WorkingScore>,
     conversation: Conversation,
     #[serde(skip)]
     root: PathBuf,
@@ -79,6 +104,7 @@ impl Project {
             excluded_instruments: Vec::new(),
             current_version: 0,
             versions: BTreeMap::new(),
+            working_score: None,
             conversation: Conversation::default(),
             root,
         };
@@ -99,6 +125,11 @@ impl Project {
     #[must_use]
     pub fn versions(&self) -> &BTreeMap<u32, VersionMeta> {
         &self.versions
+    }
+
+    #[must_use]
+    pub fn working_score(&self) -> Option<&WorkingScore> {
+        self.working_score.as_ref()
     }
 
     #[must_use]
@@ -237,6 +268,76 @@ impl Project {
             .with_context(|| format!("无法读取版本 {version}"))
     }
 
+    pub fn working_code(&self) -> Result<String> {
+        if self.working_score.is_none() {
+            bail!("项目没有工作乐谱");
+        }
+        fs::read_to_string(self.root.join(WORK_FILE)).context("无法读取 work.alda")
+    }
+
+    pub fn working_path(&self) -> Result<PathBuf> {
+        if self.working_score.is_none() {
+            bail!("项目没有工作乐谱");
+        }
+        Ok(self.root.join(WORK_FILE))
+    }
+
+    pub fn save_working_score(
+        &mut self,
+        alda_code: &str,
+        kind: WorkingScoreKind,
+        summary: &str,
+        checks: &[AldaCheck],
+    ) -> Result<()> {
+        self.validate_settings()?;
+        if alda_code.trim().is_empty() {
+            bail!("不能保存空工作乐谱");
+        }
+        if checks.iter().any(|check| check.status == CheckStatus::Fail) {
+            bail!("检查未全部通过，不能保存工作乐谱");
+        }
+        write_atomic(&self.root.join(WORK_FILE), alda_code.as_bytes())?;
+        self.working_score = Some(WorkingScore {
+            kind,
+            summary: summary.to_string(),
+            checks: checks.iter().map(CheckRecord::from).collect(),
+        });
+        self.write_metadata()
+    }
+
+    pub fn update_working_checks(&mut self, checks: &[AldaCheck]) -> Result<()> {
+        let working = self
+            .working_score
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("项目没有工作乐谱"))?;
+        working.checks = checks.iter().map(CheckRecord::from).collect();
+        self.write_metadata()
+    }
+
+    pub fn accept_working_score(&mut self) -> Result<u32> {
+        let working = self
+            .working_score
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("项目没有可接受的完整候选"))?;
+        if working.kind != WorkingScoreKind::Candidate {
+            bail!("当前工作乐谱是草稿，不能接受为有效版本");
+        }
+        if working.checks.iter().any(|check| check.status == "失败") {
+            bail!("完整候选检查未全部通过，不能接受为有效版本");
+        }
+        let code = self.working_code()?;
+        let version = self.save_version_records(&code, &working.summary, &working.checks)?;
+        self.clear_working_score()?;
+        Ok(version)
+    }
+
+    pub fn discard_working_score(&mut self) -> Result<()> {
+        if self.working_score.is_none() {
+            bail!("项目没有可放弃的工作乐谱");
+        }
+        self.clear_working_score()
+    }
+
     pub fn save_version(
         &mut self,
         alda_code: &str,
@@ -250,6 +351,16 @@ impl Project {
         if checks.iter().any(|check| check.status == CheckStatus::Fail) {
             bail!("检查未全部通过，不能创建有效版本");
         }
+        let records = checks.iter().map(CheckRecord::from).collect::<Vec<_>>();
+        self.save_version_records(alda_code, summary, &records)
+    }
+
+    fn save_version_records(
+        &mut self,
+        alda_code: &str,
+        summary: &str,
+        checks: &[CheckRecord],
+    ) -> Result<u32> {
         if self.current_version > 0 && self.version_code(self.current_version)? == alda_code {
             bail!("新乐谱与当前版本相同，未创建新版本");
         }
@@ -271,11 +382,21 @@ impl Project {
             VersionMeta {
                 created_at: timestamp(),
                 summary: summary.to_string(),
-                checks: checks.iter().map(CheckRecord::from).collect(),
+                checks: checks.to_vec(),
             },
         );
         self.write_metadata()?;
         Ok(next)
+    }
+
+    fn clear_working_score(&mut self) -> Result<()> {
+        self.working_score = None;
+        self.write_metadata()?;
+        let path = self.root.join(WORK_FILE);
+        if path.exists() {
+            fs::remove_file(&path).with_context(|| format!("无法删除 {}", path.display()))?;
+        }
+        Ok(())
     }
 
     pub fn restore_version(&mut self, version: u32) -> Result<()> {
@@ -337,6 +458,9 @@ impl Project {
         ensure_safe_project_name(&self.project_name)?;
         self.validate_settings()?;
         self.conversation.validate()?;
+        if self.working_score.is_some() && !self.root.join(WORK_FILE).is_file() {
+            bail!("项目损坏：工作乐谱元数据存在但 work.alda 不存在");
+        }
         if self.current_version == 0 {
             if !self.versions.is_empty() {
                 bail!("project.json 损坏：存在历史版本但当前版本为 0");
@@ -570,6 +694,40 @@ mod tests {
             .unwrap();
         let reloaded = Project::load_or_create(root, "ignored", "ignored").unwrap();
         assert_eq!(reloaded.creative_strategy(), "明亮欢快，避免机械重复");
+    }
+
+    #[test]
+    fn only_a_candidate_can_be_accepted_and_work_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        project
+            .save_working_score(
+                "piano: c",
+                WorkingScoreKind::Draft,
+                "核心材料",
+                &passing_checks(),
+            )
+            .unwrap();
+        assert!(project.accept_working_score().is_err());
+        assert_eq!(project.current_version(), 0);
+
+        drop(project);
+        let mut project = Project::load_or_create(root, "ignored", "").unwrap();
+        assert_eq!(project.working_code().unwrap(), "piano: c");
+        project
+            .save_working_score(
+                "piano: d",
+                WorkingScoreKind::Candidate,
+                "完整候选",
+                &passing_checks(),
+            )
+            .unwrap();
+        assert_eq!(project.current_version(), 0);
+        assert_eq!(project.accept_working_score().unwrap(), 1);
+        assert_eq!(project.current_code().unwrap(), "piano: d");
+        assert!(project.working_score().is_none());
+        assert!(!project.root().join(WORK_FILE).exists());
     }
 
     #[test]

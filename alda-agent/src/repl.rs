@@ -241,16 +241,34 @@ fn render_result(result: &ActionResult, writer: &mut impl Write) -> Result<()> {
         ActionResult::Message(message) => writeln!(writer, "{message}")?,
         ActionResult::Checks(checks) => render_checks(checks, writer)?,
         ActionResult::AgentCompleted {
-            version: Some(version),
+            kind: crate::agent::AgentResultKind::Draft,
+            success: true,
             rounds,
             ..
         } => writeln!(
             writer,
-            "✓ 已保存 v{version} · {rounds} 轮完成\n  下一步：/alda play 试听，或直接输入修改要求。"
+            "✓ 已更新草稿 · {rounds} 轮完成 · 当前有效版本未改变\n  下一步：/alda play work 试听，或继续输入发展要求。"
+        )?,
+        ActionResult::AgentCompleted {
+            kind: crate::agent::AgentResultKind::Candidate,
+            success: true,
+            rounds,
+            ..
+        } => writeln!(
+            writer,
+            "✓ 完整候选已就绪 · {rounds} 轮完成 · 尚未创建版本\n  下一步：/alda play work 试听，再 /project accept 或继续修改。"
         )?,
         ActionResult::AgentCompleted {
             needs_input: true, ..
         } => writeln!(writer, "? 等待补充信息 · 直接回答上面的问题")?,
+        ActionResult::AgentCompleted {
+            kind: crate::agent::AgentResultKind::Plan,
+            ..
+        } => writeln!(writer, "✓ 已提出创作计划 · 当前乐谱和版本未改变")?,
+        ActionResult::AgentCompleted {
+            kind: crate::agent::AgentResultKind::Answer,
+            ..
+        } => writeln!(writer, "✓ 已回答 · 当前乐谱和版本未改变")?,
         ActionResult::AgentCompleted { rounds, .. } => writeln!(
             writer,
             "! {rounds} 轮后修正仍未完成；当前有效版本未改变。\n  下一步：输入“继续修正”，也可以提出新的要求。"
@@ -639,6 +657,7 @@ mod tests {
             name: "poem".into(),
             first_request: None,
             current_version: Some(2),
+            working_score: None,
             versions: vec![],
             mode: "full".into(),
             target_duration_secs: Some(180.0),
