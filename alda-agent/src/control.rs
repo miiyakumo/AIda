@@ -1,0 +1,538 @@
+use crate::agent::{AgentEvent, AgentReporter, AgentResultKind};
+use crate::application::{ActionResult, Application, ConversationView, ProjectView};
+use crate::command::{
+    AldaAction, ConfigAction, ExportFormat, ProjectAction, ScoreTarget, UserAction,
+};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::io::{BufRead, Write};
+use std::path::PathBuf;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlRequest {
+    id: String,
+    action: ControlAction,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ControlAction {
+    Agent {
+        prompt: String,
+    },
+    AldaPlay {
+        #[serde(default)]
+        target: Option<String>,
+    },
+    AldaStop,
+    AldaCheck {
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        file: Option<PathBuf>,
+    },
+    AldaExport {
+        #[serde(default)]
+        version: Option<u32>,
+        #[serde(default)]
+        format: ControlExportFormat,
+    },
+    ProjectOverview,
+    ProjectVersions,
+    ProjectSwitch {
+        version: u32,
+    },
+    ProjectAdopt {
+        path: PathBuf,
+    },
+    ProjectAccept,
+    ProjectDiscard,
+    ConfigShow,
+    ConfigMode {
+        mode: String,
+    },
+    ConfigDuration {
+        seconds: Option<f64>,
+    },
+    ConfigInclude {
+        instruments: Vec<String>,
+    },
+    ConfigExclude {
+        instruments: Vec<String>,
+    },
+    ConfigStrategy {
+        strategy: Option<String>,
+    },
+    ConfigModel {
+        model: String,
+    },
+    ConfigUrl {
+        url: String,
+    },
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ControlExportFormat {
+    Alda,
+    Midi,
+    #[default]
+    All,
+}
+
+impl ControlAction {
+    fn into_user_action(self) -> Result<UserAction> {
+        let action = match self {
+            Self::Agent { prompt } => {
+                if prompt.trim().is_empty() {
+                    bail!("agent prompt 不能为空");
+                }
+                UserAction::Agent(prompt)
+            }
+            Self::AldaPlay { target } => {
+                UserAction::Alda(AldaAction::Play(parse_play_target(target.as_deref())?))
+            }
+            Self::AldaStop => UserAction::Alda(AldaAction::Stop),
+            Self::AldaCheck { target, file } => {
+                let target = match (target.as_deref(), file) {
+                    (Some(_), Some(_)) => bail!("alda_check 的 target 和 file 不能同时设置"),
+                    (None, Some(path)) => ScoreTarget::File(path),
+                    (target, None) => parse_score_target(target)?,
+                };
+                UserAction::Alda(AldaAction::Check(target))
+            }
+            Self::AldaExport { version, format } => UserAction::Alda(AldaAction::Export {
+                version: valid_optional_version(version)?,
+                format: match format {
+                    ControlExportFormat::Alda => ExportFormat::Alda,
+                    ControlExportFormat::Midi => ExportFormat::Midi,
+                    ControlExportFormat::All => ExportFormat::All,
+                },
+            }),
+            Self::ProjectOverview => UserAction::Project(ProjectAction::Overview),
+            Self::ProjectVersions => UserAction::Project(ProjectAction::Versions),
+            Self::ProjectSwitch { version } => {
+                UserAction::Project(ProjectAction::Switch(valid_version(version)?))
+            }
+            Self::ProjectAdopt { path } => UserAction::Project(ProjectAction::Adopt(path)),
+            Self::ProjectAccept => UserAction::Project(ProjectAction::Accept),
+            Self::ProjectDiscard => UserAction::Project(ProjectAction::Discard),
+            Self::ConfigShow => UserAction::Project(ProjectAction::Config(ConfigAction::Show)),
+            Self::ConfigMode { mode } => {
+                UserAction::Project(ProjectAction::Config(ConfigAction::Mode(mode)))
+            }
+            Self::ConfigDuration { seconds } => {
+                UserAction::Project(ProjectAction::Config(ConfigAction::Duration(seconds)))
+            }
+            Self::ConfigInclude { instruments } => {
+                UserAction::Project(ProjectAction::Config(ConfigAction::Include(instruments)))
+            }
+            Self::ConfigExclude { instruments } => {
+                UserAction::Project(ProjectAction::Config(ConfigAction::Exclude(instruments)))
+            }
+            Self::ConfigStrategy { strategy } => {
+                UserAction::Project(ProjectAction::Config(ConfigAction::Strategy(strategy)))
+            }
+            Self::ConfigModel { model } => {
+                UserAction::Project(ProjectAction::Config(ConfigAction::Model(model)))
+            }
+            Self::ConfigUrl { url } => {
+                UserAction::Project(ProjectAction::Config(ConfigAction::Url(url)))
+            }
+        };
+        Ok(action)
+    }
+}
+
+fn valid_version(version: u32) -> Result<u32> {
+    if version == 0 {
+        bail!("version 必须是正整数");
+    }
+    Ok(version)
+}
+
+fn valid_optional_version(version: Option<u32>) -> Result<Option<u32>> {
+    version.map(valid_version).transpose()
+}
+
+fn parse_play_target(target: Option<&str>) -> Result<ScoreTarget> {
+    let target = parse_score_target(target)?;
+    if matches!(target, ScoreTarget::Working | ScoreTarget::Version(_)) {
+        Ok(target)
+    } else {
+        bail!("alda_play 不支持外部文件");
+    }
+}
+
+fn parse_score_target(target: Option<&str>) -> Result<ScoreTarget> {
+    match target.unwrap_or("current") {
+        "current" => Ok(ScoreTarget::Version(None)),
+        "work" => Ok(ScoreTarget::Working),
+        value => {
+            let version = value.strip_prefix('v').unwrap_or(value);
+            let version = version
+                .parse::<u32>()
+                .ok()
+                .and_then(|value| (value > 0).then_some(value))
+                .with_context(|| "target 必须是 current、work 或 vN")?;
+            Ok(ScoreTarget::Version(Some(version)))
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ControlEnvelope<'a, T: Serialize> {
+    id: Option<&'a str>,
+    #[serde(flatten)]
+    body: T,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ControlResponse<'a> {
+    Result {
+        result: ControlResult<'a>,
+        project: &'a ProjectView,
+        conversation: &'a ConversationView,
+    },
+    Error {
+        error: ControlError,
+        project: &'a ProjectView,
+        conversation: &'a ConversationView,
+    },
+}
+
+#[derive(Serialize)]
+struct ControlError {
+    kind: &'static str,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ControlResult<'a> {
+    Message {
+        message: &'a str,
+    },
+    Checks {
+        checks: &'a [crate::alda::AldaCheck],
+    },
+    AgentCompleted {
+        result_kind: &'static str,
+        success: bool,
+        rounds: usize,
+        needs_input: bool,
+    },
+    Quit,
+    None,
+}
+
+impl<'a> From<&'a ActionResult> for ControlResult<'a> {
+    fn from(result: &'a ActionResult) -> Self {
+        match result {
+            ActionResult::Message(message) => Self::Message { message },
+            ActionResult::Checks(checks) => Self::Checks { checks },
+            ActionResult::AgentCompleted {
+                kind,
+                success,
+                rounds,
+                needs_input,
+            } => Self::AgentCompleted {
+                result_kind: agent_result_kind(*kind),
+                success: *success,
+                rounds: *rounds,
+                needs_input: *needs_input,
+            },
+            ActionResult::Quit => Self::Quit,
+            ActionResult::None => Self::None,
+        }
+    }
+}
+
+fn agent_result_kind(kind: AgentResultKind) -> &'static str {
+    match kind {
+        AgentResultKind::Answer => "answer",
+        AgentResultKind::Clarification => "clarification",
+        AgentResultKind::Plan => "plan",
+        AgentResultKind::Draft => "draft",
+        AgentResultKind::Candidate => "candidate",
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ControlEvent<'a> {
+    Event {
+        #[serde(flatten)]
+        event: EventBody<'a>,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum EventBody<'a> {
+    PrivacyNotice,
+    RoundStarted {
+        round: usize,
+        max_rounds: usize,
+    },
+    ModelText {
+        text: &'a str,
+    },
+    ValidationStarted {
+        round: usize,
+        max_rounds: usize,
+    },
+    ValidationCompleted {
+        checks: &'a [crate::alda::AldaCheck],
+    },
+    RevisionStarted {
+        next_round: usize,
+        max_rounds: usize,
+        failures: usize,
+    },
+}
+
+struct ControlReporter<'a, W: Write> {
+    id: &'a str,
+    writer: &'a mut W,
+    write_error: Option<anyhow::Error>,
+}
+
+impl<W: Write> AgentReporter for ControlReporter<'_, W> {
+    fn report(&mut self, event: AgentEvent) {
+        if self.write_error.is_some() {
+            return;
+        }
+        let event = match &event {
+            AgentEvent::PrivacyNotice => EventBody::PrivacyNotice,
+            AgentEvent::RoundStarted { round, max_rounds } => EventBody::RoundStarted {
+                round: *round,
+                max_rounds: *max_rounds,
+            },
+            AgentEvent::ModelText(text) => EventBody::ModelText { text },
+            AgentEvent::ValidationStarted { round, max_rounds } => EventBody::ValidationStarted {
+                round: *round,
+                max_rounds: *max_rounds,
+            },
+            AgentEvent::ValidationCompleted(checks) => EventBody::ValidationCompleted { checks },
+            AgentEvent::RevisionStarted {
+                next_round,
+                max_rounds,
+                failures,
+            } => EventBody::RevisionStarted {
+                next_round: *next_round,
+                max_rounds: *max_rounds,
+                failures: *failures,
+            },
+        };
+        let envelope = ControlEnvelope {
+            id: Some(self.id),
+            body: ControlEvent::Event { event },
+        };
+        if let Err(error) = write_json_line(self.writer, &envelope) {
+            self.write_error = Some(error);
+        }
+    }
+}
+
+pub async fn run(project_dir: PathBuf, name: String) -> Result<()> {
+    let mut application = Application::open(project_dir, &name)?;
+    run_io(
+        &mut application,
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+    )
+    .await
+}
+
+pub async fn run_io<R: BufRead, W: Write>(
+    application: &mut Application,
+    reader: R,
+    mut writer: W,
+) -> Result<()> {
+    for line in reader.lines() {
+        let line = line.context("无法读取 control 请求")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request = match serde_json::from_str::<ControlRequest>(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                let id = request_id(&line);
+                write_error_response(
+                    application,
+                    &mut writer,
+                    id.as_deref(),
+                    "invalid_request",
+                    error.to_string(),
+                )?;
+                continue;
+            }
+        };
+        let action = match request.action.into_user_action() {
+            Ok(action) => action,
+            Err(error) => {
+                write_error_response(
+                    application,
+                    &mut writer,
+                    Some(&request.id),
+                    "invalid_action",
+                    format!("{error:#}"),
+                )?;
+                continue;
+            }
+        };
+        let result = {
+            let mut reporter = ControlReporter {
+                id: &request.id,
+                writer: &mut writer,
+                write_error: None,
+            };
+            let result = application.execute(action, &mut reporter).await;
+            if let Some(error) = reporter.write_error {
+                return Err(error);
+            }
+            result
+        };
+        match result {
+            Ok(result) => {
+                let project = application.project_view();
+                let conversation = application.conversation_view();
+                let envelope = ControlEnvelope {
+                    id: Some(&request.id),
+                    body: ControlResponse::Result {
+                        result: (&result).into(),
+                        project: &project,
+                        conversation: &conversation,
+                    },
+                };
+                write_json_line(&mut writer, &envelope)?;
+            }
+            Err(error) => write_error_response(
+                application,
+                &mut writer,
+                Some(&request.id),
+                "execution",
+                format!("{error:#}"),
+            )?,
+        }
+    }
+    Ok(())
+}
+
+fn request_id(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+fn write_error_response(
+    application: &Application,
+    writer: &mut impl Write,
+    id: Option<&str>,
+    kind: &'static str,
+    message: String,
+) -> Result<()> {
+    let project = application.project_view();
+    let conversation = application.conversation_view();
+    write_json_line(
+        writer,
+        &ControlEnvelope {
+            id,
+            body: ControlResponse::Error {
+                error: ControlError { kind, message },
+                project: &project,
+                conversation: &conversation,
+            },
+        },
+    )
+}
+
+fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value).context("无法序列化 control 响应")?;
+    writeln!(writer).context("无法写入 control 响应")?;
+    writer.flush().context("无法刷新 control 响应")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::Project;
+
+    #[tokio::test]
+    async fn processes_requests_and_continues_after_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let project =
+            Project::load_or_create(directory.path().join("control-test"), "control-test", "")
+                .unwrap();
+        let mut application = Application::from_project(project, None);
+        let input = concat!(
+            "not-json\n",
+            r#"{"id":"one","action":{"type":"config_duration","seconds":90.0}}"#,
+            "\n",
+            r#"{"id":"two","action":{"type":"project_overview"}}"#,
+            "\n",
+            r#"{"id":"three","action":{"type":"project_switch","version":0}}"#,
+            "\n"
+        );
+        let mut output = Vec::new();
+        run_io(&mut application, input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let responses = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 4);
+        assert_eq!(responses[0]["type"], "error");
+        assert!(responses[0]["id"].is_null());
+        assert_eq!(responses[1]["id"], "one");
+        assert_eq!(responses[1]["project"]["target_duration_secs"], 90.0);
+        assert_eq!(responses[2]["result"]["kind"], "message");
+        assert_eq!(responses[3]["error"]["kind"], "invalid_action");
+    }
+
+    #[test]
+    fn rejects_api_key_actions() {
+        assert!(
+            serde_json::from_str::<ControlRequest>(
+                r#"{"id":"1","action":{"type":"config_api_key","key":"secret"}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reporter_emits_correlated_structured_events() {
+        let mut output = Vec::new();
+        let mut reporter = ControlReporter {
+            id: "request-7",
+            writer: &mut output,
+            write_error: None,
+        };
+        reporter.report(AgentEvent::RoundStarted {
+            round: 1,
+            max_rounds: 3,
+        });
+        reporter.report(AgentEvent::ModelText("正在发展主题".to_string()));
+        assert!(reporter.write_error.is_none());
+        drop(reporter);
+
+        let events = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events[0]["id"], "request-7");
+        assert_eq!(events[0]["type"], "event");
+        assert_eq!(events[0]["event"], "round_started");
+        assert_eq!(events[1]["event"], "model_text");
+        assert_eq!(events[1]["text"], "正在发展主题");
+    }
+}

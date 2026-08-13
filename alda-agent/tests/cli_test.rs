@@ -25,6 +25,8 @@ fn new_shell_commands_parse_and_removed_ones_fail() {
             probe: Some(ProbeTarget::Alda)
         })
     ));
+    let cli = Cli::try_parse_from(["alda-agent", "--project", "/tmp/project", "control"]).unwrap();
+    assert!(matches!(cli.command, Some(Command::Control)));
     assert!(Cli::try_parse_from(["alda-agent", "repl"]).is_err());
     assert!(Cli::try_parse_from(["alda-agent", "list"]).is_err());
     assert!(Cli::try_parse_from(["alda-agent", "create"]).is_err());

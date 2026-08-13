@@ -11,9 +11,10 @@ use crate::conversation::{ConversationMessage, ConversationRole, ConversationSta
 use crate::deepseek::{ChatError, DeepSeekClient};
 use crate::project::{CheckRecord, Project, WorkingScoreKind};
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProjectView {
     pub name: String,
     pub first_request: Option<String>,
@@ -33,14 +34,14 @@ pub struct ProjectView {
     pub model_service_status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VersionView {
     pub version: u32,
     pub summary: String,
     pub checks: Vec<CheckRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConversationView {
     pub messages: Vec<ConversationMessage>,
     pub state: ConversationState,

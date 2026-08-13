@@ -15,6 +15,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Doctor { probe }) => {
             alda_agent::doctor::run(probe, selected_project_root(project, name)?).await
         }
+        Some(Command::Control) => {
+            let (project, name) = selected_project(project, name)?;
+            alda_agent::control::run(project, name).await
+        }
         Some(Command::Compose {
             file,
             mode,
@@ -36,26 +40,33 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         None => {
-            let (project, name) = if let Some(project) = project {
-                let name = project
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("project")
-                    .to_string();
-                (project, name)
-            } else if let Some(name) = name {
-                (alda_agent::project::default_project_dir(&name)?, name)
-            } else {
-                let project = std::env::current_dir()?;
-                let name = project
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("project")
-                    .to_string();
-                (project, name)
-            };
+            let (project, name) = selected_project(project, name)?;
             alda_agent::repl::run_repl(project, name).await
         }
+    }
+}
+
+fn selected_project(
+    project: Option<std::path::PathBuf>,
+    name: Option<String>,
+) -> anyhow::Result<(std::path::PathBuf, String)> {
+    if let Some(project) = project {
+        let name = project
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("project")
+            .to_string();
+        Ok((project, name))
+    } else if let Some(name) = name {
+        Ok((alda_agent::project::default_project_dir(&name)?, name))
+    } else {
+        let project = std::env::current_dir()?;
+        let name = project
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("project")
+            .to_string();
+        Ok((project, name))
     }
 }
 

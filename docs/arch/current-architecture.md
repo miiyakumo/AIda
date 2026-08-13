@@ -12,6 +12,7 @@
 Shell CLI（main.rs）
 ├── 默认进入项目交互
 ├── projects / compose / doctor
+├── Machine control adapter（control.rs，JSONL）
 └── Terminal adapter（repl.rs）
     ├── command.rs：分层动作解析、帮助与补全目录
     ├── application.rs：动作执行、能力装载、双视图快照
@@ -24,6 +25,10 @@ Shell CLI（main.rs）
 `Application::execute`，再读取 `ProjectView` 和 `ConversationView` 渲染提示符与结果。未来界面可以
 直接复用这一入口。
 
+`control` 是同一个应用入口的机器适配器。它从 stdin 逐行读取 JSON 请求，把 Agent 阶段事件、动作结果、
+错误和动作后的双视图快照逐行写到 stdout；单个请求失败不会终止会话。控制面不直接修改项目文件，也不
+提供跳过 Alda 校验、任意 shell 或模型密钥读写能力。
+
 ## Shell 与项目内命令
 
 Shell 入口只有：
@@ -33,10 +38,40 @@ alda-agent [--name NAME | --project PATH]
 alda-agent projects
 alda-agent compose [OPTIONS]
 alda-agent doctor [--probe model|alda|all] # 无 probe 时只做本地环境检查
+alda-agent [--name NAME | --project PATH] control
 ```
 
 项目内命令按职责分组：自然语言输入进入 Agent；`/alda` 只执行本地工具动作；`/project` 查看和修改
 持久项目；`/help` 提供分层帮助；`/quit` 退出。旧的扁平命令已删除。
+
+## JSONL 控制面
+
+每个请求包含调用方生成的字符串 `id` 和一个带 `type` 的 `action`。例如：
+
+```json
+{"id":"1","action":{"type":"agent","prompt":"发展当前草稿"}}
+{"id":"2","action":{"type":"alda_check","target":"work"}}
+{"id":"3","action":{"type":"project_accept"}}
+```
+
+每个长操作事件和最终响应都带相同 `id`。成功响应包含结构化 `result`、`project` 与 `conversation`；错误
+响应包含 `error.kind`、`error.message` 和错误后的双视图快照。无法解析为 JSON 时 `id` 为 `null`；JSON
+有效且含字符串 `id` 时，即使动作无效也会保留该 `id`。可用动作是：
+
+| 分组 | `type` |
+|---|---|
+| Agent | `agent` |
+| Alda | `alda_play`、`alda_stop`、`alda_check`、`alda_export` |
+| Project | `project_overview`、`project_versions`、`project_switch`、`project_adopt`、`project_accept`、`project_discard` |
+| Config | `config_show`、`config_mode`、`config_duration`、`config_include`、`config_exclude`、`config_strategy`、`config_model`、`config_url` |
+
+`alda_play` 和 `alda_check` 的 `target` 接受 `current`、`work` 或 `vN`；`alda_check` 也可改用 `file` 检查
+外部文件。控制面刻意不支持模型密钥设置，密钥仍只能通过交互终端隐藏输入或已有的私有 `model.json`
+提供，避免进入自动化命令与日志。
+
+控制面用于真实模型调用、Alda 操作、状态流转、重启恢复和错误恢复等自动化验收。音乐听感、修改是否符合
+主观意图和终端实际手感仍不能由结构化协议证明，需要人工判断；接受完整候选虽可被显式调用，但自动化
+调用方必须先获得用户对该接受动作的授权。
 
 TTY 使用 reedline 0.49，并显式启用 bracketed paste，使多行粘贴先完整进入编辑缓冲、等待 Enter 后再作为
 一条请求提交；同时支持多行输入、项目级 500 条历史和 Tab 补全。Alt+Enter、

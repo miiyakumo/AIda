@@ -3,6 +3,7 @@ pub mod alda;
 pub mod application;
 pub mod command;
 pub mod config;
+pub mod control;
 pub mod conversation;
 pub mod deepseek;
 pub mod doctor;
@@ -37,6 +38,8 @@ pub enum Command {
         #[arg(long, value_enum)]
         probe: Option<ProbeTarget>,
     },
+    /// 通过 stdin/stdout 上的 JSONL 协议操控项目
+    Control,
     /// 一次性创作 Alda 音乐作品
     Compose {
         /// 素材文本文件路径（不指定则从 stdin 读取）
