@@ -187,23 +187,21 @@ impl Application {
             .and_then(|config| config.resolve())
             .err();
         let next_step = if let Some(version) = self.playback_version {
-            format!("已发起播放 v{version} · /alda stop 停止")
-        } else if let Some(error) = config_error {
-            format!(
-                "仅本地 · 模型配置不可用：{error}；使用 /project config 设置，或继续使用 /alda 和 /project"
-            )
+            format!("播放已发起 · v{version} · /alda stop")
+        } else if config_error.is_some() {
+            "仅本地 · 模型配置不可用 · /project config".to_string()
         } else if let Some(failure) = &self.last_model_failure {
             format!("模型服务最近失败 · {}", failure.status())
         } else if state == ConversationState::AwaitingInput {
             "等待补充信息 · 直接回答上面的问题".to_string()
         } else if state == ConversationState::RevisionAvailable {
-            "修正未完成 · 输入“继续修正”，也可以提出新的要求".to_string()
+            "修正未完成 · 输入“继续修正”或新的要求".to_string()
         } else if state == ConversationState::RequestPending {
-            "上次请求未完成 · 重新提交相同内容可安全重试，也可以输入新的补充要求".to_string()
+            "上次请求未完成 · 重试原要求或输入补充".to_string()
         } else if self.project.current_version() == 0 {
-            "新项目 · 描述你想创作的作品，也可以直接粘贴参考素材".to_string()
+            "新项目 · 描述作品或粘贴参考素材".to_string()
         } else {
-            "就绪 · 输入修改要求；/alda play 试听；输入 / 后按 Tab 查看命令".to_string()
+            "就绪 · 输入修改要求 · /alda play · /help".to_string()
         };
         ConversationView {
             messages: self.project.conversation().messages().to_vec(),

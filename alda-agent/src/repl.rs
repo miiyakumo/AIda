@@ -9,11 +9,12 @@ use crate::command::{ProjectAction, UserAction};
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reedline::{
-    ColumnarMenu, Completer, DefaultPrompt, DefaultPromptSegment, Emacs, FileBackedHistory,
-    History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, MenuBuilder,
-    Reedline, ReedlineEvent, ReedlineMenu, SearchQuery, Signal, Span, Suggestion,
-    default_emacs_keybindings,
+    ColumnarMenu, Completer, Emacs, FileBackedHistory, History, HistoryItem, HistoryItemId,
+    HistorySessionId, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode,
+    PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu,
+    SearchQuery, Signal, Span, Suggestion, default_emacs_keybindings,
 };
+use std::borrow::Cow;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::{
@@ -54,6 +55,7 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
     let menu = ColumnarMenu::default().with_name("commands");
     let mut editor = Reedline::create()
         .use_bracketed_paste(true)
+        .with_transient_prompt(Box::new(InputPrompt::history()))
         .with_completer(Box::new(CommandCompleter {
             versions: Arc::clone(&versions),
         }))
@@ -73,11 +75,7 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
                 .collect();
         }
         let conversation = application.conversation_view();
-        println!("{}\n{}", project_summary(&project), conversation.next_step);
-        let prompt = DefaultPrompt::new(
-            DefaultPromptSegment::Basic(String::new()),
-            DefaultPromptSegment::Empty,
-        );
+        let prompt = InputPrompt::active(&project, &conversation.next_step);
         match editor.read_line(&prompt) {
             Ok(Signal::Success(line)) => {
                 if !execute_line(application, &line, &mut TerminalReporter::new(true)).await? {
@@ -91,6 +89,54 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
         }
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct InputPrompt {
+    context: String,
+}
+
+impl InputPrompt {
+    fn active(project: &ProjectView, status: &str) -> Self {
+        Self {
+            context: format!("\n项目 · {}\n状态 · {status}\n", project_summary(project)),
+        }
+    }
+
+    fn history() -> Self {
+        Self {
+            context: String::new(),
+        }
+    }
+}
+
+impl Prompt for InputPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.context)
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("› ")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("· ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        let failed = match history_search.status {
+            PromptHistorySearchStatus::Failing => "无匹配 ",
+            PromptHistorySearchStatus::Passing => "",
+        };
+        Cow::Owned(format!("({failed}历史搜索：{}) ", history_search.term))
+    }
 }
 
 async fn run_plain<R: BufRead, W: Write>(
@@ -215,7 +261,7 @@ fn render_result(result: &ActionResult, writer: &mut impl Write) -> Result<()> {
 }
 
 fn project_summary(view: &ProjectView) -> String {
-    let mut parts = vec![
+    [
         view.name.clone(),
         view.current_version
             .map_or_else(|| "尚无版本".to_string(), |version| format!("v{version}")),
@@ -225,21 +271,8 @@ fn project_summary(view: &ProjectView) -> String {
             "完整曲目"
         }
         .to_string(),
-    ];
-    if let Some(duration) = view.target_duration_secs {
-        parts.push(format!("{duration} 秒"));
-    }
-    parts.extend(
-        view.included_instruments
-            .iter()
-            .map(|value| format!("+{value}")),
-    );
-    parts.extend(
-        view.excluded_instruments
-            .iter()
-            .map(|value| format!("-{value}")),
-    );
-    parts.join(" · ")
+    ]
+    .join(" · ")
 }
 
 fn render_checks(checks: &[AldaCheck], writer: &mut impl Write) -> Result<()> {
@@ -600,9 +633,9 @@ fn suggestion(value: String, start: usize, end: usize) -> Suggestion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn summary_keeps_project_context() {
-        let view = ProjectView {
+
+    fn project_view() -> ProjectView {
+        ProjectView {
             name: "poem".into(),
             first_request: None,
             current_version: Some(2),
@@ -618,11 +651,33 @@ mod tests {
             alda_available: true,
             model_configured: true,
             model_service_status: "最近成功".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn summary_keeps_project_context() {
+        assert_eq!(project_summary(&project_view()), "poem · v2 · 完整曲目");
+    }
+
+    #[test]
+    fn active_prompt_separates_project_status_and_input() {
+        let prompt = InputPrompt::active(&project_view(), "已发起播放 v1 · /alda stop 停止");
+
         assert_eq!(
-            project_summary(&view),
-            "poem · v2 · 完整曲目 · 180 秒 · +piano · -violin"
+            prompt.render_prompt_left(),
+            "\n项目 · poem · v2 · 完整曲目\n状态 · 已发起播放 v1 · /alda stop 停止\n"
         );
+        assert_eq!(prompt.render_prompt_indicator(PromptEditMode::Emacs), "› ");
+        assert_eq!(prompt.render_prompt_multiline_indicator(), "· ");
+    }
+
+    #[test]
+    fn submitted_prompt_keeps_only_the_user_input_marker() {
+        let prompt = InputPrompt::history();
+
+        assert_eq!(prompt.render_prompt_left(), "");
+        assert_eq!(prompt.render_prompt_right(), "");
+        assert_eq!(prompt.render_prompt_indicator(PromptEditMode::Emacs), "› ");
     }
 
     #[test]

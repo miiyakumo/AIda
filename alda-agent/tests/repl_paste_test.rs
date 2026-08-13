@@ -14,10 +14,14 @@ struct PtyProcess {
 
 impl PtyProcess {
     fn spawn(project: &std::path::Path) -> Self {
+        Self::spawn_with_size(project, 30, 100)
+    }
+
+    fn spawn_with_size(project: &std::path::Path, rows: u16, cols: u16) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
-                rows: 30,
-                cols: 100,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -98,6 +102,10 @@ impl PtyProcess {
             self.pump(Duration::from_millis(50));
         }
     }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.transcript).into_owned()
+    }
 }
 
 impl Drop for PtyProcess {
@@ -141,4 +149,35 @@ fn bracketed_multiline_paste_waits_for_enter_and_submits_once() {
         saved["conversation"]["messages"],
         serde_json::json!([{"role": "user", "content": "第一行\n\n第二行"}])
     );
+}
+
+#[test]
+fn terminal_prompt_separates_context_and_keeps_only_submitted_input_in_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("layout-project");
+    let mut process = PtyProcess::spawn(&project);
+    process.wait_for("项目 · layout-project · 尚无版本 · 完整曲目".as_bytes());
+    process.wait_for("状态 · 仅本地 · 模型配置不可用".as_bytes());
+    process.wait_for("› ".as_bytes());
+
+    process.send(b"/project\r");
+    process.wait_for("项目：layout-project".as_bytes());
+    process.send(b"\x04");
+    process.pump(Duration::from_millis(200));
+
+    let transcript = process.text();
+    assert!(transcript.contains("项目 · layout-project · 尚无版本 · 完整曲目"));
+    assert!(transcript.contains("状态 · 仅本地 · 模型配置不可用"));
+    assert!(transcript.contains("项目：layout-project"));
+    assert!(transcript.matches("项目 · layout-project").count() >= 2);
+}
+
+#[test]
+fn narrow_terminal_keeps_project_status_and_input_markers() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("narrow-project");
+    let mut process = PtyProcess::spawn_with_size(&project, 30, 32);
+    process.wait_for("项目 · narrow-project".as_bytes());
+    process.wait_for("状态 · 仅本地".as_bytes());
+    process.wait_for("› ".as_bytes());
 }

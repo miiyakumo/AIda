@@ -43,6 +43,11 @@ TTY 使用 reedline 0.49，并显式启用 bracketed paste，使多行粘贴先�
 Shift+Enter 插入换行，普通 Enter 提交。非 TTY 使用逐行纯文本适配器，不输出控制序列或动画。
 indicatif 0.18 只负责 TTY 活动指示；所有阶段和结果仍是稳定的语义事件与文本。
 
+TTY 的活动输入块分为 `项目 ·`、`状态 ·` 和 `›` 三层。项目行来自 `ProjectView`，状态行来自
+`ConversationView::next_step`，输入和多行续行分别使用 `›`、`·` 标记。reedline transient prompt 在提交
+时移除项目与状态行，只把带 `›` 的用户输入留在原生 scrollback；因此稳定上下文始终可见于当前输入块，
+但不会在空输入和连续轮次中污染会话历史。活动 spinner 仍由 reporter 临时绘制，完成结果才进入历史。
+
 ## 项目聚合与双视图
 
 `Project` 是聚合根，持有项目设置、当前有效版本、线性版本元数据和一条供应商无关的
