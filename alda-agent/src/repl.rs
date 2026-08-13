@@ -43,6 +43,7 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
     let history = FileBackedHistory::with_file(500, history_path)
         .map(|history| SensitiveHistory { inner: history });
     let versions = Arc::new(RwLock::new(Vec::new()));
+    let working_available = Arc::new(AtomicBool::new(false));
     let mut keybindings = default_emacs_keybindings();
     keybindings.add_binding(
         KeyModifiers::NONE,
@@ -58,6 +59,7 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
         .with_transient_prompt(Box::new(InputPrompt::history()))
         .with_completer(Box::new(CommandCompleter {
             versions: Arc::clone(&versions),
+            working_available: Arc::clone(&working_available),
         }))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_edit_mode(Box::new(Emacs::new(keybindings)));
@@ -68,6 +70,7 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
     let mut basic_input = false;
     loop {
         let project = application.project_view();
+        working_available.store(project.working_score.is_some(), Ordering::Relaxed);
         if let Ok(mut candidates) = versions.write() {
             *candidates = project
                 .versions
@@ -591,6 +594,7 @@ fn render_event(event: &AgentEvent, writer: &mut impl Write) -> Result<()> {
 
 struct CommandCompleter {
     versions: Arc<RwLock<Vec<String>>>,
+    working_available: Arc<AtomicBool>,
 }
 impl Completer for CommandCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
@@ -602,11 +606,15 @@ impl Completer for CommandCompleter {
                 .map(|candidate| suggestion(candidate, start, pos))
                 .collect();
         }
-        if let Some((lead, fragment)) = version_fragment(prefix) {
-            return self
+        if let Some((lead, fragment, supports_working)) = target_fragment(prefix) {
+            let mut candidates = self
                 .versions
                 .read()
-                .map_or_else(|_| Vec::new(), |versions| versions.clone())
+                .map_or_else(|_| Vec::new(), |versions| versions.clone());
+            if supports_working && self.working_available.load(Ordering::Relaxed) {
+                candidates.push("work".to_string());
+            }
+            return candidates
                 .into_iter()
                 .filter(|candidate| candidate.starts_with(fragment))
                 .map(|candidate| suggestion(candidate, lead, pos))
@@ -630,18 +638,17 @@ impl Completer for CommandCompleter {
     }
 }
 
-fn version_fragment(prefix: &str) -> Option<(usize, &str)> {
-    let supports_versions = [
-        "/alda play ",
-        "/alda check ",
-        "/alda export ",
-        "/project switch ",
-    ]
-    .iter()
-    .any(|command| prefix.starts_with(command));
+fn target_fragment(prefix: &str) -> Option<(usize, &str, bool)> {
+    let supports_working = ["/alda play ", "/alda check "]
+        .iter()
+        .any(|command| prefix.starts_with(command));
+    let supports_versions = supports_working
+        || ["/alda export ", "/project switch "]
+            .iter()
+            .any(|command| prefix.starts_with(command));
     supports_versions.then(|| {
         let start = prefix.rfind(' ').map_or(0, |index| index + 1);
-        (start, &prefix[start..])
+        (start, &prefix[start..], supports_working)
     })
 }
 
@@ -717,6 +724,36 @@ mod tests {
     #[test]
     fn summary_keeps_project_context() {
         assert_eq!(project_summary(&project_view()), "poem · v2 · 完整曲目");
+    }
+
+    #[test]
+    fn working_score_is_completed_only_for_commands_that_support_it() {
+        let versions = Arc::new(RwLock::new(vec!["v1".to_string()]));
+        let working_available = Arc::new(AtomicBool::new(true));
+        let mut completer = CommandCompleter {
+            versions,
+            working_available: Arc::clone(&working_available),
+        };
+
+        let play = completer.complete("/alda play w", "/alda play w".len());
+        assert_eq!(
+            play.into_iter()
+                .map(|suggestion| suggestion.value)
+                .collect::<Vec<_>>(),
+            ["work"]
+        );
+        assert!(
+            completer
+                .complete("/project switch w", "/project switch w".len())
+                .is_empty()
+        );
+
+        working_available.store(false, Ordering::Relaxed);
+        assert!(
+            completer
+                .complete("/alda check w", "/alda check w".len())
+                .is_empty()
+        );
     }
 
     #[test]
