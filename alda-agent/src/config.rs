@@ -69,7 +69,7 @@ impl ModelConfig {
     }
 
     pub fn set_base_url(&mut self, value: &str) -> Result<()> {
-        let value = required(value, "模型 URL")?;
+        let value = required(value, "API Base URL")?;
         validate_base_url(&value)?;
         self.base_url = value;
         Ok(())
@@ -136,9 +136,9 @@ fn required(value: &str, name: &str) -> Result<String> {
 }
 
 fn validate_base_url(value: &str) -> Result<()> {
-    let url = reqwest::Url::parse(value).context("模型 URL 无效")?;
+    let url = reqwest::Url::parse(value).context("API Base URL 无效")?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        bail!("模型 URL 必须是包含主机名的 http 或 https 地址");
+        bail!("API Base URL 必须是包含主机名的 http 或 https 地址");
     }
     Ok(())
 }

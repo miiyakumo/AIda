@@ -89,6 +89,12 @@ pub fn parse(input: &str) -> Result<UserAction> {
         ["/project", "config"] => Ok(UserAction::Project(ProjectAction::Config(
             ConfigAction::Show,
         ))),
+        ["/project", "config", "url"] => {
+            bail!("缺少 API Base URL；用法：/project config url https://api.example.com")
+        }
+        ["/project", "config", "model"] => {
+            bail!("缺少模型名称；用法：/project config model MODEL_NAME")
+        }
         ["/project", "config", "mode", mode @ ("full" | "improv")] => Ok(UserAction::Project(
             ProjectAction::Config(ConfigAction::Mode((*mode).to_string())),
         )),
@@ -127,6 +133,9 @@ pub fn parse(input: &str) -> Result<UserAction> {
         ["/project", "config", "key"] => Ok(UserAction::Project(ProjectAction::Config(
             ConfigAction::ApiKey(None),
         ))),
+        ["/project", "config", "key", ..] => {
+            bail!("不要在命令中输入模型密钥；请只输入 /project config key，再通过隐藏输入设置")
+        }
         ["/alda", "play"] => Ok(UserAction::Alda(AldaAction::Play(None))),
         ["/alda", "play", version] => Ok(UserAction::Alda(AldaAction::Play(Some(parse_version(
             version,
@@ -147,6 +156,12 @@ pub fn parse(input: &str) -> Result<UserAction> {
         }
         _ => bail!("未知或参数不完整的命令；输入 /help 查看用法"),
     }
+}
+
+#[must_use]
+pub fn contains_inline_api_key(input: &str) -> bool {
+    let words = input.split_whitespace().collect::<Vec<_>>();
+    matches!(words.as_slice(), ["/project", "config", "key", _, ..])
 }
 
 fn parse_version(value: &str) -> Result<u32> {
@@ -226,5 +241,13 @@ mod tests {
             UserAction::Project(ProjectAction::Config(ConfigAction::ApiKey(None)))
         );
         assert!(parse("/project config key secret").is_err());
+        assert!(contains_inline_api_key(" /project config key secret"));
+        assert!(!contains_inline_api_key("/project config key"));
+        assert!(
+            parse("/project config url")
+                .unwrap_err()
+                .to_string()
+                .contains("API Base URL")
+        );
     }
 }

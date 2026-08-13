@@ -1,14 +1,18 @@
 use crate::agent::{AgentEvent, AgentReporter};
 use crate::alda::{AldaCheck, CancellationToken, CheckStatus};
 use crate::application::{ActionResult, Application, ProjectView};
-use crate::command::{ALDA_COMMANDS, CONFIG_COMMANDS, PROJECT_COMMANDS, TOP_LEVEL_COMMANDS, parse};
+use crate::command::{
+    ALDA_COMMANDS, CONFIG_COMMANDS, PROJECT_COMMANDS, TOP_LEVEL_COMMANDS, contains_inline_api_key,
+    parse,
+};
 use crate::command::{ProjectAction, UserAction};
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reedline::{
     ColumnarMenu, Completer, DefaultPrompt, DefaultPromptSegment, Emacs, FileBackedHistory,
-    KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span,
-    Suggestion, default_emacs_keybindings,
+    History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, MenuBuilder,
+    Reedline, ReedlineEvent, ReedlineMenu, SearchQuery, Signal, Span, Suggestion,
+    default_emacs_keybindings,
 };
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -33,7 +37,10 @@ pub async fn run_repl(project_dir: PathBuf, name: String) -> Result<()> {
 }
 
 async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Result<()> {
-    let history = FileBackedHistory::with_file(500, project_dir.join(".repl-history"));
+    let history_path = project_dir.join(".repl-history");
+    sanitize_history_file(&history_path)?;
+    let history = FileBackedHistory::with_file(500, history_path)
+        .map(|history| SensitiveHistory { inner: history });
     let versions = Arc::new(RwLock::new(Vec::new()));
     let mut keybindings = default_emacs_keybindings();
     keybindings.add_binding(
@@ -146,19 +153,27 @@ async fn execute_line(
     let cancellation = CancellationToken::default();
     application.set_cancellation(cancellation.clone());
     let alda_active = Arc::clone(&reporter.alda_active);
-    let operation = application.execute(action, reporter);
-    tokio::pin!(operation);
-    let result = tokio::select! {
-        result = &mut operation => result,
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("无法监听 Ctrl+C")?;
-            cancellation.cancel();
-            if direct_alda || alda_active.load(Ordering::SeqCst) {
-                let _ = operation.await;
+    let result = {
+        let operation = application.execute(action, reporter);
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => Some(result),
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("无法监听 Ctrl+C")?;
+                cancellation.cancel();
+                if direct_alda || alda_active.load(Ordering::SeqCst) {
+                    let _ = operation.await;
+                }
+                None
             }
-            eprintln!("! 已取消当前操作；当前有效版本未改变。\n  下一步：重新输入要求，或试听当前版本。");
-            return Ok(true);
         }
+    };
+    reporter.finish_operation();
+    let Some(result) = result else {
+        eprintln!(
+            "! 已取消当前操作；当前有效版本未改变。\n  下一步：重新输入要求，或试听当前版本。"
+        );
+        return Ok(true);
     };
     match result {
         Ok(ActionResult::Quit) => Ok(false),
@@ -242,6 +257,97 @@ struct PlainReporter<'a, W> {
     writer: &'a mut W,
     model_open: bool,
 }
+
+struct SensitiveHistory {
+    inner: FileBackedHistory,
+}
+
+impl History for SensitiveHistory {
+    fn save(&mut self, item: HistoryItem) -> reedline::Result<HistoryItem> {
+        if contains_inline_api_key(&item.command_line) {
+            Ok(item)
+        } else {
+            self.inner.save(item)
+        }
+    }
+
+    fn load(&self, id: HistoryItemId) -> reedline::Result<HistoryItem> {
+        self.inner.load(id)
+    }
+
+    fn count(&self, query: SearchQuery) -> reedline::Result<i64> {
+        self.inner.count(query)
+    }
+
+    fn search(&self, query: SearchQuery) -> reedline::Result<Vec<HistoryItem>> {
+        self.inner.search(query)
+    }
+
+    fn update(
+        &mut self,
+        id: HistoryItemId,
+        updater: &dyn Fn(HistoryItem) -> HistoryItem,
+    ) -> reedline::Result<()> {
+        self.inner.update(id, updater)
+    }
+
+    fn clear(&mut self) -> reedline::Result<()> {
+        self.inner.clear()
+    }
+
+    fn delete(&mut self, id: HistoryItemId) -> reedline::Result<()> {
+        self.inner.delete(id)
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
+
+    fn session(&self) -> Option<HistorySessionId> {
+        self.inner.session()
+    }
+}
+
+fn sanitize_history_file(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("无法读取项目输入历史 {}", path.display()))?;
+    let retained = contents
+        .lines()
+        .filter(|line| !contains_inline_api_key(line))
+        .collect::<Vec<_>>();
+    if retained.len() == contents.lines().count() {
+        return Ok(());
+    }
+    let sanitized = if retained.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", retained.join("\n"))
+    };
+    let temporary = path.with_extension(format!("history-sanitize-{}", std::process::id()));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("无法创建脱敏历史 {}", temporary.display()))?;
+        file.write_all(sanitized.as_bytes())
+            .with_context(|| format!("无法写入脱敏历史 {}", temporary.display()))?;
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("无法更新脱敏历史 {}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
 impl<W: Write> AgentReporter for PlainReporter<'_, W> {
     fn report(&mut self, event: AgentEvent) {
         if let AgentEvent::ModelText(text) = &event {
@@ -299,6 +405,11 @@ impl TerminalReporter {
             self.model_open = false;
         }
     }
+    fn finish_operation(&mut self) {
+        self.close_model();
+        self.finish_spinner();
+        self.alda_active.store(false, Ordering::SeqCst);
+    }
 }
 impl AgentReporter for TerminalReporter {
     fn report(&mut self, event: AgentEvent) {
@@ -350,8 +461,7 @@ impl AgentReporter for TerminalReporter {
 }
 impl Drop for TerminalReporter {
     fn drop(&mut self) {
-        self.close_model();
-        self.finish_spinner();
+        self.finish_operation();
     }
 }
 
@@ -506,10 +616,50 @@ mod tests {
             model_key_configured: true,
             alda_available: true,
             model_configured: true,
+            model_service_status: "最近成功".into(),
         };
         assert_eq!(
             project_summary(&view),
             "poem · v2 · 完整曲目 · 180 秒 · +piano · -violin"
         );
+    }
+
+    #[test]
+    fn sanitizes_only_inline_api_keys_from_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".repl-history");
+        std::fs::write(
+            &path,
+            "/project\n/project config key secret-value\n/project config key\n自然语言要求\n",
+        )
+        .unwrap();
+
+        sanitize_history_file(&path).unwrap();
+
+        let history = std::fs::read_to_string(path).unwrap();
+        assert_eq!(history, "/project\n/project config key\n自然语言要求\n");
+        assert!(!history.contains("secret-value"));
+    }
+
+    #[test]
+    fn sensitive_history_never_persists_inline_api_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".repl-history");
+        let inner = FileBackedHistory::with_file(10, path.clone()).unwrap();
+        let mut history = SensitiveHistory { inner };
+
+        history
+            .save(HistoryItem::from_command_line("/project"))
+            .unwrap();
+        history
+            .save(HistoryItem::from_command_line(
+                " /project config key secret-value",
+            ))
+            .unwrap();
+        history.sync().unwrap();
+
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert_eq!(persisted, "/project\n");
+        assert!(!persisted.contains("secret-value"));
     }
 }

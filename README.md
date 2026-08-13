@@ -30,7 +30,7 @@ bash scripts/install-linux.sh --check
 
 安装脚本只处理或检查运行依赖，不安装 `alda-agent` 本身；当前版本从源码通过 Cargo 运行。
 
-模型配置属于项目。先进入项目，再通过项目内命令分别设置模型名称、URL 和密钥：
+模型配置属于项目。先进入项目，再通过项目内命令分别设置模型名称、API Base URL 和密钥：
 
 ```console
 /project config model your-model-id
@@ -38,9 +38,9 @@ bash scripts/install-linux.sh --check
 /project config key
 ```
 
-密钥由隐藏输入读取，不进入 REPL 历史；三项设置持久化在项目的私有 `model.json` 中，状态和配置输出
-不会回显密钥。客户端使用 OpenAI-compatible 的 `/v1/chat/completions` 流式接口。素材、创作要求、
-当前乐谱和校验错误会发送给所配置的模型服务。
+密钥由隐藏输入读取，不进入 REPL 历史；若误把密钥写在命令后，程序会拒绝并排除该历史项。三项设置
+持久化在项目的私有 `model.json` 中，状态和配置输出不会回显密钥。客户端使用 OpenAI-compatible 的
+`/v1/chat/completions` 流式接口。素材、创作要求、当前乐谱和校验错误会发送给所配置的模型服务。
 
 ## 使用
 

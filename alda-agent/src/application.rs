@@ -7,7 +7,7 @@ use crate::command::{
 };
 use crate::config::ModelConfig;
 use crate::conversation::{ConversationMessage, ConversationRole, ConversationState};
-use crate::deepseek::DeepSeekClient;
+use crate::deepseek::{ChatError, DeepSeekClient};
 use crate::project::{CheckRecord, Project};
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -28,6 +28,7 @@ pub struct ProjectView {
     pub model_key_configured: bool,
     pub alda_available: bool,
     pub model_configured: bool,
+    pub model_service_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,23 +61,49 @@ pub enum ActionResult {
 pub struct Application {
     project: Project,
     alda: Option<AldaRunner>,
-    model_error: Option<String>,
+    last_model_failure: Option<ModelFailure>,
+    model_request_succeeded: bool,
     playback_version: Option<u32>,
     privacy_shown: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ModelFailure {
+    Auth(String),
+    RateLimit(String),
+    Network(String),
+    Rejected(String),
+}
+
+impl ModelFailure {
+    fn from_error(error: &anyhow::Error) -> Option<Self> {
+        error.downcast_ref::<ChatError>().map(|error| match error {
+            ChatError::Auth(message) => Self::Auth(message.clone()),
+            ChatError::RateLimit(message) => Self::RateLimit(message.clone()),
+            ChatError::Network(message) => Self::Network(message.clone()),
+            ChatError::ModelReject(message) => Self::Rejected(message.clone()),
+        })
+    }
+
+    fn status(&self) -> String {
+        match self {
+            Self::Auth(message) => format!("认证失败：{message}；请重新设置模型密钥"),
+            Self::RateLimit(message) => format!("请求限流：{message}；稍后重试相同要求"),
+            Self::Network(message) => format!("连接失败：{message}；请检查 API Base URL 或网络"),
+            Self::Rejected(message) => format!("请求被模型拒绝：{message}"),
+        }
+    }
 }
 
 impl Application {
     pub fn open(root: PathBuf, name: &str) -> Result<Self> {
         let project = Project::load_or_create(root, name, "")?;
         let alda = find_alda().map(AldaRunner::new);
-        let model_error = ModelConfig::load(project.root())
-            .and_then(|config| config.resolve())
-            .err()
-            .map(|error| error.to_string());
         Ok(Self {
             project,
             alda,
-            model_error,
+            last_model_failure: None,
+            model_request_succeeded: false,
             playback_version: None,
             privacy_shown: false,
         })
@@ -84,14 +111,11 @@ impl Application {
 
     #[must_use]
     pub fn from_project(project: Project, alda: Option<AldaRunner>) -> Self {
-        let model_error = ModelConfig::load(project.root())
-            .and_then(|config| config.resolve())
-            .err()
-            .map(|error| error.to_string());
         Self {
             project,
             alda,
-            model_error,
+            last_model_failure: None,
+            model_request_succeeded: false,
             playback_version: None,
             privacy_shown: false,
         }
@@ -106,7 +130,13 @@ impl Application {
 
     #[must_use]
     pub fn project_view(&self) -> ProjectView {
-        let model_config = ModelConfig::load(self.project.root()).unwrap_or_default();
+        let model_config_result = ModelConfig::load(self.project.root());
+        let model_config = model_config_result.as_ref().ok();
+        let model_configured = model_config_result
+            .as_ref()
+            .ok()
+            .and_then(|config| config.resolve().ok())
+            .is_some();
         ProjectView {
             name: self.project.project_name.clone(),
             first_request: self.project.conversation().first_request().map(summarize),
@@ -128,29 +158,50 @@ impl Application {
             excluded_instruments: self.project.excluded_instruments().to_vec(),
             creative_strategy: (!self.project.creative_strategy().is_empty())
                 .then(|| self.project.creative_strategy().to_string()),
-            model_name: model_config.model().map(ToString::to_string),
-            model_url: model_config.base_url().map(ToString::to_string),
-            model_key_configured: model_config.has_api_key(),
+            model_name: model_config
+                .and_then(|config| config.model())
+                .map(ToString::to_string),
+            model_url: model_config
+                .and_then(|config| config.base_url())
+                .map(ToString::to_string),
+            model_key_configured: model_config.is_some_and(ModelConfig::has_api_key),
             alda_available: self.alda.is_some(),
-            model_configured: self.model_error.is_none(),
+            model_configured,
+            model_service_status: self.last_model_failure.as_ref().map_or_else(
+                || {
+                    if self.model_request_succeeded {
+                        "最近成功".to_string()
+                    } else {
+                        "未尝试".to_string()
+                    }
+                },
+                ModelFailure::status,
+            ),
         }
     }
 
     #[must_use]
     pub fn conversation_view(&self) -> ConversationView {
         let state = self.project.conversation().state();
+        let config_error = ModelConfig::load(self.project.root())
+            .and_then(|config| config.resolve())
+            .err();
         let next_step = if let Some(version) = self.playback_version {
             format!("已发起播放 v{version} · /alda stop 停止")
-        } else if let Some(error) = &self.model_error {
+        } else if let Some(error) = config_error {
             format!(
                 "仅本地 · 模型配置不可用：{error}；使用 /project config 设置，或继续使用 /alda 和 /project"
             )
-        } else if self.project.current_version() == 0 {
-            "新项目 · 描述你想创作的作品，也可以直接粘贴参考素材".to_string()
+        } else if let Some(failure) = &self.last_model_failure {
+            format!("模型服务最近失败 · {}", failure.status())
         } else if state == ConversationState::AwaitingInput {
             "等待补充信息 · 直接回答上面的问题".to_string()
         } else if state == ConversationState::RevisionAvailable {
             "修正未完成 · 输入“继续修正”，也可以提出新的要求".to_string()
+        } else if state == ConversationState::RequestPending {
+            "上次请求未完成 · 重新提交相同内容可安全重试，也可以输入新的补充要求".to_string()
+        } else if self.project.current_version() == 0 {
+            "新项目 · 描述你想创作的作品，也可以直接粘贴参考素材".to_string()
         } else {
             "就绪 · 输入修改要求；/alda play 试听；输入 / 后按 Tab 查看命令".to_string()
         };
@@ -181,7 +232,7 @@ impl Application {
         prompt: String,
         reporter: &mut impl AgentReporter,
     ) -> Result<ActionResult> {
-        self.project.add_user_message(&prompt)?;
+        self.project.prepare_user_message(&prompt)?;
         if !self.privacy_shown {
             reporter.report(crate::agent::AgentEvent::PrivacyNotice);
             self.privacy_shown = true;
@@ -189,10 +240,7 @@ impl Application {
         let config =
             match ModelConfig::load(self.project.root()).and_then(|config| config.resolve()) {
                 Ok(config) => config,
-                Err(error) => {
-                    self.model_error = Some(error.to_string());
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
         let runner = self
             .alda
@@ -222,11 +270,12 @@ impl Application {
             .await;
         let result = match result {
             Ok(result) => {
-                self.model_error = None;
+                self.last_model_failure = None;
+                self.model_request_succeeded = true;
                 result
             }
             Err(error) => {
-                self.model_error = Some(error.to_string());
+                self.last_model_failure = ModelFailure::from_error(&error);
                 return Err(error);
             }
         };
@@ -385,7 +434,8 @@ impl Application {
         let mut config = ModelConfig::load(self.project.root())?;
         update(&mut config)?;
         config.save(self.project.root())?;
-        self.model_error = config.resolve().err().map(|error| error.to_string());
+        self.last_model_failure = None;
+        self.model_request_succeeded = false;
         Ok(ActionResult::Message("✓ 已更新项目模型配置".to_string()))
     }
 
@@ -481,7 +531,7 @@ fn render_versions(view: &ProjectView) -> String {
 }
 fn render_config(view: &ProjectView) -> String {
     format!(
-        "模式：{}\n目标时长：{}\n包含乐器：{}\n排除乐器：{}\n创作策略：{}\n模型名称：{}\n模型 URL：{}\n模型密钥：{}",
+        "模式：{}\n目标时长：{}\n包含乐器：{}\n排除乐器：{}\n创作策略：{}\n模型名称：{}\nAPI Base URL：{}\n模型密钥：{}",
         view.mode,
         view.target_duration_secs
             .map_or_else(|| "无".to_string(), |value| format!("{value} 秒")),
@@ -499,14 +549,15 @@ fn render_config(view: &ProjectView) -> String {
 }
 fn render_project(view: &ProjectView) -> String {
     format!(
-        "项目：{}\n首次请求：{}\n当前版本：{}\n{}\nAlda：{}\n模型配置：{}",
+        "项目：{}\n首次请求：{}\n当前版本：{}\n{}\nAlda：{}\n模型配置：{}\n模型服务：{}",
         view.name,
         view.first_request.as_deref().unwrap_or("无"),
         view.current_version
             .map_or_else(|| "无".to_string(), |value| format!("v{value}")),
         render_config(view),
         available(view.alda_available),
-        available(view.model_configured)
+        available(view.model_configured),
+        view.model_service_status
     )
 }
 fn empty(values: &[String]) -> String {
@@ -558,10 +609,38 @@ mod tests {
         let restarted = Application::open(root, "poem").unwrap();
         let rendered = render_config(&restarted.project_view());
         assert!(rendered.contains("模型名称：example-model"));
-        assert!(rendered.contains("模型 URL：https://api.example.com"));
+        assert!(rendered.contains("API Base URL：https://api.example.com"));
         assert!(rendered.contains("模型密钥：已设置"));
         assert!(!rendered.contains("secret-test-value"));
         assert!(restarted.project_view().model_configured);
+    }
+
+    #[test]
+    fn service_failure_does_not_make_complete_configuration_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("poem");
+        let project = Project::load_or_create(root, "poem", "").unwrap();
+        let mut application = Application::from_project(project, None);
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application
+            .configure(ConfigAction::Url("https://api.example.com".to_string()))
+            .unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+        application.last_model_failure = Some(ModelFailure::RateLimit("请稍后重试".to_string()));
+
+        let view = application.project_view();
+        assert!(view.model_configured);
+        assert!(view.model_service_status.contains("限流"));
+        assert!(
+            application
+                .conversation_view()
+                .next_step
+                .contains("稍后重试")
+        );
     }
 
     #[tokio::test]
@@ -616,5 +695,9 @@ mod tests {
         drop(application);
         let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
         assert_eq!(reloaded.conversation().first_request(), Some("首次请求"));
+        assert_eq!(
+            reloaded.conversation().state(),
+            ConversationState::RequestPending
+        );
     }
 }

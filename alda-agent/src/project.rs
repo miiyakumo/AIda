@@ -139,6 +139,21 @@ impl Project {
         self.write_metadata()
     }
 
+    pub fn prepare_user_message(&mut self, content: &str) -> Result<()> {
+        if content.trim().is_empty() {
+            bail!("对话消息不能为空");
+        }
+        let is_same_pending_request = self.conversation.state()
+            == ConversationState::RequestPending
+            && self.conversation.last_user_message() == Some(content);
+        if !is_same_pending_request {
+            self.conversation.add_user_message(content.to_string());
+        }
+        self.conversation
+            .set_state(ConversationState::RequestPending);
+        self.write_metadata()
+    }
+
     pub fn finish_agent_turn(
         &mut self,
         assistant_text: String,
@@ -598,5 +613,26 @@ mod tests {
         let loaded =
             Project::load_or_create(directory.path().to_path_buf(), "test", "ignored").unwrap();
         assert_eq!(loaded.mode(), "full");
+    }
+
+    #[test]
+    fn retrying_same_pending_request_does_not_duplicate_user_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+
+        project.prepare_user_message("同一个请求").unwrap();
+        project.prepare_user_message("同一个请求").unwrap();
+
+        assert_eq!(project.conversation().messages().len(), 1);
+        assert_eq!(
+            project.conversation().state(),
+            ConversationState::RequestPending
+        );
+        drop(project);
+
+        let mut restarted = Project::load_or_create(root, "ignored", "").unwrap();
+        restarted.prepare_user_message("同一个请求").unwrap();
+        assert_eq!(restarted.conversation().messages().len(), 1);
     }
 }

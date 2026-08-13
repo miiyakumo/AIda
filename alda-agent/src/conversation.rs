@@ -39,6 +39,7 @@ pub enum ConversationState {
     Ready,
     AwaitingInput,
     RevisionAvailable,
+    RequestPending,
 }
 
 impl Conversation {
@@ -56,6 +57,15 @@ impl Conversation {
     pub fn first_request(&self) -> Option<&str> {
         self.messages
             .iter()
+            .find(|message| message.role == ConversationRole::User)
+            .and_then(|message| message.content.as_deref())
+    }
+
+    #[must_use]
+    pub fn last_user_message(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
             .find(|message| message.role == ConversationRole::User)
             .and_then(|message| message.content.as_deref())
     }

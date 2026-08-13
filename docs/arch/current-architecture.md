@@ -55,11 +55,17 @@ Project 与进程内能力状态派生，不是新的事实来源。
 ## 能力与降级
 
 项目、Alda 和模型能力独立：打开项目不创建模型客户端；自然语言操作才读取项目内 `model.json` 并
-创建客户端。模型名称、OpenAI-compatible URL 和密钥必须全部设置；模型失败不会阻止 `/project` 或
-可用的 `/alda` 操作。Alda 缺失时仍可导出版本的 Alda 源码；请求 MIDI 或 all 会明确报告 MIDI 未完成。
+创建客户端。模型名称、OpenAI-compatible API Base URL 和密钥必须全部设置；模型失败不会阻止
+`/project` 或可用的 `/alda` 操作。Alda 缺失时仍可导出版本的 Alda 源码；请求 MIDI 或 all 会明确
+报告 MIDI 未完成。
 
-模型名称和 URL 由普通 `/project config` 命令设置。密钥使用 `/project config key` 后的隐藏输入，避免
-进入 `.repl-history`；配置视图只显示密钥是否存在。`model.json` 在 Unix 上以 `0600` 权限原子写入。
+模型配置完整性、最近模型服务状态和对话请求状态彼此独立。限流、认证、网络或模型拒绝不会把完整配置
+标成不可用；界面按错误类型分别提示稍后重试、更新密钥或检查 API Base URL。用户消息在请求前以
+`request_pending` 状态持久化；失败或取消后重新提交相同内容会复用原消息，不会重复污染模型上下文。
+
+模型名称和 API Base URL 由普通 `/project config` 命令设置。密钥使用 `/project config key` 后的隐藏
+输入，避免进入 `.repl-history`；携带明文参数的 key 命令会被拒绝且不写入历史，启动时也会清理旧历史
+中的同类行。配置视图只显示密钥是否存在。`model.json` 在 Unix 上以 `0600` 权限原子写入。
 程序不读取 `.env` 或模型环境变量。`compose` 与 `doctor --probe model` 通过 Shell 的 `--project` 或
 `--name` 选择同一个项目配置，未指定时使用当前目录。
 
