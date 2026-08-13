@@ -53,6 +53,7 @@ async fn run_terminal(application: &mut Application, project_dir: PathBuf) -> Re
     );
     let menu = ColumnarMenu::default().with_name("commands");
     let mut editor = Reedline::create()
+        .use_bracketed_paste(true)
         .with_completer(Box::new(CommandCompleter {
             versions: Arc::clone(&versions),
         }))

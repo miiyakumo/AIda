@@ -38,7 +38,8 @@ alda-agent doctor [--probe model|alda|all] # 无 probe 时只做本地环境检�
 项目内命令按职责分组：自然语言输入进入 Agent；`/alda` 只执行本地工具动作；`/project` 查看和修改
 持久项目；`/help` 提供分层帮助；`/quit` 退出。旧的扁平命令已删除。
 
-TTY 使用 reedline 0.49，支持 bracketed paste、多行输入、项目级 500 条历史和 Tab 补全。Alt+Enter、
+TTY 使用 reedline 0.49，并显式启用 bracketed paste，使多行粘贴先完整进入编辑缓冲、等待 Enter 后再作为
+一条请求提交；同时支持多行输入、项目级 500 条历史和 Tab 补全。Alt+Enter、
 Shift+Enter 插入换行，普通 Enter 提交。非 TTY 使用逐行纯文本适配器，不输出控制序列或动画。
 indicatif 0.18 只负责 TTY 活动指示；所有阶段和结果仍是稳定的语义事件与文本。
 

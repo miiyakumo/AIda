@@ -26,3 +26,4 @@ indicatif = "0.18"
 rpassword = "7"
 
 [dev-dependencies]
+portable-pty = "0.9"
