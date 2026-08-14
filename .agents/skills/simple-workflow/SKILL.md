@@ -1,6 +1,6 @@
 ---
 name: simple-workflow
-description: Coordinate complex work through the smallest useful Brain–Worker–Reviewer workflow. Use when the user explicitly requests delegation, parallel agents, or independent review, or when a long or high-risk task has genuinely independent workstreams and delegation materially reduces latency, context pressure, or review risk. Do not trigger merely because a task has multiple steps, touches multiple files, can theoretically be staged, or asks for routine inspection or status reporting. Invoking the skill does not require spawning agents when one agent is sufficient.
+description: Coordinate complex work through the smallest useful Brain–Worker–Reviewer workflow. Use when the user explicitly requests delegation, parallel agents, or independent review, or when a long or high-risk task has genuinely independent workstreams and delegation materially reduces latency, context pressure, or review risk. Do not trigger merely because a task has multiple steps, touches multiple files, can theoretically be staged, or asks for routine inspection or status reporting. Invoking the skill does not require spawning agents when one agent is sufficient. Do not use for system-wide codebase refactors handled by refactor-codebase.
 ---
 
 # Simple Agent Workflow

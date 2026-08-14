@@ -1,0 +1,4 @@
+interface:
+  display_name: "Refactor Codebase"
+  short_description: "Review and execute system-wide refactors"
+  default_prompt: "Use $refactor-codebase to audit and execute an evidence-based, behavior-preserving system refactor."
