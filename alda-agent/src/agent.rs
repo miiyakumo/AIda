@@ -1,6 +1,7 @@
 use crate::alda::{AldaCheck, AldaRunner, CheckStatus};
 use crate::conversation::{ConversationMessage, ConversationRole, ConversationToolCall};
 use crate::deepseek::{DeepSeekClient, FunctionDef, Message, StreamEvent, Tool};
+use crate::instructions::{CompiledInstructions, ProjectPreferences};
 use anyhow::{Context, Result, bail};
 use std::fmt::Write as _;
 use std::fs;
@@ -8,9 +9,6 @@ use std::fs;
 // ============================================================
 // 系统提示
 // ============================================================
-
-const PROTOCOL_PROMPT: &str = include_str!("../prompts/protocol.md");
-const DEFAULT_CREATIVE_STRATEGY: &str = include_str!("../prompts/default-creative-strategy.md");
 
 // ============================================================
 // 工具定义
@@ -54,8 +52,8 @@ pub struct CreationRequest {
     pub source_material: String,
     /// 本次创作的自然语言要求
     pub instructions: String,
-    /// 项目级创作策略；为空时仅使用内置默认
-    pub creative_strategy: String,
+    /// 由宿主编译的不可变有效指示
+    pub compiled_instructions: CompiledInstructions,
     /// 创作模式
     pub mode: CreationMode,
     /// 目标时长（秒），None 不检查
@@ -68,7 +66,7 @@ pub struct CreationRequest {
     pub max_rounds: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreationMode {
     FullPiece,
     Improvisation,
@@ -83,6 +81,13 @@ impl CreationMode {
             CreationMode::Improvisation => {
                 "即兴片段：强调自由发展，允许开放式收束；模式本身不预设时长"
             }
+        }
+    }
+
+    fn profile_value(self) -> &'static str {
+        match self {
+            Self::FullPiece => "full",
+            Self::Improvisation => "improv",
         }
     }
 }
@@ -126,7 +131,7 @@ pub struct ModifyRequest {
     pub source_material: String,
     pub current_alda: String,
     pub feedback: String,
-    pub creative_strategy: String,
+    pub compiled_instructions: CompiledInstructions,
     pub mode: CreationMode,
     pub target_duration_secs: Option<f64>,
     pub included_instruments: Vec<String>,
@@ -136,6 +141,8 @@ pub struct ModifyRequest {
 
 pub struct ContinueRequest {
     pub conversation: Vec<Message>,
+    pub compiled_instructions: CompiledInstructions,
+    pub mode: CreationMode,
     pub target_duration_secs: Option<f64>,
     pub included_instruments: Vec<String>,
     pub excluded_instruments: Vec<String>,
@@ -146,7 +153,7 @@ pub struct ProjectPromptRequest {
     pub conversation: Vec<ConversationMessage>,
     pub current_alda: Option<String>,
     pub working_alda: Option<String>,
-    pub creative_strategy: String,
+    pub compiled_instructions: CompiledInstructions,
     pub mode: CreationMode,
     pub target_duration_secs: Option<f64>,
     pub included_instruments: Vec<String>,
@@ -278,9 +285,16 @@ impl Agent {
         if request.conversation.is_empty() {
             bail!("对话不能为空");
         }
+        validate_compiled_preferences(
+            &request.compiled_instructions,
+            request.mode,
+            request.target_duration_secs,
+            &request.included_instruments,
+            &request.excluded_instruments,
+        )?;
         let mut messages = vec![Message {
             role: "system".to_string(),
-            content: Some(PROTOCOL_PROMPT.to_string()),
+            content: Some(request.compiled_instructions.rendered().to_string()),
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -312,10 +326,17 @@ impl Agent {
         if request.source_material.trim().is_empty() && request.instructions.trim().is_empty() {
             bail!("创作素材与要求不能同时为空");
         }
+        validate_compiled_preferences(
+            &request.compiled_instructions,
+            request.mode,
+            request.target_duration_secs,
+            &request.included_instruments,
+            &request.excluded_instruments,
+        )?;
         let messages = vec![
             Message {
                 role: "system".to_string(),
-                content: Some(PROTOCOL_PROMPT.to_string()),
+                content: Some(request.compiled_instructions.rendered().to_string()),
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -356,11 +377,18 @@ impl Agent {
         if request.feedback.trim().is_empty() {
             bail!("修改要求不能为空");
         }
+        validate_compiled_preferences(
+            &request.compiled_instructions,
+            request.mode,
+            request.target_duration_secs,
+            &request.included_instruments,
+            &request.excluded_instruments,
+        )?;
 
         let messages = vec![
             Message {
                 role: "system".to_string(),
-                content: Some(PROTOCOL_PROMPT.to_string()),
+                content: Some(request.compiled_instructions.rendered().to_string()),
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -398,8 +426,26 @@ impl Agent {
         if request.conversation.is_empty() {
             bail!("没有可继续的生成上下文");
         }
+        validate_compiled_preferences(
+            &request.compiled_instructions,
+            request.mode,
+            request.target_duration_secs,
+            &request.included_instruments,
+            &request.excluded_instruments,
+        )?;
+        let mut conversation = request.conversation;
+        conversation.retain(|message| message.role != "system");
+        conversation.insert(
+            0,
+            Message {
+                role: "system".to_string(),
+                content: Some(request.compiled_instructions.rendered().to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
         self.run_generation(
-            request.conversation,
+            conversation,
             ValidationRequest {
                 target_duration_ms: request.target_duration_secs.map(|seconds| seconds * 1000.0),
                 included_instruments: request.included_instruments,
@@ -617,6 +663,30 @@ impl Agent {
     }
 }
 
+fn validate_compiled_preferences(
+    compiled: &CompiledInstructions,
+    mode: CreationMode,
+    target_duration_secs: Option<f64>,
+    included_instruments: &[String],
+    excluded_instruments: &[String],
+) -> Result<()> {
+    let provided = ProjectPreferences {
+        mode: mode.profile_value().to_string(),
+        target_duration_secs,
+        included_instruments: included_instruments.to_vec(),
+        excluded_instruments: excluded_instruments.to_vec(),
+    };
+    provided.validate()?;
+    let expected = provided.normalized();
+    if expected != provided {
+        bail!("本次真实校验约束必须先规范化、排序并去重");
+    }
+    if compiled.resolved_preferences() != &expected {
+        bail!("编译指示中的项目偏好与本次真实校验约束不一致");
+    }
+    Ok(())
+}
+
 fn validate_generation_constraints(validation: &ValidationRequest) -> Result<()> {
     if validation
         .target_duration_ms
@@ -650,7 +720,6 @@ fn validate_generation_constraints(validation: &ValidationRequest) -> Result<()>
 fn build_user_message(request: &CreationRequest) -> String {
     let mut msg = String::new();
 
-    append_strategy_context(&mut msg, &request.creative_strategy);
     msg.push_str("【创作上下文】\n");
 
     if !request.source_material.is_empty() {
@@ -694,7 +763,6 @@ fn build_user_message(request: &CreationRequest) -> String {
 
 fn build_project_context(request: &ProjectPromptRequest) -> String {
     let mut message = String::new();
-    append_strategy_context(&mut message, &request.creative_strategy);
     message.push_str("【项目设置】\n【模式】");
     message.push_str(request.mode.description());
     message.push('\n');
@@ -729,7 +797,6 @@ fn build_project_context(request: &ProjectPromptRequest) -> String {
 
 fn build_modify_message(request: &ModifyRequest) -> String {
     let mut msg = String::new();
-    append_strategy_context(&mut msg, &request.creative_strategy);
     msg.push_str("【修改上下文】\n这是一次独立的作品修改请求。不要假定或延续此前对话中的修改方案，只以本消息提供的素材、当前乐谱、最新反馈和约束为准。\n\n");
 
     if !request.source_material.trim().is_empty() {
@@ -764,17 +831,6 @@ fn build_modify_message(request: &ModifyRequest) -> String {
     msg.push_str("\n\n【本轮要求｜来源：当前用户反馈｜最高策略优先级】\n");
     msg.push_str(request.feedback.trim());
     msg
-}
-
-fn append_strategy_context(msg: &mut String, project_strategy: &str) {
-    msg.push_str("【默认创作策略｜来源：内置默认】\n");
-    msg.push_str(DEFAULT_CREATIVE_STRATEGY.trim());
-    msg.push_str("\n\n");
-    if !project_strategy.trim().is_empty() {
-        msg.push_str("【项目创作策略｜来源：用户项目配置｜覆盖冲突的默认策略】\n");
-        msg.push_str(project_strategy.trim());
-        msg.push_str("\n\n");
-    }
 }
 
 struct SubmittedResult {
@@ -943,11 +999,21 @@ mod tests {
         (directory, AldaRunner::new(executable))
     }
 
+    fn compiled_instructions(preferences: &ProjectPreferences) -> CompiledInstructions {
+        let catalog = crate::skills::SkillCatalog::discover(None, None).unwrap();
+        CompiledInstructions::compile(
+            &catalog,
+            &crate::instructions::InstructionProfile::default(),
+            preferences,
+        )
+        .unwrap()
+    }
+
     fn request(max_rounds: usize) -> CreationRequest {
         CreationRequest {
             source_material: "素材".to_string(),
             instructions: "创作完整器乐作品".to_string(),
-            creative_strategy: "保持明亮欢快".to_string(),
+            compiled_instructions: compiled_instructions(&ProjectPreferences::default()),
             mode: CreationMode::FullPiece,
             target_duration_secs: None,
             included_instruments: Vec::new(),
@@ -961,7 +1027,12 @@ mod tests {
             source_material: "原始诗歌".to_string(),
             current_alda: "midi-piano: c1".to_string(),
             feedback: "编排单调，艺术性不高".to_string(),
-            creative_strategy: "保持明亮欢快".to_string(),
+            compiled_instructions: compiled_instructions(&ProjectPreferences {
+                target_duration_secs: Some(180.0),
+                included_instruments: vec!["midi-cello".to_string()],
+                excluded_instruments: vec!["midi-timpani".to_string()],
+                ..ProjectPreferences::default()
+            }),
             mode: CreationMode::FullPiece,
             target_duration_secs: Some(180.0),
             included_instruments: vec!["midi-cello".to_string()],
@@ -972,15 +1043,23 @@ mod tests {
 
     #[test]
     fn modification_prompt_routes_scope_from_clean_project_context() {
-        let message = build_modify_message(&modify_request());
+        let request = modify_request();
+        assert!(
+            request
+                .compiled_instructions
+                .rendered()
+                .contains("可以重写曲式、主题发展、织体与配器")
+        );
+        assert!(
+            request
+                .compiled_instructions
+                .rendered()
+                .contains("一次只问一个简短问题")
+        );
+        let message = build_modify_message(&request);
         assert!(message.contains("不要假定或延续此前对话"));
         assert!(message.contains("【原始素材】\n原始诗歌"));
-        assert!(message.contains("【默认创作策略｜来源：内置默认】"));
-        assert!(message.contains("【项目创作策略｜来源：用户项目配置"));
-        assert!(message.contains("保持明亮欢快"));
         assert!(message.contains("【本轮要求｜来源：当前用户反馈｜最高策略优先级】"));
-        assert!(message.contains("可以重写曲式、主题发展、织体与配器"));
-        assert!(message.contains("只提出一个简短澄清问题"));
         assert!(message.contains("【目标时长】约 3 分钟"));
         assert!(message.contains("【必须包含的乐器】midi-cello"));
         assert!(message.contains("【必须排除的乐器】midi-timpani"));
@@ -988,17 +1067,18 @@ mod tests {
     }
 
     #[test]
-    fn protocol_and_creative_strategies_have_separate_precedence_layers() {
-        assert!(PROTOCOL_PROMPT.contains("submit_result"));
-        assert!(!PROTOCOL_PROMPT.contains("默认创作策略"));
-        assert!(!PROTOCOL_PROMPT.contains("高潮由材料演变"));
-
+    fn compiled_instructions_are_separate_from_the_current_task() {
+        let compiled = compiled_instructions(&ProjectPreferences::default());
+        assert!(compiled.rendered().contains("submit_result"));
+        assert!(
+            compiled
+                .rendered()
+                .contains("builtin:progressive-composition")
+        );
         let message = build_user_message(&request(1));
-        let default_position = message.find("【默认创作策略").unwrap();
-        let project_position = message.find("【项目创作策略").unwrap();
         let current_position = message.find("【本轮要求").unwrap();
-        assert!(default_position < project_position);
-        assert!(project_position < current_position);
+        assert!(!message.contains("builtin:progressive-composition"));
+        assert!(current_position > 0);
         assert!(message.ends_with("创作完整器乐作品"));
     }
 
@@ -1041,6 +1121,12 @@ mod tests {
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("builtin:progressive-composition")
+        );
         assert_eq!(messages[1]["role"], "user");
         assert!(
             messages[1]["content"]
@@ -1157,5 +1243,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("目标时长"));
+    }
+
+    #[tokio::test]
+    async fn compiled_preferences_cannot_diverge_from_real_validation_constraints() {
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let mut mismatched = request(1);
+        mismatched.target_duration_secs = Some(120.0);
+        let error = Agent::new(client, runner)
+            .create(mismatched)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("不一致"));
     }
 }

@@ -1,5 +1,7 @@
 use crate::alda::{AldaCheck, CheckStatus};
 use crate::conversation::{Conversation, ConversationMessage, ConversationState};
+use crate::instructions::InstructionProfile;
+use crate::skills::{QualifiedSkillId, SkillOrigin};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -62,7 +64,8 @@ pub struct WorkingScore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub project_name: String,
-    creative_strategy: String,
+    #[serde(default)]
+    instruction_profile: InstructionProfile,
     mode: String,
     target_duration_secs: Option<f64>,
     included_instruments: Vec<String>,
@@ -97,7 +100,7 @@ impl Project {
         fs::create_dir_all(root.join("exports")).context("无法创建 exports 目录")?;
         let project = Self {
             project_name: project_name.to_string(),
-            creative_strategy: String::new(),
+            instruction_profile: InstructionProfile::default(),
             mode: "full".to_string(),
             target_duration_secs: None,
             included_instruments: Vec::new(),
@@ -153,8 +156,8 @@ impl Project {
     }
 
     #[must_use]
-    pub fn creative_strategy(&self) -> &str {
-        &self.creative_strategy
+    pub fn instruction_profile(&self) -> &InstructionProfile {
+        &self.instruction_profile
     }
 
     #[must_use]
@@ -205,14 +208,43 @@ impl Project {
         self.write_metadata()
     }
 
-    pub fn set_creative_strategy(&mut self, strategy: &str) -> Result<()> {
-        let strategy = strategy.trim().to_string();
-        let previous = std::mem::replace(&mut self.creative_strategy, strategy);
+    pub fn enable_advisory_skill(&mut self, id: QualifiedSkillId) -> Result<bool> {
+        if matches!(id.origin(), SkillOrigin::Builtin) {
+            bail!("内建 workflow 固定启用，不能作为 Advisory Skill 配置");
+        }
+        if self
+            .instruction_profile
+            .enabled_advisory_skills
+            .contains(&id)
+        {
+            return Ok(false);
+        }
+        let previous = self.instruction_profile.clone();
+        self.instruction_profile.enabled_advisory_skills.push(id);
+        self.instruction_profile.enabled_advisory_skills.sort();
         if let Err(error) = self.write_metadata() {
-            self.creative_strategy = previous;
+            self.instruction_profile = previous;
             return Err(error);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    pub fn disable_advisory_skill(&mut self, id: &QualifiedSkillId) -> Result<bool> {
+        if matches!(id.origin(), SkillOrigin::Builtin) {
+            bail!("内建 workflow 固定启用，不能禁用");
+        }
+        let previous = self.instruction_profile.clone();
+        self.instruction_profile
+            .enabled_advisory_skills
+            .retain(|enabled| enabled != id);
+        if self.instruction_profile == previous {
+            return Ok(false);
+        }
+        if let Err(error) = self.write_metadata() {
+            self.instruction_profile = previous;
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub fn configure(
@@ -222,19 +254,32 @@ impl Project {
         included_instruments: Vec<String>,
         excluded_instruments: Vec<String>,
     ) -> Result<()> {
-        validate_project_settings(
-            mode,
+        let normalized = crate::instructions::ProjectPreferences {
+            mode: mode.to_string(),
             target_duration_secs,
-            &included_instruments,
-            &excluded_instruments,
+            included_instruments,
+            excluded_instruments,
+        }
+        .normalized();
+        validate_project_settings(
+            &normalized.mode,
+            normalized.target_duration_secs,
+            &normalized.included_instruments,
+            &normalized.excluded_instruments,
         )?;
         let previous_target = self.target_duration_secs;
-        self.target_duration_secs = target_duration_secs;
+        self.target_duration_secs = normalized.target_duration_secs;
         let previous = (
-            std::mem::replace(&mut self.mode, mode.to_string()),
+            std::mem::replace(&mut self.mode, normalized.mode),
             previous_target,
-            std::mem::replace(&mut self.included_instruments, included_instruments),
-            std::mem::replace(&mut self.excluded_instruments, excluded_instruments),
+            std::mem::replace(
+                &mut self.included_instruments,
+                normalized.included_instruments,
+            ),
+            std::mem::replace(
+                &mut self.excluded_instruments,
+                normalized.excluded_instruments,
+            ),
         );
         if let Err(error) = self.write_metadata() {
             self.mode = previous.0;
@@ -482,6 +527,16 @@ impl Project {
     }
 
     fn validate_settings(&self) -> Result<()> {
+        let preferences = crate::instructions::ProjectPreferences {
+            mode: self.mode.clone(),
+            target_duration_secs: self.target_duration_secs,
+            included_instruments: self.included_instruments.clone(),
+            excluded_instruments: self.excluded_instruments.clone(),
+        };
+        if preferences.normalized() != preferences {
+            bail!("project.json 损坏：项目偏好必须规范化、排序并去重");
+        }
+        validate_instruction_profile(&self.instruction_profile)?;
         validate_project_settings(
             &self.mode,
             self.target_duration_secs,
@@ -495,6 +550,24 @@ impl Project {
         let json = serde_json::to_vec_pretty(self).context("无法序列化 project.json")?;
         write_atomic(&self.root.join(PROJECT_FILE), &json)
     }
+}
+
+fn validate_instruction_profile(profile: &InstructionProfile) -> Result<()> {
+    if profile
+        .enabled_advisory_skills
+        .iter()
+        .any(|id| matches!(id.origin(), SkillOrigin::Builtin))
+    {
+        bail!("project.json 损坏：内建 Skill 不能出现在 enabled_advisory_skills 中");
+    }
+    if !profile
+        .enabled_advisory_skills
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
+    {
+        bail!("project.json 损坏：enabled_advisory_skills 必须去重并按限定 ID 排序");
+    }
+    Ok(())
 }
 
 fn validate_project_settings(
@@ -685,15 +758,35 @@ mod tests {
     }
 
     #[test]
-    fn creative_strategy_is_trimmed_and_persisted() {
+    fn enabled_advisory_skills_are_sorted_deduplicated_and_persisted() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_path_buf();
         let mut project = Project::load_or_create(root.clone(), "test", "material").unwrap();
-        project
-            .set_creative_strategy("  明亮欢快，避免机械重复  ")
-            .unwrap();
+        assert!(
+            project
+                .enable_advisory_skill("user:zeta".parse().unwrap())
+                .unwrap()
+        );
+        assert!(
+            project
+                .enable_advisory_skill("project:alpha".parse().unwrap())
+                .unwrap()
+        );
+        assert!(
+            !project
+                .enable_advisory_skill("user:zeta".parse().unwrap())
+                .unwrap()
+        );
         let reloaded = Project::load_or_create(root, "ignored", "ignored").unwrap();
-        assert_eq!(reloaded.creative_strategy(), "明亮欢快，避免机械重复");
+        assert_eq!(
+            reloaded.instruction_profile().enabled_advisory_skills,
+            [
+                "project:alpha".parse().unwrap(),
+                "user:zeta".parse().unwrap()
+            ]
+        );
+        let metadata = fs::read_to_string(reloaded.root().join(PROJECT_FILE)).unwrap();
+        assert!(!metadata.contains("Skill 正文"));
     }
 
     #[test]
@@ -736,7 +829,7 @@ mod tests {
         assert!(Project::load_or_create(directory.path().join("x"), "../x", "").is_err());
         fs::write(
             directory.path().join(PROJECT_FILE),
-            r#"{"project_name":"test","creative_strategy":"","mode":"full","target_duration_secs":null,"included_instruments":[],"excluded_instruments":[],"current_version":1,"versions":{},"conversation":{"messages":[],"state":"ready"}}"#,
+            r#"{"project_name":"test","instruction_profile":{"enabled_advisory_skills":[]},"mode":"full","target_duration_secs":null,"included_instruments":[],"excluded_instruments":[],"current_version":1,"versions":{},"conversation":{"messages":[],"state":"ready"}}"#,
         )
         .unwrap();
         assert!(Project::load_or_create(directory.path().to_path_buf(), "test", "").is_err());
@@ -771,6 +864,35 @@ mod tests {
         let loaded =
             Project::load_or_create(directory.path().to_path_buf(), "test", "ignored").unwrap();
         assert_eq!(loaded.mode(), "full");
+    }
+
+    #[test]
+    fn instrument_preferences_are_canonical_before_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        project
+            .configure(
+                "full",
+                None,
+                vec![" MIDI-Piano ".to_string(), "midi-piano".to_string()],
+                vec![" MIDI-TUBA ".to_string()],
+            )
+            .unwrap();
+        assert_eq!(project.included_instruments(), ["midi-piano"]);
+        assert_eq!(project.excluded_instruments(), ["midi-tuba"]);
+
+        let error = project
+            .configure(
+                "full",
+                None,
+                vec![" midi-cello ".to_string()],
+                vec!["MIDI-CELLO".to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("同时"));
+        let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
+        assert_eq!(reloaded.included_instruments(), ["midi-piano"]);
     }
 
     #[test]

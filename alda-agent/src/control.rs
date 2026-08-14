@@ -39,6 +39,14 @@ enum ControlAction {
         format: ControlExportFormat,
     },
     ProjectOverview,
+    ProjectInstructions,
+    ProjectSkills,
+    ProjectSkillEnable {
+        id: String,
+    },
+    ProjectSkillDisable {
+        id: String,
+    },
     ProjectVersions,
     ProjectSwitch {
         version: u32,
@@ -60,9 +68,6 @@ enum ControlAction {
     },
     ConfigExclude {
         instruments: Vec<String>,
-    },
-    ConfigStrategy {
-        strategy: Option<String>,
     },
     ConfigModel {
         model: String,
@@ -111,6 +116,12 @@ impl ControlAction {
                 },
             }),
             Self::ProjectOverview => UserAction::Project(ProjectAction::Overview),
+            Self::ProjectInstructions => UserAction::Project(ProjectAction::Instructions),
+            Self::ProjectSkills => UserAction::Project(ProjectAction::Skills),
+            Self::ProjectSkillEnable { id } => UserAction::Project(ProjectAction::SkillEnable(id)),
+            Self::ProjectSkillDisable { id } => {
+                UserAction::Project(ProjectAction::SkillDisable(id))
+            }
             Self::ProjectVersions => UserAction::Project(ProjectAction::Versions),
             Self::ProjectSwitch { version } => {
                 UserAction::Project(ProjectAction::Switch(valid_version(version)?))
@@ -130,9 +141,6 @@ impl ControlAction {
             }
             Self::ConfigExclude { instruments } => {
                 UserAction::Project(ProjectAction::Config(ConfigAction::Exclude(instruments)))
-            }
-            Self::ConfigStrategy { strategy } => {
-                UserAction::Project(ProjectAction::Config(ConfigAction::Strategy(strategy)))
             }
             Self::ConfigModel { model } => {
                 UserAction::Project(ProjectAction::Config(ConfigAction::Model(model)))
@@ -466,9 +474,15 @@ mod tests {
     #[tokio::test]
     async fn processes_requests_and_continues_after_errors() {
         let directory = tempfile::tempdir().unwrap();
-        let project =
-            Project::load_or_create(directory.path().join("control-test"), "control-test", "")
-                .unwrap();
+        let project_root = directory.path().join("control-test");
+        let skill_root = project_root.join("skills/phrasing");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nname: phrasing\ndescription: 乐句建议\nkind: advisory\n---\n让乐句有清晰呼吸。\n",
+        )
+        .unwrap();
+        let project = Project::load_or_create(project_root, "control-test", "").unwrap();
         let mut application = Application::from_project(project, None);
         let input = concat!(
             "not-json\n",
@@ -477,6 +491,12 @@ mod tests {
             r#"{"id":"two","action":{"type":"project_overview"}}"#,
             "\n",
             r#"{"id":"three","action":{"type":"project_switch","version":0}}"#,
+            "\n",
+            r#"{"id":"four","action":{"type":"project_skills"}}"#,
+            "\n",
+            r#"{"id":"five","action":{"type":"project_skill_enable","id":"project:phrasing"}}"#,
+            "\n",
+            r#"{"id":"six","action":{"type":"project_instructions"}}"#,
             "\n"
         );
         let mut output = Vec::new();
@@ -489,13 +509,29 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(responses.len(), 4);
+        assert_eq!(responses.len(), 7);
         assert_eq!(responses[0]["type"], "error");
         assert!(responses[0]["id"].is_null());
         assert_eq!(responses[1]["id"], "one");
         assert_eq!(responses[1]["project"]["target_duration_secs"], 90.0);
         assert_eq!(responses[2]["result"]["kind"], "message");
         assert_eq!(responses[3]["error"]["kind"], "invalid_action");
+        assert!(
+            responses[4]["result"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("project:phrasing")
+        );
+        assert_eq!(
+            responses[5]["project"]["enabled_advisory_skills"][0],
+            "project:phrasing"
+        );
+        assert!(
+            responses[6]["result"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Fingerprint")
+        );
     }
 
     #[test]

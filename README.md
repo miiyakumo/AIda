@@ -17,6 +17,7 @@ Alda Music Agent 是一个面向音乐创作的终端 Agent。用户可以提供
 - 保存线性版本，查看历史、恢复旧版并采用人工编辑；
 - 播放当前版本，导出 Alda 与 MIDI；
 - 按项目配置模型名称、OpenAI-compatible URL 和密钥；
+- 组合内建、用户级和项目级 Skill，并查看当前有效指示 fingerprint；
 - 检查 Java、Alda 和 Rust 环境，并按项目探测模型连通性。
 
 ## 环境与配置

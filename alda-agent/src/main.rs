@@ -27,16 +27,17 @@ async fn main() -> anyhow::Result<()> {
             exclude,
             output,
         }) => {
-            let project_root = selected_project_root(project, name)?;
-            run_cancelable(compose(
+            let (project_root, project_name) = selected_project(project, name)?;
+            run_cancelable(compose(ComposeOptions {
                 project_root,
+                project_name,
                 file,
                 mode,
                 duration,
                 include,
                 exclude,
                 output,
-            ))
+            }))
             .await
         }
         None => {
@@ -107,20 +108,56 @@ fn list_projects() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn compose(
+struct ComposeOptions {
     project_root: std::path::PathBuf,
+    project_name: String,
     file: Option<std::path::PathBuf>,
     mode: String,
     duration: Option<f64>,
     include: Vec<String>,
     exclude: Vec<String>,
     output: std::path::PathBuf,
-) -> anyhow::Result<()> {
+}
+
+fn compile_compose_instructions(
+    project_root: &std::path::Path,
+    project_name: &str,
+    preferences: &alda_agent::instructions::ProjectPreferences,
+) -> anyhow::Result<alda_agent::instructions::CompiledInstructions> {
+    let project =
+        alda_agent::project::Project::load_or_create(project_root.to_path_buf(), project_name, "")?;
+    let user_skills_root = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".alda-agent").join("skills"));
+    let catalog = alda_agent::skills::SkillCatalog::discover(
+        user_skills_root.as_deref(),
+        Some(&project_root.join("skills")),
+    )?;
+    alda_agent::instructions::CompiledInstructions::compile(
+        &catalog,
+        project.instruction_profile(),
+        preferences,
+    )
+}
+
+async fn compose(options: ComposeOptions) -> anyhow::Result<()> {
     use alda_agent::agent::{Agent, AgentResultKind, CreationMode, CreationRequest};
     use alda_agent::alda::{AldaRunner, CheckStatus, find_alda};
     use alda_agent::config::ModelConfig;
     use alda_agent::deepseek::DeepSeekClient;
+    use alda_agent::instructions::ProjectPreferences;
     use std::io::Read;
+
+    let ComposeOptions {
+        project_root,
+        project_name,
+        file,
+        mode,
+        duration,
+        include,
+        exclude,
+        output,
+    } = options;
 
     // 读取素材
     let source_material = if let Some(ref path) = file {
@@ -150,15 +187,24 @@ async fn compose(
         "improv" => CreationMode::Improvisation,
         other => anyhow::bail!("无效的创作模式: {other}（应为 full 或 improv）"),
     };
+    let preferences = ProjectPreferences {
+        mode,
+        target_duration_secs: duration,
+        included_instruments: include,
+        excluded_instruments: exclude,
+    }
+    .normalized();
+    let compiled_instructions =
+        compile_compose_instructions(&project_root, &project_name, &preferences)?;
 
     let request = CreationRequest {
         source_material,
         instructions: String::new(),
-        creative_strategy: String::new(),
+        compiled_instructions,
         mode: creation_mode,
-        target_duration_secs: duration,
-        included_instruments: include,
-        excluded_instruments: exclude,
+        target_duration_secs: preferences.target_duration_secs,
+        included_instruments: preferences.included_instruments,
+        excluded_instruments: preferences.excluded_instruments,
         max_rounds: 3,
     };
 

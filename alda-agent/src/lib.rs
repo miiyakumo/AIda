@@ -7,8 +7,10 @@ pub mod control;
 pub mod conversation;
 pub mod deepseek;
 pub mod doctor;
+pub mod instructions;
 pub mod project;
 pub mod repl;
+pub mod skills;
 #[cfg(test)]
 pub(crate) mod test_support;
 

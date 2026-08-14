@@ -3,7 +3,9 @@ use alda_agent::agent::{Agent, CreationMode, CreationRequest, ModifyRequest};
 use alda_agent::alda::AldaRunner;
 use alda_agent::conversation::ConversationState;
 use alda_agent::deepseek::DeepSeekClient;
+use alda_agent::instructions::{CompiledInstructions, InstructionProfile, ProjectPreferences};
 use alda_agent::project::{Project, WorkingScoreKind};
+use alda_agent::skills::SkillCatalog;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -86,6 +88,18 @@ fn fake_alda() -> (tempfile::TempDir, std::path::PathBuf) {
     (directory, executable)
 }
 
+fn compiled_instructions() -> CompiledInstructions {
+    CompiledInstructions::compile(
+        &SkillCatalog::discover(None, None).unwrap(),
+        &InstructionProfile::default(),
+        &ProjectPreferences {
+            target_duration_secs: Some(180.0),
+            ..ProjectPreferences::default()
+        },
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn progressive_workflow_only_versions_an_accepted_candidate() {
@@ -117,7 +131,7 @@ async fn progressive_workflow_only_versions_an_accepted_candidate() {
         .create(CreationRequest {
             source_material: source.to_string(),
             instructions: "创作约三分钟的完整纯器乐曲".to_string(),
-            creative_strategy: String::new(),
+            compiled_instructions: compiled_instructions(),
             mode: CreationMode::FullPiece,
             target_duration_secs: Some(180.0),
             included_instruments: Vec::new(),
@@ -139,7 +153,7 @@ async fn progressive_workflow_only_versions_an_accepted_candidate() {
         .create(CreationRequest {
             source_material: source.to_string(),
             instructions: "先做核心材料草稿".to_string(),
-            creative_strategy: String::new(),
+            compiled_instructions: compiled_instructions(),
             mode: CreationMode::FullPiece,
             target_duration_secs: Some(180.0),
             included_instruments: Vec::new(),
@@ -166,7 +180,7 @@ async fn progressive_workflow_only_versions_an_accepted_candidate() {
             source_material: source.to_string(),
             current_alda: project.working_code().unwrap(),
             feedback: feedback.to_string(),
-            creative_strategy: String::new(),
+            compiled_instructions: compiled_instructions(),
             mode: CreationMode::FullPiece,
             target_duration_secs: Some(180.0),
             included_instruments: Vec::new(),

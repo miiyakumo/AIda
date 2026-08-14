@@ -125,8 +125,9 @@ alda-agent doctor [--probe TARGET] # 检查环境；TARGET 为 model、alda 或 
 `alda-smoke` 子命令：`list` 变为更明确的 `projects`，`create` 变为避免与“创建项目”混淆的
 `compose`，两个 smoke 合并为 `doctor --probe`。这是直接替换，不提供兼容别名。
 
-交互项目的模式、时长、乐器约束和创作策略统一由 `/project config` 持久化管理，不再混入打开项目的
-Shell 参数。`compose` 仍用命令行参数表达一次性任务约束，保证脚本调用无需进入 REPL。
+交互项目的模式、时长和乐器约束由 `/project config` 持久化管理；创作方法后续迁移为
+`/project skills` 管理的可组合 Skill，不再混入打开项目的 Shell 参数。`compose` 仍用命令行参数表达
+一次性任务约束，保证脚本调用无需进入 REPL。
 
 ### 打开已有项目
 
@@ -202,7 +203,8 @@ Shift+Enter 插入换行。命令只有在去除前导空白后以 `/` 开头时
 /project config duration SECONDS|none
 /project config include INST...|none # 替换必须包含的乐器列表
 /project config exclude INST...|none # 替换必须排除的乐器列表
-/project config strategy TEXT|default
+/project instructions                         # 查看当前有效指示与 fingerprint
+/project skills [enable|disable QUALIFIED_ID] # 查看或启停 advisory Skill
 /project config model NAME
 /project config url URL
 /project config key                 # 隐藏输入，不进入历史
@@ -217,7 +219,7 @@ Shift+Enter 插入换行。命令只有在去除前导空白后以 `/` 开头时
 第二个用户可调用工具族时，再依据实际关系决定是否引入 `/tool`。
 
 `/project config` 每次只修改一个键并立即校验、持久化。`include` 和 `exclude` 是替换语义，不使用容易
-产生累计误解的隐式追加；`none` 清空列表或时长，`default` 清除自定义创作策略。冲突的乐器约束在写入
+产生累计误解的隐式追加；`none` 清空列表或时长。冲突的乐器约束在写入
 前拒绝，原配置保持不变。模型名称、URL 和密钥是项目级配置；密钥命令后续使用隐藏输入，不能把密钥
 写入命令参数、历史或状态输出。
 

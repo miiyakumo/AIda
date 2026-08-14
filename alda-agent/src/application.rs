@@ -9,7 +9,9 @@ use crate::command::{
 use crate::config::ModelConfig;
 use crate::conversation::{ConversationMessage, ConversationRole, ConversationState};
 use crate::deepseek::{ChatError, DeepSeekClient};
+use crate::instructions::{CompiledInstructions, ProjectPreferences};
 use crate::project::{CheckRecord, Project, WorkingScoreKind};
+use crate::skills::{QualifiedSkillId, SkillCatalog, SkillKind};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -25,7 +27,7 @@ pub struct ProjectView {
     pub target_duration_secs: Option<f64>,
     pub included_instruments: Vec<String>,
     pub excluded_instruments: Vec<String>,
-    pub creative_strategy: Option<String>,
+    pub enabled_advisory_skills: Vec<String>,
     pub model_name: Option<String>,
     pub model_url: Option<String>,
     pub model_key_configured: bool,
@@ -164,8 +166,13 @@ impl Application {
             target_duration_secs: self.project.target_duration_secs(),
             included_instruments: self.project.included_instruments().to_vec(),
             excluded_instruments: self.project.excluded_instruments().to_vec(),
-            creative_strategy: (!self.project.creative_strategy().is_empty())
-                .then(|| self.project.creative_strategy().to_string()),
+            enabled_advisory_skills: self
+                .project
+                .instruction_profile()
+                .enabled_advisory_skills
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             model_name: model_config
                 .and_then(|config| config.model())
                 .map(ToString::to_string),
@@ -262,6 +269,7 @@ impl Application {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("未找到 alda；Agent 不能绕过校验保存版本"))?;
         let client = DeepSeekClient::new(config.api_key, config.base_url, config.model)?;
+        let compiled_instructions = self.compile_instructions()?;
         let result = Agent::new(client, runner)
             .respond_with_reporter(
                 ProjectPromptRequest {
@@ -274,7 +282,7 @@ impl Application {
                         .working_score()
                         .map(|_| self.project.working_code())
                         .transpose()?,
-                    creative_strategy: self.project.creative_strategy().to_string(),
+                    compiled_instructions,
                     mode: if self.project.mode() == "improv" {
                         CreationMode::Improvisation
                     } else {
@@ -396,6 +404,12 @@ impl Application {
             ProjectAction::Overview => {
                 Ok(ActionResult::Message(render_project(&self.project_view())))
             }
+            ProjectAction::Instructions => Ok(ActionResult::Message(
+                self.compile_instructions()?.summary().to_string(),
+            )),
+            ProjectAction::Skills => Ok(ActionResult::Message(self.render_skills()?)),
+            ProjectAction::SkillEnable(value) => self.enable_advisory_skill(&value),
+            ProjectAction::SkillDisable(value) => self.disable_advisory_skill(&value),
             ProjectAction::Versions => {
                 Ok(ActionResult::Message(render_versions(&self.project_view())))
             }
@@ -480,11 +494,6 @@ impl Application {
             ConfigAction::Duration(value) => duration = value,
             ConfigAction::Include(value) => include = value,
             ConfigAction::Exclude(value) => exclude = value,
-            ConfigAction::Strategy(value) => {
-                self.project
-                    .set_creative_strategy(value.as_deref().unwrap_or(""))?;
-                return Ok(ActionResult::Message("✓ 已更新创作策略".to_string()));
-            }
             ConfigAction::Model(value) => {
                 return self.update_model_config(|config| config.set_model(&value));
             }
@@ -513,6 +522,88 @@ impl Application {
         self.last_model_failure = None;
         self.model_request_succeeded = false;
         Ok(ActionResult::Message("✓ 已更新项目模型配置".to_string()))
+    }
+
+    fn skill_catalog(&self) -> Result<SkillCatalog> {
+        let user_root = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".alda-agent").join("skills"));
+        SkillCatalog::discover(
+            user_root.as_deref(),
+            Some(&self.project.root().join("skills")),
+        )
+    }
+
+    fn enable_advisory_skill(&mut self, value: &str) -> Result<ActionResult> {
+        let id: QualifiedSkillId = value.parse()?;
+        let catalog = self.skill_catalog()?;
+        let descriptor = catalog
+            .descriptor(&id)
+            .ok_or_else(|| anyhow::anyhow!("未发现 Skill {id}"))?;
+        if descriptor.kind != SkillKind::Advisory {
+            bail!("Skill {id} 不是可启用的 advisory Skill");
+        }
+        catalog.load(&id)?;
+        let changed = self.project.enable_advisory_skill(id.clone())?;
+        Ok(ActionResult::Message(if changed {
+            format!("✓ 已启用 {id}")
+        } else {
+            format!("{id} 已处于启用状态")
+        }))
+    }
+
+    fn disable_advisory_skill(&mut self, value: &str) -> Result<ActionResult> {
+        let id: QualifiedSkillId = value.parse()?;
+        let changed = self.project.disable_advisory_skill(&id)?;
+        Ok(ActionResult::Message(if changed {
+            format!("✓ 已禁用 {id}")
+        } else {
+            format!("{id} 未启用")
+        }))
+    }
+
+    fn project_preferences(&self) -> ProjectPreferences {
+        ProjectPreferences {
+            mode: self.project.mode().to_string(),
+            target_duration_secs: self.project.target_duration_secs(),
+            included_instruments: self.project.included_instruments().to_vec(),
+            excluded_instruments: self.project.excluded_instruments().to_vec(),
+        }
+    }
+
+    fn compile_instructions(&self) -> Result<CompiledInstructions> {
+        CompiledInstructions::compile(
+            &self.skill_catalog()?,
+            self.project.instruction_profile(),
+            &self.project_preferences(),
+        )
+    }
+
+    fn render_skills(&self) -> Result<String> {
+        let catalog = self.skill_catalog()?;
+        let enabled = &self.project.instruction_profile().enabled_advisory_skills;
+        let mut lines = catalog
+            .descriptors()
+            .into_iter()
+            .map(|skill| {
+                let state = if skill.kind == SkillKind::Workflow || enabled.contains(&skill.id) {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                format!(
+                    "{} · {:?} · {state} · {}",
+                    skill.id, skill.kind, skill.description
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.extend(
+            catalog
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| format!("! 无效 Skill · {diagnostic}")),
+        );
+        Ok(lines.join("\n"))
     }
 
     async fn export(&self, version: u32, format: ExportFormat) -> Result<ActionResult> {
@@ -608,13 +699,13 @@ fn render_versions(view: &ProjectView) -> String {
 }
 fn render_config(view: &ProjectView) -> String {
     format!(
-        "模式：{}\n目标时长：{}\n包含乐器：{}\n排除乐器：{}\n创作策略：{}\n模型名称：{}\nAPI Base URL：{}\n模型密钥：{}",
+        "模式：{}\n目标时长：{}\n包含乐器：{}\n排除乐器：{}\n内建工作流：builtin:progressive-composition\nAdvisory Skills：{}\n模型名称：{}\nAPI Base URL：{}\n模型密钥：{}",
         view.mode,
         view.target_duration_secs
             .map_or_else(|| "无".to_string(), |value| format!("{value} 秒")),
         empty(&view.included_instruments),
         empty(&view.excluded_instruments),
-        view.creative_strategy.as_deref().unwrap_or("内置默认"),
+        empty(&view.enabled_advisory_skills),
         view.model_name.as_deref().unwrap_or("未设置"),
         view.model_url.as_deref().unwrap_or("未设置"),
         if view.model_key_configured {
@@ -761,6 +852,76 @@ mod tests {
                 .next_step
                 .contains("稍后重试")
         );
+    }
+
+    #[tokio::test]
+    async fn active_skill_is_fail_closed_and_can_be_disabled_locally() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("poem");
+        let skill_root = root.join("skills/phrasing");
+        std::fs::create_dir_all(&skill_root).unwrap();
+        let skill_path = skill_root.join("SKILL.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: phrasing\ndescription: 乐句建议\nkind: advisory\n---\n让乐句有清晰呼吸。\n",
+        )
+        .unwrap();
+        let project = Project::load_or_create(root, "poem", "").unwrap();
+        let mut application = Application::from_project(project, None);
+
+        application
+            .execute(
+                UserAction::Project(ProjectAction::SkillEnable("project:phrasing".to_string())),
+                &mut Silent,
+            )
+            .await
+            .unwrap();
+        let summary = application
+            .execute(
+                UserAction::Project(ProjectAction::Instructions),
+                &mut Silent,
+            )
+            .await
+            .unwrap();
+        let ActionResult::Message(summary) = summary else {
+            panic!("expected instruction summary");
+        };
+        assert!(summary.contains("project:phrasing"));
+
+        std::fs::write(&skill_path, "not valid frontmatter\n").unwrap();
+        assert!(
+            application
+                .execute(
+                    UserAction::Project(ProjectAction::Instructions),
+                    &mut Silent,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("未发现 Skill")
+        );
+        application
+            .execute(
+                UserAction::Project(ProjectAction::SkillDisable("project:phrasing".to_string())),
+                &mut Silent,
+            )
+            .await
+            .unwrap();
+        application
+            .execute(
+                UserAction::Project(ProjectAction::Instructions),
+                &mut Silent,
+            )
+            .await
+            .unwrap();
+        let skills = application
+            .execute(UserAction::Project(ProjectAction::Skills), &mut Silent)
+            .await
+            .unwrap();
+        let ActionResult::Message(skills) = skills else {
+            panic!("expected Skill catalog");
+        };
+        assert!(skills.contains("无效 Skill"));
     }
 
     #[tokio::test]

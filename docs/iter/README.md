@@ -14,3 +14,6 @@ description：模型名称、URL 与密钥的项目内持久化、安全输入�
 
 [终端信息分层改造](terminal-information-layout/README.md)
 description：基于同类 Coding Agent 调研，分离滚动历史、活动状态、输入块和项目上下文。
+
+[可组合指示系统首期](composable-instructions/README.md)
+description：确定性指示编译、Skill 安全加载、项目启用配置、模型接入与首期非目标。

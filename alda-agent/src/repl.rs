@@ -2,8 +2,8 @@ use crate::agent::{AgentEvent, AgentReporter};
 use crate::alda::{AldaCheck, CancellationToken, CheckStatus};
 use crate::application::{ActionResult, Application, ProjectView};
 use crate::command::{
-    ALDA_COMMANDS, CONFIG_COMMANDS, PROJECT_COMMANDS, TOP_LEVEL_COMMANDS, contains_inline_api_key,
-    parse,
+    ALDA_COMMANDS, CONFIG_COMMANDS, PROJECT_COMMANDS, SKILL_COMMANDS, TOP_LEVEL_COMMANDS,
+    contains_inline_api_key, parse,
 };
 use crate::command::{ProjectAction, UserAction};
 use anyhow::{Context, Result};
@@ -622,6 +622,8 @@ impl Completer for CommandCompleter {
         }
         let (candidates, start) = if let Some(rest) = prefix.strip_prefix("/alda ") {
             (ALDA_COMMANDS, pos - rest.len())
+        } else if let Some(rest) = prefix.strip_prefix("/project skills ") {
+            (SKILL_COMMANDS, pos - rest.len())
         } else if let Some(rest) = prefix.strip_prefix("/project config ") {
             (CONFIG_COMMANDS, pos - rest.len())
         } else if let Some(rest) = prefix.strip_prefix("/project ") {
@@ -711,7 +713,7 @@ mod tests {
             target_duration_secs: Some(180.0),
             included_instruments: vec!["piano".into()],
             excluded_instruments: vec!["violin".into()],
-            creative_strategy: None,
+            enabled_advisory_skills: vec![],
             model_name: Some("example-model".into()),
             model_url: Some("https://api.example.com".into()),
             model_key_configured: true,

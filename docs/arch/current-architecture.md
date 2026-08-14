@@ -1,6 +1,6 @@
 # 当前架构
 
-> 代码基线：渐进式创作与版本语义实现（2026-08-13）
+> 代码基线：可组合指示系统首期实现（2026-08-14）
 >
 > 本文描述当前源码实际行为。
 
@@ -62,8 +62,8 @@ alda-agent [--name NAME | --project PATH] control
 |---|---|
 | Agent | `agent` |
 | Alda | `alda_play`、`alda_stop`、`alda_check`、`alda_export` |
-| Project | `project_overview`、`project_versions`、`project_switch`、`project_adopt`、`project_accept`、`project_discard` |
-| Config | `config_show`、`config_mode`、`config_duration`、`config_include`、`config_exclude`、`config_strategy`、`config_model`、`config_url` |
+| Project | `project_overview`、`project_instructions`、`project_skills`、`project_skill_enable`、`project_skill_disable`、`project_versions`、`project_switch`、`project_adopt`、`project_accept`、`project_discard` |
+| Config | `config_show`、`config_mode`、`config_duration`、`config_include`、`config_exclude`、`config_model`、`config_url` |
 
 `alda_play` 和 `alda_check` 的 `target` 接受 `current`、`work` 或 `vN`；`alda_check` 也可改用 `file` 检查
 外部文件。控制面刻意不支持模型密钥设置，密钥仍只能通过交互终端隐藏输入或已有的私有 `model.json`
@@ -121,6 +121,26 @@ Alda 操作使用每次前台操作独立的 `CancellationToken`。Ctrl+C 在模
 阶段设置 token 并等待子进程组终止后才返回提示符。Ctrl+C 编辑输入只清空缓冲，Ctrl+D 或 `/quit`
 退出。
 
+## 可组合指示与 Skill
+
+每次模型调用前，`Application` 从同一个 `Project` 读取 mode、目标时长和乐器约束，并通过
+`SkillCatalog` 发现内建、用户级和项目级 Skill。指示编译器按固定顺序生成不可变的
+`CompiledInstructions`：核心协议、应用能力边界、固定内建 workflow、按限定 ID 排序的 advisory Skill、
+项目偏好和默认角色。每个片段保留来源、作用域、强度和 SHA-256 摘要，整体渲染结果具有 fingerprint。
+
+默认创作方法是固定启用的 `builtin:progressive-composition`。外部首期只允许 advisory Skill，位于
+`~/.alda-agent/skills/<name>/SKILL.md` 或 `<project>/skills/<name>/SKILL.md`；项目元数据只保存显式启用的
+`user:name`/`project:name` 引用，不复制正文。发现阶段读取 frontmatter，编译生效项时才读取正文；加载器
+限制扫描层级、数量和字节数，并在规范化路径后拒绝符号链接越界。
+
+`/project skills` 查看发现结果，`/project skills enable|disable QUALIFIED_ID` 修改项目引用，
+`/project instructions` 展示当前生效 Skill、偏好、角色、能力、冲突说明和 fingerprint。它描述当前配置，
+不是历史 Invocation 快照。启用 Skill 缺失、损坏或超限时模型调用失败关闭，但本地项目、Alda 和禁用该
+Skill 的恢复操作仍可用。
+
+Skill 内容只影响模型输入。Alda 校验、工作乐谱写入、候选接受和有效版本创建仍由 `Application` 与
+`Project` 强制；提示中的能力说明不授予任何运行权限。
+
 ## 生成与输出边界
 
 Agent 在每轮报告轮次开始、模型文本增量、Alda 校验开始、完整检查结果和自动修正。模型传输层不写
@@ -143,6 +163,7 @@ project-root/
 ├── work.alda                  # 当前草稿或完整候选，可选
 ├── current.alda               # 当前有效版本，可选
 ├── .repl-history
+├── skills/<name>/SKILL.md     # 项目级 advisory Skill，可选
 ├── versions/0001.alda ...
 └── exports/version-0001.alda|mid ...
 ```
