@@ -100,4 +100,13 @@ ref/
 # Rust build artifacts
 target/
 
+# alda-agent runtime project
+/project.json
+/model.json
+/work.alda
+/current.alda
+/.repl-history
+/versions/
+/exports/
+
 .env
