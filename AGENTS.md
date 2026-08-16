@@ -20,7 +20,7 @@
 - 文档用于快速了解和定位项目，不能替代代码验证。文档与代码冲突时，以代码为准，并同步修正文档。
 - 调研应按需进行：
   - 优先调研项目现有代码。
-  - 当现有实现不足以回答设计问题时，可以调研 `codex-cli`、`claude-code`、`gork-build` 等现有 coding agent。
+  - 当现有实现不足以回答设计问题时，可以调研 `codex-cli`、`claude-code`、`gork-build` `deepseek-harness` 等现有 coding agent。其中，提示词因当重点参考`deepseek-harness`
   - 这些项目应位于 `ref/` 下；如果没有，可以 clone 一份。
   - `ref/` 仅用于了解已有方案、内部机制和设计权衡，不作为本项目的设计规范。
 
