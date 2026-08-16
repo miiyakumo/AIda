@@ -1,5 +1,5 @@
 use crate::agent::{
-    Agent, AgentReporter, AgentResultKind, CreationMode, ProjectPromptRequest,
+    Agent, AgentReporter, AgentResultKind, CreationRequest, CreationResult, ProjectPromptRequest,
     from_provider_messages,
 };
 use crate::alda::{AldaCheck, AldaRunner, CancellationToken, CheckStatus, find_alda};
@@ -15,6 +15,55 @@ use crate::skills::{QualifiedSkillId, SkillCatalog, SkillKind};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::PathBuf;
+
+pub struct ComposeRequest {
+    pub project_root: PathBuf,
+    pub project_name: String,
+    pub source_material: String,
+    pub preferences: ProjectPreferences,
+    pub max_rounds: usize,
+}
+
+pub struct PreparedCompose {
+    agent: Agent,
+    request: CreationRequest,
+}
+
+pub fn prepare_compose(request: ComposeRequest) -> Result<PreparedCompose> {
+    if request.source_material.trim().is_empty() {
+        bail!("素材不能为空");
+    }
+    let preferences = request.preferences.normalized();
+    preferences.validate()?;
+    let config = ModelConfig::load(&request.project_root)?.resolve()?;
+    let client = DeepSeekClient::new(config.api_key, config.base_url, config.model)?;
+    let alda_path = find_alda().ok_or_else(|| anyhow::anyhow!("未找到 alda，请先安装"))?;
+    let project = Project::load_or_create(
+        request.project_root,
+        &request.project_name,
+        &request.source_material,
+    )?;
+    let user_root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".alda-agent").join("skills"));
+    let catalog =
+        SkillCatalog::discover(user_root.as_deref(), Some(&project.root().join("skills")))?;
+    let compiled_instructions =
+        CompiledInstructions::compile(&catalog, project.instruction_profile(), &preferences)?;
+    Ok(PreparedCompose {
+        agent: Agent::new(client, AldaRunner::new(alda_path)),
+        request: CreationRequest {
+            source_material: request.source_material,
+            instructions: String::new(),
+            compiled_instructions,
+            max_rounds: request.max_rounds,
+        },
+    })
+}
+
+pub async fn compose_once(prepared: PreparedCompose) -> Result<CreationResult> {
+    prepared.agent.create(prepared.request).await
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProjectView {
@@ -283,14 +332,6 @@ impl Application {
                         .map(|_| self.project.working_code())
                         .transpose()?,
                     compiled_instructions,
-                    mode: if self.project.mode() == "improv" {
-                        CreationMode::Improvisation
-                    } else {
-                        CreationMode::FullPiece
-                    },
-                    target_duration_secs: self.project.target_duration_secs(),
-                    included_instruments: self.project.included_instruments().to_vec(),
-                    excluded_instruments: self.project.excluded_instruments().to_vec(),
                     max_rounds: 3,
                 },
                 reporter,
@@ -367,27 +408,17 @@ impl Application {
                 Ok(ActionResult::Message("✓ 已请求停止播放".to_string()))
             }
             AldaAction::Check(target) => {
-                let target_duration_ms = if target == ScoreTarget::Working
+                let check_duration = !(target == ScoreTarget::Working
                     && self
                         .project
                         .working_score()
-                        .is_some_and(|working| working.kind == WorkingScoreKind::Draft)
-                {
-                    None
-                } else {
-                    self.project
-                        .target_duration_secs()
-                        .map(|value| value * 1000.0)
-                };
+                        .is_some_and(|working| working.kind == WorkingScoreKind::Draft));
                 let path = self.score_path(target)?;
                 let checks = self
                     .runner()?
                     .validate_async(
                         path,
-                        self.project.included_instruments().to_vec(),
-                        self.project.excluded_instruments().to_vec(),
-                        target_duration_ms,
-                        10.0,
+                        self.project.preferences().score_validation(check_duration),
                     )
                     .await?;
                 Ok(ActionResult::Checks(checks))
@@ -426,12 +457,7 @@ impl Application {
                 let checks = runner
                     .validate_async(
                         path.clone(),
-                        self.project.included_instruments().to_vec(),
-                        self.project.excluded_instruments().to_vec(),
-                        self.project
-                            .target_duration_secs()
-                            .map(|value| value * 1000.0),
-                        10.0,
+                        self.project.preferences().score_validation(true),
                     )
                     .await?;
                 if checks.iter().any(|check| check.status == CheckStatus::Fail) {
@@ -454,12 +480,7 @@ impl Application {
                     .runner()?
                     .validate_async(
                         self.project.working_path()?,
-                        self.project.included_instruments().to_vec(),
-                        self.project.excluded_instruments().to_vec(),
-                        self.project
-                            .target_duration_secs()
-                            .map(|value| value * 1000.0),
-                        10.0,
+                        self.project.preferences().score_validation(true),
                     )
                     .await?;
                 self.project.update_working_checks(&checks)?;
@@ -485,15 +506,12 @@ impl Application {
         if action == ConfigAction::Show {
             return Ok(ActionResult::Message(render_config(&self.project_view())));
         }
-        let mut mode = self.project.mode().to_string();
-        let mut duration = self.project.target_duration_secs();
-        let mut include = self.project.included_instruments().to_vec();
-        let mut exclude = self.project.excluded_instruments().to_vec();
+        let mut preferences = self.project.preferences().clone();
         match action {
-            ConfigAction::Mode(value) => mode = value,
-            ConfigAction::Duration(value) => duration = value,
-            ConfigAction::Include(value) => include = value,
-            ConfigAction::Exclude(value) => exclude = value,
+            ConfigAction::Mode(value) => preferences.mode = value.parse()?,
+            ConfigAction::Duration(value) => preferences.target_duration_secs = value,
+            ConfigAction::Include(value) => preferences.included_instruments = value,
+            ConfigAction::Exclude(value) => preferences.excluded_instruments = value,
             ConfigAction::Model(value) => {
                 return self.update_model_config(|config| config.set_model(&value));
             }
@@ -508,7 +526,7 @@ impl Application {
             }
             ConfigAction::Show => unreachable!(),
         }
-        self.project.configure(&mode, duration, include, exclude)?;
+        self.project.configure(&preferences)?;
         Ok(ActionResult::Message("✓ 已更新项目设置".to_string()))
     }
 
@@ -562,20 +580,11 @@ impl Application {
         }))
     }
 
-    fn project_preferences(&self) -> ProjectPreferences {
-        ProjectPreferences {
-            mode: self.project.mode().to_string(),
-            target_duration_secs: self.project.target_duration_secs(),
-            included_instruments: self.project.included_instruments().to_vec(),
-            excluded_instruments: self.project.excluded_instruments().to_vec(),
-        }
-    }
-
     fn compile_instructions(&self) -> Result<CompiledInstructions> {
         CompiledInstructions::compile(
             &self.skill_catalog()?,
             self.project.instruction_profile(),
-            &self.project_preferences(),
+            self.project.preferences(),
         )
     }
 
@@ -778,10 +787,10 @@ mod tests {
         (directory, AldaRunner::new(executable))
     }
 
-    fn candidate_response() -> String {
+    fn score_response(kind: &str) -> String {
         let arguments = serde_json::json!({
-            "kind": "candidate",
-            "message": "完整候选",
+            "kind": kind,
+            "message": "工作乐谱",
             "alda_code": "piano: c"
         })
         .to_string();
@@ -798,6 +807,10 @@ mod tests {
             }]
         });
         format!("data: {chunk}\n\ndata: [DONE]\n")
+    }
+
+    fn candidate_response() -> String {
+        score_response("candidate")
     }
 
     #[test]
@@ -988,7 +1001,10 @@ mod tests {
         let root = directory.path().join("poem");
         let mut project = Project::load_or_create(root, "poem", "").unwrap();
         project
-            .configure("full", Some(180.0), Vec::new(), Vec::new())
+            .configure(&ProjectPreferences {
+                target_duration_secs: Some(180.0),
+                ..ProjectPreferences::default()
+            })
             .unwrap();
         let (_directory, runner) = passing_runner();
         let mut application = Application::from_project(project, Some(runner));
@@ -1028,5 +1044,135 @@ mod tests {
         assert!(message.contains("v1"));
         assert_eq!(application.project_view().current_version, Some(1));
         assert!(application.project_view().working_score.is_none());
+    }
+
+    #[tokio::test]
+    async fn draft_generation_and_work_check_ignore_only_duration() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("poem");
+        let mut project = Project::load_or_create(root, "poem", "").unwrap();
+        project
+            .configure(&ProjectPreferences {
+                target_duration_secs: Some(60.0),
+                ..ProjectPreferences::default()
+            })
+            .unwrap();
+        let (_directory, runner) = passing_runner();
+        let mut application = Application::from_project(project, Some(runner));
+        let (base_url, _requests) = serve(vec![MockResponse::sse(score_response("draft"))]);
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application.configure(ConfigAction::Url(base_url)).unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+
+        let result = application
+            .execute(UserAction::Agent("先写草稿".to_string()), &mut Silent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ActionResult::AgentCompleted {
+                kind: AgentResultKind::Draft,
+                success: true,
+                ..
+            }
+        ));
+
+        let ActionResult::Checks(checks) = application
+            .execute(
+                UserAction::Alda(AldaAction::Check(ScoreTarget::Working)),
+                &mut Silent,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected checks");
+        };
+        assert_eq!(
+            checks
+                .iter()
+                .find(|check| check.name == "时长")
+                .unwrap()
+                .status,
+            CheckStatus::Unchecked
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_check_adopt_and_accept_share_full_project_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("poem");
+        let mut project = Project::load_or_create(root.clone(), "poem", "").unwrap();
+        project
+            .configure(&ProjectPreferences {
+                target_duration_secs: Some(60.0),
+                ..ProjectPreferences::default()
+            })
+            .unwrap();
+        project
+            .save_working_score(
+                "piano: c",
+                WorkingScoreKind::Candidate,
+                "candidate",
+                &passing_checks(),
+            )
+            .unwrap();
+        let external = directory.path().join("external.alda");
+        std::fs::write(&external, "piano: d").unwrap();
+        let (_directory, runner) = passing_runner();
+        let mut application = Application::from_project(project, Some(runner));
+
+        let ActionResult::Checks(work_checks) = application
+            .execute(
+                UserAction::Alda(AldaAction::Check(ScoreTarget::Working)),
+                &mut Silent,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected work checks");
+        };
+        let work_duration = work_checks
+            .iter()
+            .find(|check| check.name == "时长")
+            .unwrap();
+        assert_eq!(work_duration.status, CheckStatus::Fail);
+
+        let ActionResult::Checks(adopt_checks) = application
+            .execute(
+                UserAction::Project(ProjectAction::Adopt(external)),
+                &mut Silent,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected adopt checks");
+        };
+        assert_eq!(
+            adopt_checks.iter().find(|check| check.name == "时长"),
+            Some(work_duration)
+        );
+        assert_eq!(application.project_view().current_version, None);
+
+        let ActionResult::Checks(accept_checks) = application
+            .execute(UserAction::Project(ProjectAction::Accept), &mut Silent)
+            .await
+            .unwrap()
+        else {
+            panic!("expected accept checks");
+        };
+        assert_eq!(
+            accept_checks.iter().find(|check| check.name == "时长"),
+            Some(work_duration)
+        );
+        assert_eq!(application.project_view().current_version, None);
+        assert_eq!(
+            application.project_view().working_score.as_deref(),
+            Some("完整候选")
+        );
+        assert!(!root.join("versions/0001.alda").exists());
     }
 }

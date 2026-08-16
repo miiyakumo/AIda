@@ -1,11 +1,10 @@
-use alda_agent::agent::from_provider_messages;
-use alda_agent::agent::{Agent, CreationMode, CreationRequest, ModifyRequest};
+use alda_agent::agent::{AgentEvent, AgentReporter};
 use alda_agent::alda::AldaRunner;
-use alda_agent::conversation::ConversationState;
-use alda_agent::deepseek::DeepSeekClient;
-use alda_agent::instructions::{CompiledInstructions, InstructionProfile, ProjectPreferences};
+use alda_agent::application::{ActionResult, Application};
+use alda_agent::command::{ProjectAction, UserAction};
+use alda_agent::config::ModelConfig;
+use alda_agent::instructions::ProjectPreferences;
 use alda_agent::project::{Project, WorkingScoreKind};
-use alda_agent::skills::SkillCatalog;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -88,16 +87,10 @@ fn fake_alda() -> (tempfile::TempDir, std::path::PathBuf) {
     (directory, executable)
 }
 
-fn compiled_instructions() -> CompiledInstructions {
-    CompiledInstructions::compile(
-        &SkillCatalog::discover(None, None).unwrap(),
-        &InstructionProfile::default(),
-        &ProjectPreferences {
-            target_duration_secs: Some(180.0),
-            ..ProjectPreferences::default()
-        },
-    )
-    .unwrap()
+struct TestReporter;
+
+impl AgentReporter for TestReporter {
+    fn report(&mut self, _event: AgentEvent) {}
 }
 
 #[tokio::test]
@@ -110,113 +103,86 @@ async fn progressive_workflow_only_versions_an_accepted_candidate() {
         tool_response("draft", "核心机械脉冲草稿。", Some(draft)),
         tool_response("candidate", "已发展成完整候选。", Some(developed)),
     ]);
-    let client = DeepSeekClient::new(
-        "secret-test-value".to_string(),
-        base_url,
-        "example-model".to_string(),
-    )
-    .unwrap();
     let (_alda_directory, alda_path) = fake_alda();
-    let agent = Agent::new(client, AldaRunner::new(alda_path.clone()));
     let project_directory = tempfile::tempdir().unwrap();
     let root = project_directory.path().join("mechanical-drive-poem");
     let source = include_str!("fixtures/mechanical-drive-poem.txt");
     let mut project =
         Project::load_or_create(root.clone(), "mechanical-drive-poem", source).unwrap();
     project
-        .configure("full", Some(180.0), Vec::new(), Vec::new())
-        .unwrap();
-
-    let plan = agent
-        .create(CreationRequest {
-            source_material: source.to_string(),
-            instructions: "创作约三分钟的完整纯器乐曲".to_string(),
-            compiled_instructions: compiled_instructions(),
-            mode: CreationMode::FullPiece,
+        .configure(&ProjectPreferences {
             target_duration_secs: Some(180.0),
-            included_instruments: Vec::new(),
-            excluded_instruments: Vec::new(),
-            max_rounds: 3,
+            ..ProjectPreferences::default()
         })
+        .unwrap();
+    let mut model = ModelConfig::default();
+    model.set_model("example-model").unwrap();
+    model.set_base_url(&base_url).unwrap();
+    model.set_api_key("secret-test-value").unwrap();
+    model.save(&root).unwrap();
+    let mut application =
+        Application::from_project(project, Some(AldaRunner::new(alda_path.clone())));
+    let mut reporter = TestReporter;
+
+    let plan = application
+        .execute(
+            UserAction::Agent("创作约三分钟的完整纯器乐曲".to_string()),
+            &mut reporter,
+        )
         .await
         .unwrap();
-    assert!(!plan.success);
-    assert!(plan.interpretation.contains("机械脉冲"));
-    project
-        .replace_conversation(
-            from_provider_messages(plan.conversation),
-            ConversationState::Ready,
-        )
-        .unwrap();
+    assert!(matches!(
+        plan,
+        ActionResult::AgentCompleted { success: false, .. }
+    ));
 
-    let draft_result = agent
-        .create(CreationRequest {
-            source_material: source.to_string(),
-            instructions: "先做核心材料草稿".to_string(),
-            compiled_instructions: compiled_instructions(),
-            mode: CreationMode::FullPiece,
-            target_duration_secs: Some(180.0),
-            included_instruments: Vec::new(),
-            excluded_instruments: Vec::new(),
-            max_rounds: 3,
-        })
+    let draft_result = application
+        .execute(
+            UserAction::Agent("先做核心材料草稿".to_string()),
+            &mut reporter,
+        )
         .await
         .unwrap();
-    assert!(draft_result.success);
-    project
-        .save_working_score(
-            draft_result.alda_code.as_deref().unwrap(),
-            WorkingScoreKind::Draft,
-            "核心材料",
-            &draft_result.checks,
-        )
-        .unwrap();
-    assert_eq!(project.current_version(), 0);
-    assert_eq!(project.versions().len(), 0);
+    assert!(matches!(
+        draft_result,
+        ActionResult::AgentCompleted { success: true, .. }
+    ));
+    assert_eq!(application.project_view().current_version, None);
+    assert_eq!(
+        application.project_view().working_score.as_deref(),
+        Some("草稿")
+    );
 
     let feedback = "发展中段并完成明亮结尾";
-    let candidate = agent
-        .modify(ModifyRequest {
-            source_material: source.to_string(),
-            current_alda: project.working_code().unwrap(),
-            feedback: feedback.to_string(),
-            compiled_instructions: compiled_instructions(),
-            mode: CreationMode::FullPiece,
-            target_duration_secs: Some(180.0),
-            included_instruments: Vec::new(),
-            excluded_instruments: Vec::new(),
-            max_rounds: 3,
-        })
+    let candidate = application
+        .execute(UserAction::Agent(feedback.to_string()), &mut reporter)
         .await
         .unwrap();
-    assert!(candidate.success);
-    project
-        .save_working_score(
-            candidate.alda_code.as_deref().unwrap(),
-            WorkingScoreKind::Candidate,
-            feedback,
-            &candidate.checks,
-        )
-        .unwrap();
-    assert_eq!(project.current_version(), 0);
-    drop(project);
+    assert!(matches!(
+        candidate,
+        ActionResult::AgentCompleted { success: true, .. }
+    ));
+    assert_eq!(application.project_view().current_version, None);
+    assert_eq!(
+        application.project_view().working_score.as_deref(),
+        Some("完整候选")
+    );
+    drop(application);
 
-    let mut project = Project::load_or_create(root.clone(), "ignored", "ignored").unwrap();
+    let project = Project::load_or_create(root.clone(), "ignored", "ignored").unwrap();
     assert_eq!(
         project.working_score().unwrap().kind,
         WorkingScoreKind::Candidate
     );
-    assert_eq!(project.accept_working_score().unwrap(), 1);
-    assert_eq!(project.current_version(), 1);
-    assert!(project.working_score().is_none());
-    let alda_export = project.export_alda().unwrap();
-    let midi_export = project.midi_export_path().unwrap();
-    AldaRunner::new(alda_path)
-        .export_midi(&project.current_version_path().unwrap(), &midi_export)
+    let mut application = Application::from_project(project, Some(AldaRunner::new(alda_path)));
+    let accepted = application
+        .execute(UserAction::Project(ProjectAction::Accept), &mut reporter)
+        .await
         .unwrap();
-    assert!(alda_export.is_file());
-    assert!(midi_export.is_file());
-    drop(project);
+    assert!(matches!(accepted, ActionResult::Message(message) if message.contains("v1")));
+    assert_eq!(application.project_view().current_version, Some(1));
+    assert!(application.project_view().working_score.is_none());
+    drop(application);
 
     let restarted = Project::load_or_create(root, "ignored", "ignored").unwrap();
     assert_eq!(restarted.current_version(), 1);

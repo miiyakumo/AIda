@@ -182,7 +182,10 @@ async fn probe_alda() -> anyhow::Result<()> {
     let score = score_dir.path().join("probe.alda");
     std::fs::write(&score, "piano: c")?;
     let checks = AldaRunner::new(path)
-        .validate_async(score, Vec::new(), Vec::new(), None, 10.0)
+        .validate_async(
+            score,
+            crate::alda::ScoreValidation::new(None, Vec::new(), Vec::new()),
+        )
         .await?;
     if checks
         .iter()

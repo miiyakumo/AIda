@@ -1,7 +1,7 @@
-use crate::alda::{AldaCheck, AldaRunner, CheckStatus};
+use crate::alda::{AldaCheck, AldaRunner, CheckStatus, ScoreValidation};
 use crate::conversation::{ConversationMessage, ConversationRole, ConversationToolCall};
 use crate::deepseek::{DeepSeekClient, FunctionDef, Message, StreamEvent, Tool};
-use crate::instructions::{CompiledInstructions, ProjectPreferences};
+use crate::instructions::CompiledInstructions;
 use anyhow::{Context, Result, bail};
 use std::fmt::Write as _;
 use std::fs;
@@ -54,42 +54,8 @@ pub struct CreationRequest {
     pub instructions: String,
     /// 由宿主编译的不可变有效指示
     pub compiled_instructions: CompiledInstructions,
-    /// 创作模式
-    pub mode: CreationMode,
-    /// 目标时长（秒），None 不检查
-    pub target_duration_secs: Option<f64>,
-    /// 必须包含的乐器（子串匹配）
-    pub included_instruments: Vec<String>,
-    /// 必须排除的乐器（子串匹配）
-    pub excluded_instruments: Vec<String>,
     /// 最大自动修正轮数，默认 3
     pub max_rounds: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CreationMode {
-    FullPiece,
-    Improvisation,
-}
-
-impl CreationMode {
-    fn description(&self) -> &str {
-        match self {
-            CreationMode::FullPiece => {
-                "完整曲目：强调结构完整、材料发展和明确收束；模式本身不预设时长"
-            }
-            CreationMode::Improvisation => {
-                "即兴片段：强调自由发展，允许开放式收束；模式本身不预设时长"
-            }
-        }
-    }
-
-    fn profile_value(self) -> &'static str {
-        match self {
-            Self::FullPiece => "full",
-            Self::Improvisation => "improv",
-        }
-    }
 }
 
 // ============================================================
@@ -127,44 +93,16 @@ pub enum AgentResultKind {
     Candidate,
 }
 
-pub struct ModifyRequest {
-    pub source_material: String,
-    pub current_alda: String,
-    pub feedback: String,
-    pub compiled_instructions: CompiledInstructions,
-    pub mode: CreationMode,
-    pub target_duration_secs: Option<f64>,
-    pub included_instruments: Vec<String>,
-    pub excluded_instruments: Vec<String>,
-    pub max_rounds: usize,
-}
-
-pub struct ContinueRequest {
-    pub conversation: Vec<Message>,
-    pub compiled_instructions: CompiledInstructions,
-    pub mode: CreationMode,
-    pub target_duration_secs: Option<f64>,
-    pub included_instruments: Vec<String>,
-    pub excluded_instruments: Vec<String>,
-    pub max_rounds: usize,
-}
-
 pub struct ProjectPromptRequest {
     pub conversation: Vec<ConversationMessage>,
     pub current_alda: Option<String>,
     pub working_alda: Option<String>,
     pub compiled_instructions: CompiledInstructions,
-    pub mode: CreationMode,
-    pub target_duration_secs: Option<f64>,
-    pub included_instruments: Vec<String>,
-    pub excluded_instruments: Vec<String>,
     pub max_rounds: usize,
 }
 
 struct ValidationRequest {
-    target_duration_ms: Option<f64>,
-    included_instruments: Vec<String>,
-    excluded_instruments: Vec<String>,
+    score: ScoreValidation,
     max_rounds: usize,
 }
 
@@ -285,13 +223,10 @@ impl Agent {
         if request.conversation.is_empty() {
             bail!("对话不能为空");
         }
-        validate_compiled_preferences(
-            &request.compiled_instructions,
-            request.mode,
-            request.target_duration_secs,
-            &request.included_instruments,
-            &request.excluded_instruments,
-        )?;
+        let validation = request
+            .compiled_instructions
+            .resolved_preferences()
+            .score_validation(true);
         let mut messages = vec![Message {
             role: "system".to_string(),
             content: Some(request.compiled_instructions.rendered().to_string()),
@@ -308,9 +243,7 @@ impl Agent {
         self.run_generation(
             messages,
             ValidationRequest {
-                target_duration_ms: request.target_duration_secs.map(|seconds| seconds * 1000.0),
-                included_instruments: request.included_instruments,
-                excluded_instruments: request.excluded_instruments,
+                score: validation,
                 max_rounds: request.max_rounds,
             },
             reporter,
@@ -326,13 +259,10 @@ impl Agent {
         if request.source_material.trim().is_empty() && request.instructions.trim().is_empty() {
             bail!("创作素材与要求不能同时为空");
         }
-        validate_compiled_preferences(
-            &request.compiled_instructions,
-            request.mode,
-            request.target_duration_secs,
-            &request.included_instruments,
-            &request.excluded_instruments,
-        )?;
+        let validation = request
+            .compiled_instructions
+            .resolved_preferences()
+            .score_validation(true);
         let messages = vec![
             Message {
                 role: "system".to_string(),
@@ -351,105 +281,7 @@ impl Agent {
         self.run_generation(
             messages,
             ValidationRequest {
-                target_duration_ms: request.target_duration_secs.map(|seconds| seconds * 1000.0),
-                included_instruments: request.included_instruments,
-                excluded_instruments: request.excluded_instruments,
-                max_rounds: request.max_rounds,
-            },
-            reporter,
-        )
-        .await
-    }
-
-    pub async fn modify(&self, request: ModifyRequest) -> Result<CreationResult> {
-        self.modify_with_reporter(request, &mut SilentReporter)
-            .await
-    }
-
-    pub async fn modify_with_reporter(
-        &self,
-        request: ModifyRequest,
-        reporter: &mut impl AgentReporter,
-    ) -> Result<CreationResult> {
-        if request.current_alda.trim().is_empty() {
-            bail!("当前乐谱为空，无法修改");
-        }
-        if request.feedback.trim().is_empty() {
-            bail!("修改要求不能为空");
-        }
-        validate_compiled_preferences(
-            &request.compiled_instructions,
-            request.mode,
-            request.target_duration_secs,
-            &request.included_instruments,
-            &request.excluded_instruments,
-        )?;
-
-        let messages = vec![
-            Message {
-                role: "system".to_string(),
-                content: Some(request.compiled_instructions.rendered().to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            Message {
-                role: "user".to_string(),
-                content: Some(build_modify_message(&request)),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        ];
-
-        self.run_generation(
-            messages,
-            ValidationRequest {
-                target_duration_ms: request.target_duration_secs.map(|seconds| seconds * 1000.0),
-                included_instruments: request.included_instruments,
-                excluded_instruments: request.excluded_instruments,
-                max_rounds: request.max_rounds,
-            },
-            reporter,
-        )
-        .await
-    }
-
-    pub async fn continue_generation(&self, request: ContinueRequest) -> Result<CreationResult> {
-        self.continue_with_reporter(request, &mut SilentReporter)
-            .await
-    }
-
-    pub async fn continue_with_reporter(
-        &self,
-        request: ContinueRequest,
-        reporter: &mut impl AgentReporter,
-    ) -> Result<CreationResult> {
-        if request.conversation.is_empty() {
-            bail!("没有可继续的生成上下文");
-        }
-        validate_compiled_preferences(
-            &request.compiled_instructions,
-            request.mode,
-            request.target_duration_secs,
-            &request.included_instruments,
-            &request.excluded_instruments,
-        )?;
-        let mut conversation = request.conversation;
-        conversation.retain(|message| message.role != "system");
-        conversation.insert(
-            0,
-            Message {
-                role: "system".to_string(),
-                content: Some(request.compiled_instructions.rendered().to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        );
-        self.run_generation(
-            conversation,
-            ValidationRequest {
-                target_duration_ms: request.target_duration_secs.map(|seconds| seconds * 1000.0),
-                included_instruments: request.included_instruments,
-                excluded_instruments: request.excluded_instruments,
+                score: validation,
                 max_rounds: request.max_rounds,
             },
             reporter,
@@ -465,7 +297,6 @@ impl Agent {
         validation: ValidationRequest,
         reporter: &mut impl AgentReporter,
     ) -> Result<CreationResult> {
-        validate_generation_constraints(&validation)?;
         let max_rounds = validation.max_rounds.max(1);
 
         let mut interpretation = String::new();
@@ -571,19 +402,14 @@ impl Agent {
                 max_rounds,
             });
 
+            let score_validation = if submitted.kind == AgentResultKind::Candidate {
+                validation.score.clone()
+            } else {
+                validation.score.clone().without_duration()
+            };
             let mut checks = self
                 .runner
-                .validate_async(
-                    tmp_score,
-                    validation.included_instruments.clone(),
-                    validation.excluded_instruments.clone(),
-                    if submitted.kind == AgentResultKind::Candidate {
-                        validation.target_duration_ms
-                    } else {
-                        None
-                    },
-                    10.0,
-                )
+                .validate_async(tmp_score, score_validation)
                 .await?;
 
             // 如果截断，追加诊断
@@ -663,62 +489,13 @@ impl Agent {
     }
 }
 
-fn validate_compiled_preferences(
-    compiled: &CompiledInstructions,
-    mode: CreationMode,
-    target_duration_secs: Option<f64>,
-    included_instruments: &[String],
-    excluded_instruments: &[String],
-) -> Result<()> {
-    let provided = ProjectPreferences {
-        mode: mode.profile_value().to_string(),
-        target_duration_secs,
-        included_instruments: included_instruments.to_vec(),
-        excluded_instruments: excluded_instruments.to_vec(),
-    };
-    provided.validate()?;
-    let expected = provided.normalized();
-    if expected != provided {
-        bail!("本次真实校验约束必须先规范化、排序并去重");
-    }
-    if compiled.resolved_preferences() != &expected {
-        bail!("编译指示中的项目偏好与本次真实校验约束不一致");
-    }
-    Ok(())
-}
-
-fn validate_generation_constraints(validation: &ValidationRequest) -> Result<()> {
-    if validation
-        .target_duration_ms
-        .is_some_and(|duration| !duration.is_finite() || duration <= 0.0)
-    {
-        bail!("目标时长必须是大于 0 的有限数值");
-    }
-    if validation
-        .included_instruments
-        .iter()
-        .chain(&validation.excluded_instruments)
-        .any(|instrument| instrument.trim().is_empty())
-    {
-        bail!("乐器约束不能为空");
-    }
-    if let Some(conflict) = validation.included_instruments.iter().find(|included| {
-        validation
-            .excluded_instruments
-            .iter()
-            .any(|excluded| included.eq_ignore_ascii_case(excluded))
-    }) {
-        bail!("乐器 {conflict} 不能同时要求包含和排除");
-    }
-    Ok(())
-}
-
 // ============================================================
 // 辅助函数
 // ============================================================
 
 fn build_user_message(request: &CreationRequest) -> String {
     let mut msg = String::new();
+    let preferences = request.compiled_instructions.resolved_preferences();
 
     msg.push_str("【创作上下文】\n");
 
@@ -729,26 +506,26 @@ fn build_user_message(request: &CreationRequest) -> String {
     }
 
     msg.push_str("【模式】");
-    msg.push_str(request.mode.description());
+    msg.push_str(preferences.mode.description());
     msg.push('\n');
 
-    if let Some(dur) = request.target_duration_secs {
+    if let Some(dur) = preferences.target_duration_secs {
         let _ = writeln!(msg, "【目标时长】约 {} 分钟", dur / 60.0);
     }
 
-    if !request.included_instruments.is_empty() {
+    if !preferences.included_instruments.is_empty() {
         let _ = writeln!(
             msg,
             "【必须包含的乐器】{}",
-            request.included_instruments.join("、")
+            preferences.included_instruments.join("、")
         );
     }
 
-    if !request.excluded_instruments.is_empty() {
+    if !preferences.excluded_instruments.is_empty() {
         let _ = writeln!(
             msg,
             "【必须排除的乐器】{}",
-            request.excluded_instruments.join("、")
+            preferences.excluded_instruments.join("、")
         );
     }
 
@@ -763,24 +540,25 @@ fn build_user_message(request: &CreationRequest) -> String {
 
 fn build_project_context(request: &ProjectPromptRequest) -> String {
     let mut message = String::new();
+    let preferences = request.compiled_instructions.resolved_preferences();
     message.push_str("【项目设置】\n【模式】");
-    message.push_str(request.mode.description());
+    message.push_str(preferences.mode.description());
     message.push('\n');
-    if let Some(duration) = request.target_duration_secs {
+    if let Some(duration) = preferences.target_duration_secs {
         let _ = writeln!(message, "【目标时长】约 {} 分钟", duration / 60.0);
     }
-    if !request.included_instruments.is_empty() {
+    if !preferences.included_instruments.is_empty() {
         let _ = writeln!(
             message,
             "【必须包含的乐器】{}",
-            request.included_instruments.join("、")
+            preferences.included_instruments.join("、")
         );
     }
-    if !request.excluded_instruments.is_empty() {
+    if !preferences.excluded_instruments.is_empty() {
         let _ = writeln!(
             message,
             "【必须排除的乐器】{}",
-            request.excluded_instruments.join("、")
+            preferences.excluded_instruments.join("、")
         );
     }
     if let Some(score) = &request.working_alda {
@@ -793,44 +571,6 @@ fn build_project_context(request: &ProjectPromptRequest) -> String {
         message.push_str("\n项目尚无有效版本；请根据对话中的用户请求创作。\n");
     }
     message
-}
-
-fn build_modify_message(request: &ModifyRequest) -> String {
-    let mut msg = String::new();
-    msg.push_str("【修改上下文】\n这是一次独立的作品修改请求。不要假定或延续此前对话中的修改方案，只以本消息提供的素材、当前乐谱、最新反馈和约束为准。\n\n");
-
-    if !request.source_material.trim().is_empty() {
-        msg.push_str("【原始素材】\n");
-        msg.push_str(request.source_material.trim());
-        msg.push_str("\n\n");
-    }
-    msg.push_str("【模式】");
-    msg.push_str(request.mode.description());
-    msg.push('\n');
-
-    if let Some(duration) = request.target_duration_secs {
-        let _ = writeln!(msg, "【目标时长】约 {} 分钟", duration / 60.0);
-    }
-    if !request.included_instruments.is_empty() {
-        let _ = writeln!(
-            msg,
-            "【必须包含的乐器】{}",
-            request.included_instruments.join("、")
-        );
-    }
-    if !request.excluded_instruments.is_empty() {
-        let _ = writeln!(
-            msg,
-            "【必须排除的乐器】{}",
-            request.excluded_instruments.join("、")
-        );
-    }
-
-    msg.push_str("\n【当前 Alda】\n");
-    msg.push_str(&request.current_alda);
-    msg.push_str("\n\n【本轮要求｜来源：当前用户反馈｜最高策略优先级】\n");
-    msg.push_str(request.feedback.trim());
-    msg
 }
 
 struct SubmittedResult {
@@ -942,6 +682,7 @@ fn parse_duration_values(detail: &str) -> Option<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instructions::{CreationMode, ProjectPreferences};
     use crate::test_support::{MockResponse, serve};
     use std::os::unix::fs::PermissionsExt;
 
@@ -1014,56 +755,8 @@ mod tests {
             source_material: "素材".to_string(),
             instructions: "创作完整器乐作品".to_string(),
             compiled_instructions: compiled_instructions(&ProjectPreferences::default()),
-            mode: CreationMode::FullPiece,
-            target_duration_secs: None,
-            included_instruments: Vec::new(),
-            excluded_instruments: Vec::new(),
             max_rounds,
         }
-    }
-
-    fn modify_request() -> ModifyRequest {
-        ModifyRequest {
-            source_material: "原始诗歌".to_string(),
-            current_alda: "midi-piano: c1".to_string(),
-            feedback: "编排单调，艺术性不高".to_string(),
-            compiled_instructions: compiled_instructions(&ProjectPreferences {
-                target_duration_secs: Some(180.0),
-                included_instruments: vec!["midi-cello".to_string()],
-                excluded_instruments: vec!["midi-timpani".to_string()],
-                ..ProjectPreferences::default()
-            }),
-            mode: CreationMode::FullPiece,
-            target_duration_secs: Some(180.0),
-            included_instruments: vec!["midi-cello".to_string()],
-            excluded_instruments: vec!["midi-timpani".to_string()],
-            max_rounds: 1,
-        }
-    }
-
-    #[test]
-    fn modification_prompt_routes_scope_from_clean_project_context() {
-        let request = modify_request();
-        assert!(
-            request
-                .compiled_instructions
-                .rendered()
-                .contains("可以重写曲式、主题发展、织体与配器")
-        );
-        assert!(
-            request
-                .compiled_instructions
-                .rendered()
-                .contains("一次只问一个简短问题")
-        );
-        let message = build_modify_message(&request);
-        assert!(message.contains("不要假定或延续此前对话"));
-        assert!(message.contains("【原始素材】\n原始诗歌"));
-        assert!(message.contains("【本轮要求｜来源：当前用户反馈｜最高策略优先级】"));
-        assert!(message.contains("【目标时长】约 3 分钟"));
-        assert!(message.contains("【必须包含的乐器】midi-cello"));
-        assert!(message.contains("【必须排除的乐器】midi-timpani"));
-        assert!(message.ends_with("编排单调，艺术性不高"));
     }
 
     #[test]
@@ -1084,8 +777,8 @@ mod tests {
 
     #[test]
     fn creation_mode_describes_form_without_implying_duration() {
-        let full = CreationMode::FullPiece.description();
-        let improv = CreationMode::Improvisation.description();
+        let full = CreationMode::Full.description();
+        let improv = CreationMode::Improv.description();
 
         assert!(full.contains("结构完整"));
         assert!(improv.contains("自由发展"));
@@ -1093,47 +786,6 @@ mod tests {
         assert!(improv.contains("不预设时长"));
         assert!(!full.contains("分钟"));
         assert!(!improv.contains("分钟"));
-    }
-
-    #[tokio::test]
-    async fn modification_starts_with_only_system_and_clean_request() {
-        let (base_url, requests) = serve(vec![MockResponse::sse(text_response(
-            "clarification",
-            "你希望整体重构还是只调整配器？",
-        ))]);
-        let client = DeepSeekClient::new(
-            "test-key".to_string(),
-            base_url,
-            "example-model".to_string(),
-        )
-        .unwrap();
-        let (_directory, runner) = fake_runner();
-        let result = Agent::new(client, runner)
-            .modify(modify_request())
-            .await
-            .unwrap();
-        assert!(result.needs_input);
-
-        let request = requests.recv().unwrap();
-        let request = String::from_utf8_lossy(&request);
-        let body = request.split("\r\n\r\n").nth(1).unwrap();
-        let body: serde_json::Value = serde_json::from_str(body).unwrap();
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        assert!(
-            messages[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("builtin:progressive-composition")
-        );
-        assert_eq!(messages[1]["role"], "user");
-        assert!(
-            messages[1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("原始诗歌")
-        );
     }
 
     #[test]
@@ -1225,41 +877,5 @@ mod tests {
         assert!(result.needs_input);
         assert!(result.interpretation.contains("哪一个段落"));
         assert!(result.checks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn invalid_constraints_fail_before_network_access() {
-        let client = DeepSeekClient::new(
-            "test-key".to_string(),
-            "http://127.0.0.1:1".to_string(),
-            "example-model".to_string(),
-        )
-        .unwrap();
-        let (_directory, runner) = fake_runner();
-        let mut invalid = request(1);
-        invalid.target_duration_secs = Some(0.0);
-        let error = Agent::new(client, runner)
-            .create(invalid)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("目标时长"));
-    }
-
-    #[tokio::test]
-    async fn compiled_preferences_cannot_diverge_from_real_validation_constraints() {
-        let client = DeepSeekClient::new(
-            "test-key".to_string(),
-            "http://127.0.0.1:1".to_string(),
-            "example-model".to_string(),
-        )
-        .unwrap();
-        let (_directory, runner) = fake_runner();
-        let mut mismatched = request(1);
-        mismatched.target_duration_secs = Some(120.0);
-        let error = Agent::new(client, runner)
-            .create(mismatched)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("不一致"));
     }
 }

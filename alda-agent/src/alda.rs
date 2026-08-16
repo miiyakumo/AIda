@@ -61,12 +61,40 @@ pub struct AldaCheck {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Pass,
     Fail,
     Unchecked,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoreValidation {
+    target_duration_ms: Option<f64>,
+    included_instruments: Vec<String>,
+    excluded_instruments: Vec<String>,
+}
+
+impl ScoreValidation {
+    #[must_use]
+    pub fn new(
+        target_duration_secs: Option<f64>,
+        included_instruments: Vec<String>,
+        excluded_instruments: Vec<String>,
+    ) -> Self {
+        Self {
+            target_duration_ms: target_duration_secs.map(|seconds| seconds * 1000.0),
+            included_instruments,
+            excluded_instruments,
+        }
+    }
+
+    #[must_use]
+    pub fn without_duration(mut self) -> Self {
+        self.target_duration_ms = None;
+        self
+    }
 }
 
 impl std::fmt::Display for CheckStatus {
@@ -396,19 +424,16 @@ impl AldaRunner {
     pub async fn validate_async(
         &self,
         score_path: PathBuf,
-        included_instruments: Vec<String>,
-        excluded_instruments: Vec<String>,
-        target_duration_ms: Option<f64>,
-        duration_tolerance_pct: f64,
+        validation: ScoreValidation,
     ) -> Result<Vec<AldaCheck>> {
         let runner = self.clone();
         let checks = tokio::task::spawn_blocking(move || {
             runner.validate(
                 &score_path,
-                &included_instruments,
-                &excluded_instruments,
-                target_duration_ms,
-                duration_tolerance_pct,
+                &validation.included_instruments,
+                &validation.excluded_instruments,
+                validation.target_duration_ms,
+                10.0,
             )
         })
         .await
@@ -801,7 +826,10 @@ fi
         let runner = runner.with_cancellation(cancellation.clone());
         let task = tokio::spawn(async move {
             runner
-                .validate_async(fixture("slow.alda"), Vec::new(), Vec::new(), None, 10.0)
+                .validate_async(
+                    fixture("slow.alda"),
+                    ScoreValidation::new(None, Vec::new(), Vec::new()),
+                )
                 .await
         });
         std::thread::sleep(Duration::from_millis(20));

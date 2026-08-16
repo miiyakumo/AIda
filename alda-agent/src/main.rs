@@ -119,33 +119,11 @@ struct ComposeOptions {
     output: std::path::PathBuf,
 }
 
-fn compile_compose_instructions(
-    project_root: &std::path::Path,
-    project_name: &str,
-    preferences: &alda_agent::instructions::ProjectPreferences,
-) -> anyhow::Result<alda_agent::instructions::CompiledInstructions> {
-    let project =
-        alda_agent::project::Project::load_or_create(project_root.to_path_buf(), project_name, "")?;
-    let user_skills_root = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .map(|home| home.join(".alda-agent").join("skills"));
-    let catalog = alda_agent::skills::SkillCatalog::discover(
-        user_skills_root.as_deref(),
-        Some(&project_root.join("skills")),
-    )?;
-    alda_agent::instructions::CompiledInstructions::compile(
-        &catalog,
-        project.instruction_profile(),
-        preferences,
-    )
-}
-
 async fn compose(options: ComposeOptions) -> anyhow::Result<()> {
-    use alda_agent::agent::{Agent, AgentResultKind, CreationMode, CreationRequest};
-    use alda_agent::alda::{AldaRunner, CheckStatus, find_alda};
-    use alda_agent::config::ModelConfig;
-    use alda_agent::deepseek::DeepSeekClient;
-    use alda_agent::instructions::ProjectPreferences;
+    use alda_agent::agent::AgentResultKind;
+    use alda_agent::alda::CheckStatus;
+    use alda_agent::application::{ComposeRequest, compose_once, prepare_compose};
+    use alda_agent::instructions::{CreationMode, ProjectPreferences};
     use std::io::Read;
 
     let ComposeOptions {
@@ -175,42 +153,26 @@ async fn compose(options: ComposeOptions) -> anyhow::Result<()> {
         anyhow::bail!("素材不能为空");
     }
 
-    // 初始化
-    let config = ModelConfig::load(&project_root)?.resolve()?;
-    let client = DeepSeekClient::new(config.api_key, config.base_url, config.model)?;
-    let alda_path = find_alda().ok_or_else(|| anyhow::anyhow!("未找到 alda，请先安装"))?;
-    let runner = AldaRunner::new(alda_path);
-    let agent = Agent::new(client, runner);
-
-    let creation_mode = match mode.as_str() {
-        "full" => CreationMode::FullPiece,
-        "improv" => CreationMode::Improvisation,
-        other => anyhow::bail!("无效的创作模式: {other}（应为 full 或 improv）"),
-    };
     let preferences = ProjectPreferences {
-        mode,
+        mode: mode.parse::<CreationMode>()?,
         target_duration_secs: duration,
         included_instruments: include,
         excluded_instruments: exclude,
     }
     .normalized();
-    let compiled_instructions =
-        compile_compose_instructions(&project_root, &project_name, &preferences)?;
-
-    let request = CreationRequest {
+    let request = ComposeRequest {
+        project_root,
+        project_name,
         source_material,
-        instructions: String::new(),
-        compiled_instructions,
-        mode: creation_mode,
-        target_duration_secs: preferences.target_duration_secs,
-        included_instruments: preferences.included_instruments,
-        excluded_instruments: preferences.excluded_instruments,
+        preferences,
         max_rounds: 3,
     };
 
+    let prepared = prepare_compose(request)?;
+
     println!("\n=== 开始创作 ===\n");
 
-    let result = agent.create(request).await?;
+    let result = compose_once(prepared).await?;
 
     println!("\n=== 创作完成 ({}/{} 轮) ===\n", result.rounds, 3);
     println!(

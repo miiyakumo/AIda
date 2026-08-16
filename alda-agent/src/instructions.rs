@@ -1,3 +1,4 @@
+use crate::alda::ScoreValidation;
 use crate::skills::{
     BUILTIN_PROGRESSIVE_SKILL_ID, QualifiedSkillId, SkillCatalog, SkillKind, SkillOrigin,
 };
@@ -21,9 +22,47 @@ pub struct InstructionProfile {
     pub enabled_advisory_skills: Vec<QualifiedSkillId>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CreationMode {
+    Full,
+    Improv,
+}
+
+impl CreationMode {
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Full => "完整曲目：强调结构完整、材料发展和明确收束；模式本身不预设时长",
+            Self::Improv => "即兴片段：强调自由发展，允许开放式收束；模式本身不预设时长",
+        }
+    }
+}
+
+impl std::fmt::Display for CreationMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => formatter.write_str("full"),
+            Self::Improv => formatter.write_str("improv"),
+        }
+    }
+}
+
+impl std::str::FromStr for CreationMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim() {
+            "full" => Ok(Self::Full),
+            "improv" => Ok(Self::Improv),
+            other => bail!("无效的创作模式: {other}（应为 full 或 improv）"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectPreferences {
-    pub mode: String,
+    pub mode: CreationMode,
     pub target_duration_secs: Option<f64>,
     pub included_instruments: Vec<String>,
     pub excluded_instruments: Vec<String>,
@@ -32,7 +71,7 @@ pub struct ProjectPreferences {
 impl Default for ProjectPreferences {
     fn default() -> Self {
         Self {
-            mode: "full".to_string(),
+            mode: CreationMode::Full,
             target_duration_secs: None,
             included_instruments: Vec::new(),
             excluded_instruments: Vec::new(),
@@ -44,7 +83,7 @@ impl ProjectPreferences {
     #[must_use]
     pub fn normalized(&self) -> Self {
         Self {
-            mode: self.mode.trim().to_string(),
+            mode: self.mode,
             target_duration_secs: self.target_duration_secs,
             included_instruments: normalize_instruments(&self.included_instruments),
             excluded_instruments: normalize_instruments(&self.excluded_instruments),
@@ -52,9 +91,6 @@ impl ProjectPreferences {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.mode.as_str(), "full" | "improv") {
-            bail!("项目创作模式必须是 full 或 improv");
-        }
         if self
             .target_duration_secs
             .is_some_and(|duration| !duration.is_finite() || duration <= 0.0)
@@ -77,6 +113,17 @@ impl ProjectPreferences {
             bail!("乐器 {conflict:?} 不能同时出现在必须包含和必须排除列表中");
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn score_validation(&self, check_duration: bool) -> ScoreValidation {
+        ScoreValidation::new(
+            check_duration
+                .then_some(self.target_duration_secs)
+                .flatten(),
+            self.included_instruments.clone(),
+            self.excluded_instruments.clone(),
+        )
     }
 }
 
@@ -354,7 +401,7 @@ fn render_project_preferences(preferences: &ProjectPreferences) -> String {
         .iter()
         .map(|instrument| instrument.trim())
         .collect();
-    let mut content = format!("- 创作模式：{}\n", preferences.mode.trim());
+    let mut content = format!("- 创作模式：{}\n", preferences.mode);
     if let Some(duration) = preferences.target_duration_secs {
         let _ = writeln!(content, "- 目标时长：{duration} 秒");
     } else {
@@ -420,7 +467,7 @@ fn render_summary(
     let excluded = display_list(&preferences.excluded_instruments);
     format!(
         "核心协议：builtin:protocol\n生效 Skill：{skills}\n项目偏好：mode={}, target_duration={}, include={}, exclude={}\n角色：builtin:default-agent\n有效模型工具：submit_result\n能力：可更新工作乐谱；不能接受候选或写入有效版本\n结构化冲突：未发现\n{}\n片段摘要：{fragment_digests}\nFingerprint：{fingerprint}",
-        preferences.mode.trim(),
+        preferences.mode,
         duration,
         included,
         excluded,
@@ -515,7 +562,7 @@ mod tests {
     fn fingerprint_and_summary_are_stable_for_equivalent_preferences() {
         let catalog = SkillCatalog::discover(None, None).unwrap();
         let first = ProjectPreferences {
-            mode: "full".to_string(),
+            mode: CreationMode::Full,
             target_duration_secs: Some(180.0),
             included_instruments: vec!["midi-violin".to_string(), "midi-cello".to_string()],
             excluded_instruments: vec!["midi-tuba".to_string()],
@@ -566,15 +613,12 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mode_and_duration_fail_before_rendering() {
+    fn invalid_mode_is_rejected_by_serde_and_duration_before_rendering() {
         let catalog = SkillCatalog::discover(None, None).unwrap();
-        let invalid_mode = ProjectPreferences {
-            mode: "custom".to_string(),
-            ..ProjectPreferences::default()
-        };
-        assert!(
-            compile_instructions(&catalog, &InstructionProfile::default(), &invalid_mode).is_err()
-        );
+        assert!(serde_json::from_str::<ProjectPreferences>(
+            r#"{"mode":"custom","target_duration_secs":null,"included_instruments":[],"excluded_instruments":[]}"#
+        )
+        .is_err());
         let invalid_duration = ProjectPreferences {
             target_duration_secs: Some(f64::NAN),
             ..ProjectPreferences::default()

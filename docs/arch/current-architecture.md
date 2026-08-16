@@ -1,6 +1,6 @@
 # 当前架构
 
-> 代码基线：可组合指示系统首期实现（2026-08-14）
+> 代码基线：生成与项目持久化边界收敛（2026-08-15）
 >
 > 本文描述当前源码实际行为。
 
@@ -88,9 +88,11 @@ TTY 的活动输入块分为 `项目 ·`、`状态 ·` 和 `›` 三层。项目
 
 ## 项目聚合与双视图
 
-`Project` 是聚合根，持有项目设置、至多一个工作乐谱、当前有效版本、线性版本元数据和一条供应商无关的
+`Project` 是聚合根，直接持有规范化、强类型的 `ProjectPreferences`、至多一个工作乐谱、当前有效版本、线性版本元数据和一条供应商无关的
 `Conversation`。Conversation 保存用户、模型和 Agent 内部工具消息，以及 `ready`、
 `awaiting_input`、`revision_available` 状态。项目领域不依赖模型传输消息；Agent 边界负责转换。
+mode 使用可序列化枚举；提示编译和 Alda 校验都从同一份 Project 偏好派生。持久化检查记录使用强类型
+`CheckStatus`，JSON 中继续保持既有的中文状态值。
 
 工作乐谱分为草稿和完整候选。草稿只要求语法、内容和乐器约束，可在未达到整曲时长时试听；完整候选还
 必须满足项目时长。两者都写入 `work.alda`，不会改变有效版本。项目只保留一个工作乐谱，新结果覆盖旧
@@ -123,7 +125,7 @@ Alda 操作使用每次前台操作独立的 `CancellationToken`。Ctrl+C 在模
 
 ## 可组合指示与 Skill
 
-每次模型调用前，`Application` 从同一个 `Project` 读取 mode、目标时长和乐器约束，并通过
+每次模型调用前，`Application` 从同一个 `ProjectPreferences` 读取 mode、目标时长和乐器约束，并通过
 `SkillCatalog` 发现内建、用户级和项目级 Skill。指示编译器按固定顺序生成不可变的
 `CompiledInstructions`：核心协议、应用能力边界、固定内建 workflow、按限定 ID 排序的 advisory Skill、
 项目偏好和默认角色。每个片段保留来源、作用域、强度和 SHA-256 摘要，整体渲染结果具有 fingerprint。
@@ -143,6 +145,11 @@ Skill 内容只影响模型输入。Alda 校验、工作乐谱写入、候选接
 
 ## 生成与输出边界
 
+Agent 只有交互式 `respond_with_reporter` 和一次性 `create` 两个真实生成入口，两者共享同一个内部
+`run_generation` 循环。`Application::execute` 驱动交互入口；`application::prepare_compose` 与
+`application::compose_once` 负责一次性 compose 所需的 Project、模型配置、Skill、指示和 Alda 编排，
+`main.rs` 只处理 CLI 输入输出、文件读取写入与退出语义。
+
 Agent 在每轮报告轮次开始、模型文本增量、Alda 校验开始、完整检查结果和自动修正。模型传输层不写
 stdout/stderr；SSE 文本经 callback 实时交给应用 reporter。终端统一渲染模型、Agent、Alda、项目结果
 和错误。
@@ -151,7 +158,8 @@ stdout/stderr；SSE 文本经 callback 实时交给应用 reporter。终端统�
 草稿和候选通过各自检查后更新工作乐谱。后续自然语言优先基于工作乐谱继续发展，不会按对话轮次创建版本。
 
 Agent 产生的完整候选不会自动调用 `Project::save_version`。`/project accept` 会按当前项目约束重新校验，
-通过后才创建版本并更新 `current.alda`；失败、取消、草稿和未接受候选都不会改变有效版本。显式
+通过后才创建版本并更新 `current.alda`；失败、取消、草稿和未接受候选都不会改变有效版本。接受候选时，
+新 immutable version、当前版本元数据和清除工作状态以一次 `project.json` 写入作为提交点。显式
 `/project adopt PATH` 仍可采用外部文件。版本切换不删除后续历史，新版本号始终递增。
 
 ## 持久化布局
@@ -160,16 +168,18 @@ Agent 产生的完整候选不会自动调用 `Project::save_version`。`/projec
 project-root/
 ├── project.json
 ├── model.json                 # 项目模型配置，Unix 0600
-├── work.alda                  # 当前草稿或完整候选，可选
-├── current.alda               # 当前有效版本，可选
+├── work.alda                  # working metadata 引用的规范工作源码，可选
+├── current.alda               # 当前有效版本投影，可选
 ├── .repl-history
 ├── skills/<name>/SKILL.md     # 项目级 advisory Skill，可选
-├── versions/0001.alda ...
+├── versions/0001.alda ...     # 不可变版本源码
 └── exports/version-0001.alda|mid ...
 ```
 
-项目尚未发布，元数据更新不提供迁移层；旧项目若存在无元数据的遗留 `work.alda`，后续写入工作乐谱时会
-直接覆盖。
+`project.json` 与其引用的 immutable version 文件共同构成已接受版本的规范事实，`current.alda` 是便利投影。
+working metadata 与其引用的 `work.alda` 共同构成规范工作状态；被引用的 `work.alda` 缺失视为项目损坏，
+只有 metadata 已清除后的残留文件才可清理。项目加载时会从当前 version 修复缺失或陈旧的 `current.alda`，
+并删除严格匹配协议版本名但未被元数据引用的中断残留。项目尚未发布，元数据更新不提供迁移层。
 
 ## 验证基线
 

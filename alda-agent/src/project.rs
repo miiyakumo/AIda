@@ -1,6 +1,6 @@
 use crate::alda::{AldaCheck, CheckStatus};
 use crate::conversation::{Conversation, ConversationMessage, ConversationState};
-use crate::instructions::InstructionProfile;
+use crate::instructions::{CreationMode, InstructionProfile, ProjectPreferences};
 use crate::skills::{QualifiedSkillId, SkillOrigin};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -14,10 +14,40 @@ const PROJECT_FILE: &str = "project.json";
 const CURRENT_FILE: &str = "current.alda";
 const WORK_FILE: &str = "work.alda";
 
+mod persisted_check_status {
+    use crate::alda::CheckStatus;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S>(status: &CheckStatus, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match status {
+            CheckStatus::Pass => "通过",
+            CheckStatus::Fail => "失败",
+            CheckStatus::Unchecked => "未检查",
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<CheckStatus, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "通过" | "pass" => Ok(CheckStatus::Pass),
+            "失败" | "fail" => Ok(CheckStatus::Fail),
+            "未检查" | "unchecked" => Ok(CheckStatus::Unchecked),
+            value => Err(serde::de::Error::custom(format!("未知检查状态 {value:?}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckRecord {
     pub name: String,
-    pub status: String,
+    #[serde(with = "persisted_check_status")]
+    pub status: CheckStatus,
     pub detail: String,
 }
 
@@ -25,7 +55,7 @@ impl From<&AldaCheck> for CheckRecord {
     fn from(check: &AldaCheck) -> Self {
         Self {
             name: check.name.to_string(),
-            status: check.status.to_string(),
+            status: check.status,
             detail: check.detail.clone(),
         }
     }
@@ -66,10 +96,8 @@ pub struct Project {
     pub project_name: String,
     #[serde(default)]
     instruction_profile: InstructionProfile,
-    mode: String,
-    target_duration_secs: Option<f64>,
-    included_instruments: Vec<String>,
-    excluded_instruments: Vec<String>,
+    #[serde(flatten)]
+    preferences: ProjectPreferences,
     current_version: u32,
     versions: BTreeMap<u32, VersionMeta>,
     working_score: Option<WorkingScore>,
@@ -93,6 +121,7 @@ impl Project {
                 .with_context(|| format!("无法解析 {}", project_file.display()))?;
             project.root = root;
             project.validate_metadata()?;
+            project.recover_projections()?;
             return Ok(project);
         }
 
@@ -101,10 +130,7 @@ impl Project {
         let project = Self {
             project_name: project_name.to_string(),
             instruction_profile: InstructionProfile::default(),
-            mode: "full".to_string(),
-            target_duration_secs: None,
-            included_instruments: Vec::new(),
-            excluded_instruments: Vec::new(),
+            preferences: ProjectPreferences::default(),
             current_version: 0,
             versions: BTreeMap::new(),
             working_score: None,
@@ -136,23 +162,28 @@ impl Project {
     }
 
     #[must_use]
-    pub fn mode(&self) -> &str {
-        &self.mode
+    pub fn preferences(&self) -> &ProjectPreferences {
+        &self.preferences
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> CreationMode {
+        self.preferences.mode
     }
 
     #[must_use]
     pub fn target_duration_secs(&self) -> Option<f64> {
-        self.target_duration_secs
+        self.preferences.target_duration_secs
     }
 
     #[must_use]
     pub fn included_instruments(&self) -> &[String] {
-        &self.included_instruments
+        &self.preferences.included_instruments
     }
 
     #[must_use]
     pub fn excluded_instruments(&self) -> &[String] {
-        &self.excluded_instruments
+        &self.preferences.excluded_instruments
     }
 
     #[must_use]
@@ -247,45 +278,12 @@ impl Project {
         Ok(true)
     }
 
-    pub fn configure(
-        &mut self,
-        mode: &str,
-        target_duration_secs: Option<f64>,
-        included_instruments: Vec<String>,
-        excluded_instruments: Vec<String>,
-    ) -> Result<()> {
-        let normalized = crate::instructions::ProjectPreferences {
-            mode: mode.to_string(),
-            target_duration_secs,
-            included_instruments,
-            excluded_instruments,
-        }
-        .normalized();
-        validate_project_settings(
-            &normalized.mode,
-            normalized.target_duration_secs,
-            &normalized.included_instruments,
-            &normalized.excluded_instruments,
-        )?;
-        let previous_target = self.target_duration_secs;
-        self.target_duration_secs = normalized.target_duration_secs;
-        let previous = (
-            std::mem::replace(&mut self.mode, normalized.mode),
-            previous_target,
-            std::mem::replace(
-                &mut self.included_instruments,
-                normalized.included_instruments,
-            ),
-            std::mem::replace(
-                &mut self.excluded_instruments,
-                normalized.excluded_instruments,
-            ),
-        );
+    pub fn configure(&mut self, preferences: &ProjectPreferences) -> Result<()> {
+        let normalized = preferences.normalized();
+        normalized.validate()?;
+        let previous = std::mem::replace(&mut self.preferences, normalized);
         if let Err(error) = self.write_metadata() {
-            self.mode = previous.0;
-            self.target_duration_secs = previous.1;
-            self.included_instruments = previous.2;
-            self.excluded_instruments = previous.3;
+            self.preferences = previous;
             return Err(error);
         }
         Ok(())
@@ -295,7 +293,7 @@ impl Project {
         if self.current_version == 0 {
             bail!("项目还没有有效版本");
         }
-        fs::read_to_string(self.root.join(CURRENT_FILE)).context("无法读取 current.alda")
+        self.version_code(self.current_version)
     }
 
     pub fn current_version_path(&self) -> Result<PathBuf> {
@@ -341,13 +339,25 @@ impl Project {
         if checks.iter().any(|check| check.status == CheckStatus::Fail) {
             bail!("检查未全部通过，不能保存工作乐谱");
         }
-        write_atomic(&self.root.join(WORK_FILE), alda_code.as_bytes())?;
+        let work_path = self.root.join(WORK_FILE);
+        let previous_code = fs::read(&work_path).ok();
+        let previous_working = self.working_score.clone();
+        write_atomic(&work_path, alda_code.as_bytes())?;
         self.working_score = Some(WorkingScore {
             kind,
             summary: summary.to_string(),
             checks: checks.iter().map(CheckRecord::from).collect(),
         });
-        self.write_metadata()
+        if let Err(error) = self.write_metadata() {
+            self.working_score = previous_working;
+            if let Some(previous_code) = previous_code {
+                let _ = write_atomic(&work_path, &previous_code);
+            } else {
+                let _ = fs::remove_file(&work_path);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn update_working_checks(&mut self, checks: &[AldaCheck]) -> Result<()> {
@@ -367,13 +377,15 @@ impl Project {
         if working.kind != WorkingScoreKind::Candidate {
             bail!("当前工作乐谱是草稿，不能接受为有效版本");
         }
-        if working.checks.iter().any(|check| check.status == "失败") {
+        if working
+            .checks
+            .iter()
+            .any(|check| check.status == CheckStatus::Fail)
+        {
             bail!("完整候选检查未全部通过，不能接受为有效版本");
         }
         let code = self.working_code()?;
-        let version = self.save_version_records(&code, &working.summary, &working.checks)?;
-        self.clear_working_score()?;
-        Ok(version)
+        self.save_version_records(&code, &working.summary, &working.checks, true)
     }
 
     pub fn discard_working_score(&mut self) -> Result<()> {
@@ -397,7 +409,7 @@ impl Project {
             bail!("检查未全部通过，不能创建有效版本");
         }
         let records = checks.iter().map(CheckRecord::from).collect::<Vec<_>>();
-        self.save_version_records(alda_code, summary, &records)
+        self.save_version_records(alda_code, summary, &records, false)
     }
 
     fn save_version_records(
@@ -405,6 +417,7 @@ impl Project {
         alda_code: &str,
         summary: &str,
         checks: &[CheckRecord],
+        clear_working: bool,
     ) -> Result<u32> {
         if self.current_version > 0 && self.version_code(self.current_version)? == alda_code {
             bail!("新乐谱与当前版本相同，未创建新版本");
@@ -420,7 +433,12 @@ impl Project {
         file.write_all(alda_code.as_bytes())
             .context("无法写入版本文件")?;
 
-        write_atomic(&self.root.join(CURRENT_FILE), alda_code.as_bytes())?;
+        if let Err(error) = write_atomic(&self.root.join(CURRENT_FILE), alda_code.as_bytes()) {
+            let _ = fs::remove_file(&version_path);
+            return Err(error);
+        }
+        let previous_version = self.current_version;
+        let previous_working = self.working_score.clone();
         self.current_version = next;
         self.versions.insert(
             next,
@@ -430,13 +448,33 @@ impl Project {
                 checks: checks.to_vec(),
             },
         );
-        self.write_metadata()?;
+        if clear_working {
+            self.working_score = None;
+        }
+        if let Err(error) = self.write_metadata() {
+            self.current_version = previous_version;
+            self.versions.remove(&next);
+            self.working_score = previous_working;
+            let _ = fs::remove_file(&version_path);
+            let _ = self.repair_current_projection();
+            return Err(error);
+        }
+        if clear_working {
+            let _ = self.remove_work_projection();
+        }
         Ok(next)
     }
 
     fn clear_working_score(&mut self) -> Result<()> {
-        self.working_score = None;
-        self.write_metadata()?;
+        let previous = self.working_score.take();
+        if let Err(error) = self.write_metadata() {
+            self.working_score = previous;
+            return Err(error);
+        }
+        self.remove_work_projection()
+    }
+
+    fn remove_work_projection(&self) -> Result<()> {
         let path = self.root.join(WORK_FILE);
         if path.exists() {
             fs::remove_file(&path).with_context(|| format!("无法删除 {}", path.display()))?;
@@ -448,8 +486,14 @@ impl Project {
         self.validate_settings()?;
         let code = self.version_code(version)?;
         write_atomic(&self.root.join(CURRENT_FILE), code.as_bytes())?;
+        let previous = self.current_version;
         self.current_version = version;
-        self.write_metadata()
+        if let Err(error) = self.write_metadata() {
+            self.current_version = previous;
+            let _ = self.repair_current_projection();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn export_alda_version(&self, version: u32) -> Result<PathBuf> {
@@ -520,29 +564,66 @@ impl Project {
                 bail!("project.json 损坏：版本文件 {version:04}.alda 不存在");
             }
         }
-        if !self.root.join(CURRENT_FILE).is_file() {
-            bail!("项目损坏：current.alda 不存在");
+        Ok(())
+    }
+
+    fn recover_projections(&self) -> Result<()> {
+        self.remove_orphan_versions()?;
+        self.repair_current_projection()?;
+        if self.working_score.is_none() {
+            self.remove_work_projection()?;
+        }
+        Ok(())
+    }
+
+    fn repair_current_projection(&self) -> Result<()> {
+        let current_path = self.root.join(CURRENT_FILE);
+        if self.current_version == 0 {
+            if current_path.exists() {
+                fs::remove_file(&current_path)
+                    .with_context(|| format!("无法清理 {}", current_path.display()))?;
+            }
+            return Ok(());
+        }
+        let canonical = fs::read(self.version_path(self.current_version))
+            .with_context(|| format!("无法读取版本 {}", self.current_version))?;
+        if fs::read(&current_path).ok().as_deref() != Some(canonical.as_slice()) {
+            write_atomic(&current_path, &canonical)?;
+        }
+        Ok(())
+    }
+
+    fn remove_orphan_versions(&self) -> Result<()> {
+        for entry in fs::read_dir(self.root.join("versions")).context("无法读取 versions 目录")?
+        {
+            let entry = entry.context("无法读取 versions 目录项")?;
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(version) = file_name
+                .strip_suffix(".alda")
+                .and_then(|number| number.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if file_name != format!("{version:04}.alda") {
+                continue;
+            }
+            if !self.versions.contains_key(&version) {
+                fs::remove_file(&path)
+                    .with_context(|| format!("无法清理未提交版本文件 {}", path.display()))?;
+            }
         }
         Ok(())
     }
 
     fn validate_settings(&self) -> Result<()> {
-        let preferences = crate::instructions::ProjectPreferences {
-            mode: self.mode.clone(),
-            target_duration_secs: self.target_duration_secs,
-            included_instruments: self.included_instruments.clone(),
-            excluded_instruments: self.excluded_instruments.clone(),
-        };
-        if preferences.normalized() != preferences {
+        if self.preferences.normalized() != self.preferences {
             bail!("project.json 损坏：项目偏好必须规范化、排序并去重");
         }
         validate_instruction_profile(&self.instruction_profile)?;
-        validate_project_settings(
-            &self.mode,
-            self.target_duration_secs,
-            &self.included_instruments,
-            &self.excluded_instruments,
-        )
+        self.preferences.validate()
     }
 
     fn write_metadata(&self) -> Result<()> {
@@ -566,35 +647,6 @@ fn validate_instruction_profile(profile: &InstructionProfile) -> Result<()> {
         .all(|pair| pair[0] < pair[1])
     {
         bail!("project.json 损坏：enabled_advisory_skills 必须去重并按限定 ID 排序");
-    }
-    Ok(())
-}
-
-fn validate_project_settings(
-    mode: &str,
-    target_duration_secs: Option<f64>,
-    included_instruments: &[String],
-    excluded_instruments: &[String],
-) -> Result<()> {
-    if !matches!(mode, "full" | "improv") {
-        bail!("project.json 损坏：mode 必须是 full 或 improv");
-    }
-    if target_duration_secs.is_some_and(|duration| !duration.is_finite() || duration <= 0.0) {
-        bail!("project.json 损坏：目标时长必须大于 0");
-    }
-    if included_instruments
-        .iter()
-        .chain(excluded_instruments)
-        .any(|instrument| instrument.trim().is_empty())
-    {
-        bail!("project.json 损坏：乐器约束不能为空");
-    }
-    if let Some(conflict) = included_instruments.iter().find(|included| {
-        excluded_instruments
-            .iter()
-            .any(|excluded| included.eq_ignore_ascii_case(excluded))
-    }) {
-        bail!("project.json 损坏：乐器 {conflict} 同时被包含和排除");
     }
     Ok(())
 }
@@ -739,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn edited_working_file_can_be_adopted_as_a_new_version() {
+    fn current_projection_is_not_the_canonical_version() {
         let directory = tempfile::tempdir().unwrap();
         let mut project =
             Project::load_or_create(directory.path().to_path_buf(), "test", "material").unwrap();
@@ -748,6 +800,7 @@ mod tests {
             .unwrap();
         fs::write(directory.path().join(CURRENT_FILE), "piano: d").unwrap();
 
+        assert_eq!(project.current_code().unwrap(), "piano: c");
         assert_eq!(
             project
                 .save_version("piano: d", "manual edit", &passing_checks())
@@ -755,6 +808,105 @@ mod tests {
             2
         );
         assert_eq!(project.version_code(2).unwrap(), "piano: d");
+    }
+
+    #[test]
+    fn reload_repairs_missing_and_stale_current_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        project
+            .save_version("piano: c", "first", &passing_checks())
+            .unwrap();
+
+        fs::remove_file(root.join(CURRENT_FILE)).unwrap();
+        let project = Project::load_or_create(root.clone(), "ignored", "").unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(CURRENT_FILE)).unwrap(),
+            "piano: c"
+        );
+        drop(project);
+
+        fs::write(root.join(CURRENT_FILE), "piano: stale").unwrap();
+        let project = Project::load_or_create(root.clone(), "ignored", "").unwrap();
+        assert_eq!(project.current_code().unwrap(), "piano: c");
+        assert_eq!(
+            fs::read_to_string(root.join(CURRENT_FILE)).unwrap(),
+            "piano: c"
+        );
+    }
+
+    #[test]
+    fn reload_discards_an_uncommitted_version_and_repairs_current() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        project
+            .save_version("piano: c", "first", &passing_checks())
+            .unwrap();
+        drop(project);
+
+        fs::write(root.join("versions/0002.alda"), "piano: d").unwrap();
+        fs::write(root.join("versions/10000.alda"), "uncommitted").unwrap();
+        for name in ["1.alda", "01.alda", "00001.alda"] {
+            fs::write(root.join("versions").join(name), "unrelated").unwrap();
+        }
+        fs::write(root.join(CURRENT_FILE), "piano: d").unwrap();
+
+        let project = Project::load_or_create(root.clone(), "ignored", "").unwrap();
+        assert_eq!(project.current_version(), 1);
+        assert_eq!(project.current_code().unwrap(), "piano: c");
+        assert!(!root.join("versions/0002.alda").exists());
+        assert!(!root.join("versions/10000.alda").exists());
+        for name in ["1.alda", "01.alda", "00001.alda"] {
+            assert!(root.join("versions").join(name).exists());
+        }
+        assert_eq!(
+            fs::read_to_string(root.join(CURRENT_FILE)).unwrap(),
+            "piano: c"
+        );
+    }
+
+    #[test]
+    fn reload_cleans_work_projection_after_committed_accept() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        project
+            .save_working_score(
+                "piano: c",
+                WorkingScoreKind::Candidate,
+                "candidate",
+                &passing_checks(),
+            )
+            .unwrap();
+        project.accept_working_score().unwrap();
+        fs::write(root.join(WORK_FILE), "piano: stale").unwrap();
+        drop(project);
+
+        let project = Project::load_or_create(root.clone(), "ignored", "").unwrap();
+        assert_eq!(project.current_version(), 1);
+        assert_eq!(project.current_code().unwrap(), "piano: c");
+        assert!(project.working_score().is_none());
+        assert!(!root.join(WORK_FILE).exists());
+    }
+
+    #[test]
+    fn typed_check_status_round_trips_with_the_existing_json_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        project
+            .save_version("piano: c", "first", &passing_checks())
+            .unwrap();
+
+        let metadata = fs::read_to_string(root.join(PROJECT_FILE)).unwrap();
+        assert!(metadata.contains(r#""status": "通过""#));
+        let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
+        assert_eq!(
+            reloaded.versions().get(&1).unwrap().checks[0].status,
+            CheckStatus::Pass
+        );
     }
 
     #[test]
@@ -857,13 +1009,16 @@ mod tests {
         let mut project =
             Project::load_or_create(directory.path().to_path_buf(), "test", "material").unwrap();
         let error = project
-            .configure("invalid", None, Vec::new(), Vec::new())
+            .configure(&ProjectPreferences {
+                target_duration_secs: Some(0.0),
+                ..ProjectPreferences::default()
+            })
             .unwrap_err();
-        assert!(error.to_string().contains("mode"));
+        assert!(error.to_string().contains("目标时长"));
 
         let loaded =
             Project::load_or_create(directory.path().to_path_buf(), "test", "ignored").unwrap();
-        assert_eq!(loaded.mode(), "full");
+        assert_eq!(loaded.mode(), CreationMode::Full);
     }
 
     #[test]
@@ -872,23 +1027,21 @@ mod tests {
         let root = directory.path().to_path_buf();
         let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
         project
-            .configure(
-                "full",
-                None,
-                vec![" MIDI-Piano ".to_string(), "midi-piano".to_string()],
-                vec![" MIDI-TUBA ".to_string()],
-            )
+            .configure(&ProjectPreferences {
+                included_instruments: vec![" MIDI-Piano ".to_string(), "midi-piano".to_string()],
+                excluded_instruments: vec![" MIDI-TUBA ".to_string()],
+                ..ProjectPreferences::default()
+            })
             .unwrap();
         assert_eq!(project.included_instruments(), ["midi-piano"]);
         assert_eq!(project.excluded_instruments(), ["midi-tuba"]);
 
         let error = project
-            .configure(
-                "full",
-                None,
-                vec![" midi-cello ".to_string()],
-                vec!["MIDI-CELLO".to_string()],
-            )
+            .configure(&ProjectPreferences {
+                included_instruments: vec![" midi-cello ".to_string()],
+                excluded_instruments: vec!["MIDI-CELLO".to_string()],
+                ..ProjectPreferences::default()
+            })
             .unwrap_err();
         assert!(error.to_string().contains("同时"));
         let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
