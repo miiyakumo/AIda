@@ -1,4 +1,0 @@
-interface:
-  display_name: "Claude Prototype Validator"
-  short_description: "Prototype designs with Claude and verify their purpose"
-  default_prompt: "Use $claude-prototype-validator to prototype and validate this design before implementation."
