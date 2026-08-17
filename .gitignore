@@ -110,3 +110,5 @@ target/
 /exports/
 
 .env
+model.json
+bak
