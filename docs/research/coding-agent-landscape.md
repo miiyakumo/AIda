@@ -10,10 +10,11 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
 
 - **Memory**：项目状态、持久对话、Skill 已经构成足够的结构化记忆；不需要引入 Cline Memory Bank
   或自动记忆这类"跨会话经验"子系统。当前失败模式不是记忆问题。
-- **Goal**：完整候选要求（对话状态持久化）与即将落地的 `form_plan` 持久化就是本领域的 Goal；
+- **Goal**：完整候选要求（对话状态持久化）与已落地的 `form_plan` 持久化就是本领域的 Goal；
   不需要抽象成 DeepSeek Harness 那种事件溯源 goal 服务。
-- **Subagent/多 Agent**：当前明确不引入。项目已有三处一致结论（见关联文档），且长篇诊断的根因
-  是反馈不对称与缺统一时间表示，multi-agent 解决上下文隔离与并行，不解决反馈问题。
+- **Subagent/多 Agent**：第一阶段“不引入”的判断在 Marker/form_plan 落地前成立。第二次同题运行证明反馈表示
+  之外还存在明确的作曲设计、拍数核算、DSL 排错和协议恢复职责耦合；当前建议启动长篇作曲专用 A/B 原型，
+  仍不建设通用 subagent 平台。
 - 其余特性按真实需求条件触发，见下表。
 
 最贴合当前架构、又有市场共识的下一步是**并行只读工具调用**（todo 已有方案）与
@@ -52,7 +53,7 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
 |---|---|---|
 | Memory（跨会话经验） | Cline Memory Bank、Claude Code 自动记忆 | 项目状态 + 持久对话 + Skill；缺自动经验记忆，不需要 |
 | Goal（可跨轮/重启的目标） | dsh goal、Devin plan | 候选要求持久化 + form_plan；缺通用抽象，不需要 |
-| Subagent/多 Agent | Claude Code Task、Amp、Cursor、Goose、dsh workflow | 无；当前不引入，见证据门槛 |
+| Subagent/多 Agent | Claude Code Task、Amp、Cursor、Goose、dsh workflow | 无；长篇作曲专用最小 A/B 原型待实现，不引入通用平台 |
 | Plan mode（执行前批准门） | Claude Code、Amp、Cursor | `submit_result(plan)` 已有计划产物；当前一轮完成，无需打断 |
 | Sandbox/审批 | Codex、Goose、OpenHands、dsh | 宿主固定持有校验与文件写入，无需下游沙箱 |
 | Context 管理（compaction） | Claude Code /compact、dsh、OpenHands | 无；对话已按需裁剪，先做可观测性再压缩 |
@@ -83,24 +84,22 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
 ### Goal：已有领域化版本，不抽象成通用 goal 服务
 
 - "完整候选要求"作为对话状态持久化，跨澄清、模型失败与重启保留——这就是一个领域 goal；
-- 即将落地的 `form_plan` 持久化（随工作稿、恢复候选、版本保存）本质是"本作品结构性目标"；
+- 已落地的 `form_plan` 持久化（随工作稿、恢复候选、版本保存）本质是"本作品结构性目标"；
 - dsh 的 goal 解决多工具、多轮、可随时改向的通用场景；当前领域只有一条主导创作流程，
   ConversationState 已覆盖 goal 的转向/中断/恢复语义。
 - 事件溯源 goal 域在 Rust 单 crate 里是纯负担；把 form_plan 与候选要求做实即等价于领域目标。
 
-### Subagent：三个中最不该现在做的，项目已达成共识
+### Subagent：证据门槛已达到原型阶段，尚未达到生产采纳阶段
 
-三处现有结论：
+第一阶段的因果判断仍成立一半：multi-agent 不能替代 Marker、form_plan、静态校验或人工试听，也不能单独
+解决反馈不对称。Marker/form_plan 落地后的第二次运行则补充了新的证据：同一 Agent 同时设计动机、和声、
+曲式和织体，又手算拍数、修 Alda 语法、维护 Marker 和提交字段，最终用了 20 次模型调用、19 次工具往返、
+3 次协议恢复，并留下跨段溢出和游标回跳。
 
-- [长篇作曲质量与可控修改](../todo/long-form-composition-quality.md)：明确不因长篇任务引入
-  Director、Composer、Critic 等多 Agent；
-- [Workflow 产物与 Agent 角色派生](../todo/workflow-artifacts-and-agent-roles.md)：Role/fork 需要
-  "对照实验表明拆分角色能改善质量、成本或上下文隔离"的证据门槛；
-- [deepseek-harness.md](deepseek-harness.md)：不为了"可能有用"增加 Subagent 或 Workflow。
-
-因果判断：长篇诊断的根因是反馈不对称与缺统一时间表示，不是"单个 Agent 上下文不够"。
-multi-agent 解决上下文隔离与并行，不解决反馈问题，还会引入编排成本。等 form_plan + Marker +
-局部保持闭环稳定、出现"重复发生且单 Agent 完不成"的真实任务后，再按上文的证据门槛重评。
+这足以验证职责隔离是否有效，但不足以采纳通用平台。当前只做固定的长篇作曲 A/B：主 Agent 持有精确音乐
+规格，两个 Worker 按段落家族实现 Alda 片段，Harness 确定性组装，独立 Reviewer 只读复核。若调用成本、
+游标正确性和完整试听没有可测改善，撤回原型。具体边界见
+[Workflow 产物与 Agent 角色派生](../todo/workflow-artifacts-and-agent-roles.md)。
 
 ## 其余特性判定
 
@@ -115,11 +114,10 @@ multi-agent 解决上下文隔离与并行，不解决反馈问题，还会引�
 
 ## 建议优先级
 
-1. 并行只读工具调用（todo 已有方案，直接落地）。
-2. Invocation 可观测性（先记录请求大小与来源，为压缩与审计准备）。
-3. 按 [long-form-composition-quality.md](../todo/long-form-composition-quality.md) 把 form_plan 落地
-   （即本领域的 Goal 与记忆主体）。
-4. 暂不引入 memory 子系统、通用 goal、subagent 或 workflow。
+1. 补齐声部游标回跳、跨段溢出和意外重叠的确定性检查。
+2. 用现有单 Agent 作为基线，执行长篇作曲专用 subagent A/B 原型。
+3. 并行只读工具调用与 Invocation 可观测性按现有 todo 推进。
+4. 暂不引入 memory 子系统、通用 goal、通用 subagent/workflow 平台。
 
 ## 关联文档
 

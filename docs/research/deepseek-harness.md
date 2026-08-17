@@ -10,7 +10,7 @@ DeepSeek Harness 不是一个围绕固定 agent loop 增加少量工具的应用
 2. **能力、策略和消费入口分离**：可替换能力通常拆成 Service Definition、Provider 和 Consumer，策略通过事件流水线介入。
 3. **动态信息不随意污染稳定前缀**：静态 system prompt、动态 user-role 上下文、Skill 目录与正文、历史压缩各有不同生命周期。
 
-这些约束适合多模型、多工具、多宿主和可扩展插件平台。`alda-agent` 当前是单领域、单 Agent、只有一个模型工具的小型 Rust 应用，不应整体移植 Cordis 微内核、事件溯源、子 Agent 或工作流系统。更适合按实际需求局部借鉴调用快照、动态上下文分层和单调权限约束。
+这些约束适合多模型、多工具、多宿主和可扩展插件平台。`alda-agent` 当前仍是单领域、单 Agent、只有一个模型工具的小型 Rust 应用，不应整体移植 Cordis 微内核、事件溯源、子 Agent 或工作流系统。长篇作曲第二次运行已经提供了启动任务专用 subagent 对照原型的证据，但尚无生产采纳证据；更适合局部借鉴一次委派的能力边界、调用快照、动态上下文分层和单调权限约束。
 
 ## 调研基准
 
@@ -307,7 +307,7 @@ Sandbox seam 只承诺文件系统效果限制，不承诺网络隔离或进程�
 | 工具 | 注册表、审批、guard、并发调度、Code Mode | 模型只见 `submit_result`，宿主校验并决定是否保存工作乐谱 |
 | Compaction | 带持久事务与 surface replacement | 无历史压缩 |
 | 权限/沙箱 | 通用 shell/fs 工具需要多层策略 | 不向模型开放通用 shell/fs，主要能力由宿主固定实现 |
-| Subagent/workflow | 多 provider 和脚本编排 | 无；当前领域流程由单 Agent 完成 |
+| Subagent/workflow | 多 provider 和脚本编排 | 无；当前流程仍由单 Agent 完成，长篇作曲专用 A/B 原型待实现 |
 
 ### 当前持久化边界
 
@@ -354,14 +354,14 @@ Sandbox seam 只承诺文件系统效果限制，不承诺网络隔离或进程�
 - Advisory Skill 常驻 token 成本成为实际问题时，引入 catalog + 按需正文加载。
 - 出现多个稳定的模型或执行后端时，再采用 Definition / Provider / Consumer 三角色 seam。
 - Conversation 需要跨版本精确回放、审计或复杂压缩时，再评估 append-only invocation/event log。
-- 多 Agent 音乐创作经过对照实验确认稳定提高结果质量时，再增加 subagent；当前没有这项证据。
+- 已有证据启动长篇作曲专用 subagent 对照原型；只有对照实验确认质量、成本或上下文隔离有稳定收益时，才生产采纳。
 
 ### 当前不建议采用
 
 - 不移植 Cordis 插件微内核或 HMR 配置树。`alda-agent` 的能力数量和部署形态不足以抵消其认知与生命周期成本。
 - 不照搬通用工具注册、Code Mode、沙箱和审批栈。当前宿主固定持有 Alda 校验和文件写入，能力边界更窄也更清楚。
 - 不引入 DeepSeek Harness 的完整 compaction 事务。当前应先证明对话长度确实成为问题。
-- 不为了“可能有用”增加 Subagent 或 Workflow；音乐创作流程已有领域化的单 Agent 校验闭环。
+- 不移植完整通用 Subagent/Workflow 运行时；专用原型只实现固定角色、受限产物和确定性 Harness 组装。
 
 ## 风险与局限
 

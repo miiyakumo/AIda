@@ -14,6 +14,11 @@ pub enum UserAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AldaAction {
     Play(ScoreTarget),
+    PlaySection {
+        target: ScoreTarget,
+        section_id: String,
+        context_secs: u32,
+    },
     Stop,
     Check(ScoreTarget),
     Export {
@@ -92,6 +97,9 @@ pub fn parse(input: &str) -> Result<UserAction> {
         return Ok(UserAction::Agent(input.to_string()));
     }
     let words = input.split_whitespace().collect::<Vec<_>>();
+    if words.first() == Some(&"/alda") {
+        return parse_alda(&words[1..]).map(UserAction::Alda);
+    }
     match words.as_slice() {
         ["/quit"] => Ok(UserAction::Quit),
         ["/help", rest @ ..] => Ok(UserAction::Help(
@@ -157,28 +165,38 @@ pub fn parse(input: &str) -> Result<UserAction> {
         ["/project", "config", "key", ..] => {
             bail!("不要在命令中输入模型密钥；请只输入 /project config key，再通过隐藏输入设置")
         }
-        ["/alda", "play"] => Ok(UserAction::Alda(AldaAction::Play(ScoreTarget::Version(
-            None,
-        )))),
-        ["/alda", "play", "work"] => Ok(UserAction::Alda(AldaAction::Play(ScoreTarget::Working))),
-        ["/alda", "play", version] => Ok(UserAction::Alda(AldaAction::Play(ScoreTarget::Version(
-            Some(parse_version(version)?),
-        )))),
-        ["/alda", "stop"] => Ok(UserAction::Alda(AldaAction::Stop)),
-        ["/alda", "check"] => Ok(UserAction::Alda(AldaAction::Check(ScoreTarget::Version(
-            None,
-        )))),
-        ["/alda", "check", "work"] => Ok(UserAction::Alda(AldaAction::Check(ScoreTarget::Working))),
-        ["/alda", "check", "--file", path] => Ok(UserAction::Alda(AldaAction::Check(
-            ScoreTarget::File(PathBuf::from(path)),
-        ))),
-        ["/alda", "check", version] => Ok(UserAction::Alda(AldaAction::Check(
-            ScoreTarget::Version(Some(parse_version(version)?)),
-        ))),
-        ["/alda", "export", rest @ ..] => parse_export(rest).map(UserAction::Alda),
         [old @ ("/play" | "/history" | "/restore" | "/reload" | "/continue" | "/strategy")] => {
             bail!("旧命令 {old} 已删除；输入 /help 查看新命令")
         }
+        _ => bail!("未知或参数不完整的命令；输入 /help 查看用法"),
+    }
+}
+
+fn parse_alda(words: &[&str]) -> Result<AldaAction> {
+    match words {
+        ["play"] => Ok(AldaAction::Play(ScoreTarget::Version(None))),
+        ["play", "work"] => Ok(AldaAction::Play(ScoreTarget::Working)),
+        ["play", version] => Ok(AldaAction::Play(ScoreTarget::Version(Some(parse_version(
+            version,
+        )?)))),
+        ["play", "work", "section", section_id] => Ok(AldaAction::PlaySection {
+            target: ScoreTarget::Working,
+            section_id: (*section_id).to_string(),
+            context_secs: 10,
+        }),
+        ["play", "current", "section", section_id] => Ok(AldaAction::PlaySection {
+            target: ScoreTarget::Version(None),
+            section_id: (*section_id).to_string(),
+            context_secs: 10,
+        }),
+        ["stop"] => Ok(AldaAction::Stop),
+        ["check"] => Ok(AldaAction::Check(ScoreTarget::Version(None))),
+        ["check", "work"] => Ok(AldaAction::Check(ScoreTarget::Working)),
+        ["check", "--file", path] => Ok(AldaAction::Check(ScoreTarget::File(PathBuf::from(path)))),
+        ["check", version] => Ok(AldaAction::Check(ScoreTarget::Version(Some(
+            parse_version(version)?,
+        )))),
+        ["export", rest @ ..] => parse_export(rest),
         _ => bail!("未知或参数不完整的命令；输入 /help 查看用法"),
     }
 }
@@ -279,6 +297,22 @@ mod tests {
         assert_eq!(
             parse("/alda play work").unwrap(),
             UserAction::Alda(AldaAction::Play(ScoreTarget::Working))
+        );
+        assert_eq!(
+            parse("/alda play work section climax").unwrap(),
+            UserAction::Alda(AldaAction::PlaySection {
+                target: ScoreTarget::Working,
+                section_id: "climax".to_string(),
+                context_secs: 10,
+            })
+        );
+        assert_eq!(
+            parse("/alda play current section coda").unwrap(),
+            UserAction::Alda(AldaAction::PlaySection {
+                target: ScoreTarget::Version(None),
+                section_id: "coda".to_string(),
+                context_secs: 10,
+            })
         );
         assert_eq!(
             parse("/alda export work --format wav").unwrap(),

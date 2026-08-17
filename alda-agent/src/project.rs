@@ -57,6 +57,85 @@ pub struct CheckRecord {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FormPlan {
+    pub target_duration_secs: f64,
+    pub sections: Vec<FormSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FormSection {
+    pub id: String,
+    pub target_start_secs: f64,
+    pub target_end_secs: f64,
+    pub function: String,
+    pub material_action: MaterialAction,
+    pub energy: SectionEnergy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialAction {
+    Introduce,
+    Develop,
+    Contrast,
+    Reprise,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionEnergy {
+    Low,
+    Medium,
+    High,
+    Peak,
+}
+
+impl FormPlan {
+    pub fn validate(&self) -> Result<()> {
+        if !self.target_duration_secs.is_finite() || self.target_duration_secs <= 0.0 {
+            bail!("form_plan.target_duration_secs 必须是正有限数");
+        }
+        if !(4..=10).contains(&self.sections.len()) {
+            bail!("form_plan.sections 必须包含 4–10 个段落");
+        }
+
+        let mut previous_end = 0.0;
+        let mut ids = std::collections::BTreeSet::new();
+        for (index, section) in self.sections.iter().enumerate() {
+            let valid_id = section.id.bytes().enumerate().all(|(offset, byte)| {
+                if offset == 0 {
+                    byte.is_ascii_lowercase()
+                } else {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                }
+            });
+            if !valid_id || !ids.insert(section.id.as_str()) {
+                bail!("form_plan 段落 id 必须唯一并匹配 [a-z][a-z0-9_]*");
+            }
+            if section.function.trim().is_empty() {
+                bail!("form_plan.sections[{index}].function 不能为空");
+            }
+            if !section.target_start_secs.is_finite()
+                || !section.target_end_secs.is_finite()
+                || section.target_start_secs < 0.0
+                || section.target_end_secs <= section.target_start_secs
+            {
+                bail!("form_plan.sections[{index}] 的时间区间无效");
+            }
+            if (section.target_start_secs - previous_end).abs() > 0.001 {
+                bail!("form_plan 段落必须从 0 开始且连续、不重叠");
+            }
+            previous_end = section.target_end_secs;
+        }
+        if (previous_end - self.target_duration_secs).abs() > 0.001 {
+            bail!("form_plan 最后一段结束时间必须等于 target_duration_secs");
+        }
+        Ok(())
+    }
+}
+
 impl From<&AldaCheck> for CheckRecord {
     fn from(check: &AldaCheck) -> Self {
         Self {
@@ -67,11 +146,13 @@ impl From<&AldaCheck> for CheckRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VersionMeta {
     pub created_at: String,
     pub summary: String,
     pub checks: Vec<CheckRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_plan: Option<FormPlan>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,19 +171,23 @@ impl std::fmt::Display for WorkingScoreKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkingScore {
     pub kind: WorkingScoreKind,
     pub summary: String,
     pub checks: Vec<CheckRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_plan: Option<FormPlan>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingRevision {
     pub kind: WorkingScoreKind,
     pub summary: String,
     pub checks: Vec<CheckRecord>,
     pub source_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_plan: Option<FormPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +270,13 @@ impl Project {
     #[must_use]
     pub fn pending_revision(&self) -> Option<&PendingRevision> {
         self.pending_revision.as_ref()
+    }
+
+    #[must_use]
+    pub fn current_form_plan(&self) -> Option<&FormPlan> {
+        self.versions
+            .get(&self.current_version)
+            .and_then(|version| version.form_plan.as_ref())
     }
 
     #[must_use]
@@ -381,6 +473,17 @@ impl Project {
         summary: &str,
         checks: &[AldaCheck],
     ) -> Result<()> {
+        self.save_pending_revision_with_plan(alda_code, kind, summary, checks, None)
+    }
+
+    pub fn save_pending_revision_with_plan(
+        &mut self,
+        alda_code: &str,
+        kind: WorkingScoreKind,
+        summary: &str,
+        checks: &[AldaCheck],
+        form_plan: Option<FormPlan>,
+    ) -> Result<()> {
         if alda_code.trim().is_empty() {
             bail!("不能保存空的待修正候选");
         }
@@ -393,6 +496,7 @@ impl Project {
             summary: summary.to_string(),
             checks: checks.iter().map(CheckRecord::from).collect(),
             source_hash: format!("{:x}", Sha256::digest(alda_code.as_bytes())),
+            form_plan,
         });
         if let Err(error) = self.write_metadata() {
             self.pending_revision = previous_revision;
@@ -425,7 +529,18 @@ impl Project {
         summary: &str,
         checks: &[AldaCheck],
     ) -> Result<()> {
-        self.save_working_score_inner(alda_code, kind, summary, checks, None)
+        self.save_working_score_with_plan(alda_code, kind, summary, checks, None)
+    }
+
+    pub fn save_working_score_with_plan(
+        &mut self,
+        alda_code: &str,
+        kind: WorkingScoreKind,
+        summary: &str,
+        checks: &[AldaCheck],
+        form_plan: Option<FormPlan>,
+    ) -> Result<()> {
+        self.save_working_score_inner(alda_code, kind, summary, checks, form_plan, None)
     }
 
     pub fn save_rendered_candidate(
@@ -435,6 +550,25 @@ impl Project {
         checks: &[AldaCheck],
         midi_source: &Path,
         wav_source: &Path,
+    ) -> Result<()> {
+        self.save_rendered_candidate_with_plan(
+            alda_code,
+            summary,
+            checks,
+            midi_source,
+            wav_source,
+            None,
+        )
+    }
+
+    pub fn save_rendered_candidate_with_plan(
+        &mut self,
+        alda_code: &str,
+        summary: &str,
+        checks: &[AldaCheck],
+        midi_source: &Path,
+        wav_source: &Path,
+        form_plan: Option<FormPlan>,
     ) -> Result<()> {
         if !midi_source.is_file() {
             bail!("候选 MIDI 不存在: {}", midi_source.display());
@@ -447,6 +581,7 @@ impl Project {
             WorkingScoreKind::Candidate,
             summary,
             checks,
+            form_plan,
             Some((midi_source, wav_source)),
         )
     }
@@ -457,6 +592,7 @@ impl Project {
         kind: WorkingScoreKind,
         summary: &str,
         checks: &[AldaCheck],
+        form_plan: Option<FormPlan>,
         artifacts: Option<(&Path, &Path)>,
     ) -> Result<()> {
         self.validate_settings()?;
@@ -507,6 +643,7 @@ impl Project {
             kind,
             summary: summary.to_string(),
             checks: checks.iter().map(CheckRecord::from).collect(),
+            form_plan,
         });
         self.pending_revision = None;
         if let Err(error) = self.write_metadata() {
@@ -554,7 +691,13 @@ impl Project {
             bail!("完整候选检查未全部通过，不能接受为有效版本");
         }
         let code = self.working_code()?;
-        self.save_version_records(&code, &working.summary, &working.checks, true)
+        self.save_version_records(
+            &code,
+            &working.summary,
+            &working.checks,
+            working.form_plan,
+            true,
+        )
     }
 
     pub fn discard_working_score(&mut self) -> Result<()> {
@@ -578,7 +721,7 @@ impl Project {
             bail!("检查未全部通过，不能创建有效版本");
         }
         let records = checks.iter().map(CheckRecord::from).collect::<Vec<_>>();
-        self.save_version_records(alda_code, summary, &records, false)
+        self.save_version_records(alda_code, summary, &records, None, false)
     }
 
     fn save_version_records(
@@ -586,6 +729,7 @@ impl Project {
         alda_code: &str,
         summary: &str,
         checks: &[CheckRecord],
+        form_plan: Option<FormPlan>,
         clear_working: bool,
     ) -> Result<u32> {
         if self.current_version > 0 && self.version_code(self.current_version)? == alda_code {
@@ -615,6 +759,7 @@ impl Project {
                 created_at: timestamp(),
                 summary: summary.to_string(),
                 checks: checks.to_vec(),
+                form_plan,
             },
         );
         if clear_working {
@@ -721,6 +866,26 @@ impl Project {
         ensure_safe_project_name(&self.project_name)?;
         self.validate_settings()?;
         self.conversation.validate()?;
+        for (version, metadata) in &self.versions {
+            if let Some(plan) = &metadata.form_plan {
+                plan.validate()
+                    .with_context(|| format!("版本 {version} 的 form_plan 无效"))?;
+            }
+        }
+        if let Some(plan) = self
+            .working_score
+            .as_ref()
+            .and_then(|working| working.form_plan.as_ref())
+        {
+            plan.validate().context("工作乐谱的 form_plan 无效")?;
+        }
+        if let Some(plan) = self
+            .pending_revision
+            .as_ref()
+            .and_then(|revision| revision.form_plan.as_ref())
+        {
+            plan.validate().context("待修正候选的 form_plan 无效")?;
+        }
         if self.working_score.is_some() && !self.root.join(WORK_FILE).is_file() {
             bail!("项目损坏：工作乐谱元数据存在但 work.alda 不存在");
         }

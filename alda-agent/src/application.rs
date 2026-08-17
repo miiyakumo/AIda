@@ -1,6 +1,7 @@
 use crate::agent::{
     Agent, AgentReporter, AgentResultKind, AgentToolContext, CreationRequest, CreationResult,
-    GenerationStats, ProjectPromptRequest, RecoveryCheckpoint, RunPolicy,
+    GenerationStats, ProjectPromptRequest, RecoveryCheckpoint, RunPolicy, form_plan_check,
+    requires_form_plan,
 };
 use crate::alda::{AldaCheck, AldaRunner, CancellationToken, CheckStatus, find_alda};
 use crate::audio::AudioRenderer;
@@ -412,6 +413,17 @@ impl Application {
                         .pending_revision()
                         .map(|_| self.project.revision_code())
                         .transpose()?,
+                    form_plan: self
+                        .project
+                        .pending_revision()
+                        .and_then(|revision| revision.form_plan.as_ref())
+                        .or_else(|| {
+                            self.project
+                                .working_score()
+                                .and_then(|working| working.form_plan.as_ref())
+                        })
+                        .or_else(|| self.project.current_form_plan())
+                        .cloned(),
                     compiled_instructions,
                     run_policy: RunPolicy::default(),
                     tool_context: Some(AgentToolContext {
@@ -424,6 +436,22 @@ impl Application {
                             .working_score()
                             .map(|_| self.project.working_path())
                             .transpose()?,
+                        revision_path: self
+                            .project
+                            .pending_revision()
+                            .map(|_| self.project.revision_path())
+                            .transpose()?,
+                        form_plan: self
+                            .project
+                            .pending_revision()
+                            .and_then(|revision| revision.form_plan.as_ref())
+                            .or_else(|| {
+                                self.project
+                                    .working_score()
+                                    .and_then(|working| working.form_plan.as_ref())
+                            })
+                            .or_else(|| self.project.current_form_plan())
+                            .cloned(),
                     }),
                     require_candidate,
                     forbid_clarification: answered_clarification,
@@ -456,23 +484,25 @@ impl Application {
                 .as_deref()
                 .context("成功结果缺少 Alda 代码")?;
             match kind {
-                WorkingScoreKind::Draft => self.project.save_working_score(
+                WorkingScoreKind::Draft => self.project.save_working_score_with_plan(
                     alda_code,
                     kind,
                     &result.interpretation,
                     &result.checks,
+                    result.form_plan.clone(),
                 )?,
                 WorkingScoreKind::Candidate => {
                     let artifacts = result
                         .candidate_artifacts
                         .as_ref()
                         .context("成功候选缺少已验证的 MIDI/WAV")?;
-                    self.project.save_rendered_candidate(
+                    self.project.save_rendered_candidate_with_plan(
                         alda_code,
                         &result.interpretation,
                         &result.checks,
                         artifacts.midi_path(),
                         artifacts.wav_path(),
+                        result.form_plan.clone(),
                     )?;
                 }
             }
@@ -482,11 +512,12 @@ impl Application {
                 AgentResultKind::Candidate => WorkingScoreKind::Candidate,
                 _ => bail!("文本结果不能保存为待修正候选"),
             };
-            self.project.save_pending_revision(
+            self.project.save_pending_revision_with_plan(
                 alda_code,
                 kind,
                 &result.interpretation,
                 &result.checks,
+                result.form_plan.clone(),
             )?;
         }
         let working_score_changed = result.success
@@ -538,6 +569,47 @@ impl Application {
                 self.runner()?.play_async(path).await?;
                 self.playback = Some(label.clone());
                 Ok(ActionResult::Message(format!("✓ 已发起播放 {label}")))
+            }
+            AldaAction::PlaySection {
+                target,
+                section_id,
+                context_secs,
+            } => {
+                let (path, label) = match target {
+                    ScoreTarget::Working => (self.project.working_path()?, "工作乐谱".to_string()),
+                    ScoreTarget::Version(version) => {
+                        let version = version.unwrap_or(self.require_current()?);
+                        (
+                            self.project.version_path_for(version)?,
+                            format!("v{version}"),
+                        )
+                    }
+                    ScoreTarget::File(_) => bail!("play 不支持外部文件"),
+                };
+                let runner = self.runner()?;
+                let info = runner.parse(&path)?;
+                let marker_name = if section_id.starts_with("section_") {
+                    section_id.clone()
+                } else {
+                    format!("section_{section_id}")
+                };
+                let section = info
+                    .sections
+                    .iter()
+                    .find(|section| section.name == marker_name)
+                    .with_context(|| format!("乐谱中没有段落 {section_id:?}"))?;
+                let context_ms = f64::from(context_secs.clamp(5, 15)) * 1000.0;
+                let from_ms = (section.start_ms - context_ms).max(0.0);
+                let to_ms = (section.end_ms + context_ms).min(info.duration_ms);
+                runner
+                    .play_range_async(path, alda_time_marking(from_ms), alda_time_marking(to_ms))
+                    .await?;
+                let playback_label = format!("{label} 段落 {section_id}");
+                self.playback = Some(playback_label.clone());
+                Ok(ActionResult::Message(format!(
+                    "✓ 已发起播放 {playback_label}（含前后 {} 秒上下文）",
+                    context_secs.clamp(5, 15)
+                )))
             }
             AldaAction::Stop => {
                 self.runner()?.stop_async().await?;
@@ -605,18 +677,27 @@ impl Application {
                 Ok(ActionResult::Message(format!("✓ 已采用为 v{version}")))
             }
             ProjectAction::Accept => {
-                match self.project.working_score() {
-                    Some(working) if working.kind == WorkingScoreKind::Candidate => {}
+                let form_plan = match self.project.working_score() {
+                    Some(working) if working.kind == WorkingScoreKind::Candidate => {
+                        working.form_plan.clone()
+                    }
                     Some(_) => bail!("当前工作乐谱是草稿，不能接受为有效版本"),
                     None => bail!("项目没有可接受的完整候选"),
-                }
-                let checks = self
-                    .runner()?
-                    .validate_async(
-                        self.project.working_path()?,
-                        self.project.preferences().score_validation(true),
-                    )
+                };
+                let validation = self.project.preferences().score_validation(true);
+                let runner = self.runner()?;
+                let working_path = self.project.working_path()?;
+                let mut checks = runner
+                    .validate_async(working_path.clone(), validation.clone())
                     .await?;
+                let info = runner.parse(&working_path).ok();
+                if let Some(check) = form_plan_check(
+                    info.as_ref(),
+                    form_plan.as_ref(),
+                    requires_form_plan(&validation),
+                ) {
+                    checks.push(check);
+                }
                 self.project.update_working_checks(&checks)?;
                 if checks.iter().any(|check| check.status == CheckStatus::Fail) {
                     return Ok(ActionResult::Checks(checks));
@@ -864,6 +945,12 @@ impl Application {
             anyhow::anyhow!("未找到 alda；Alda 源码仍可用 /alda export --format alda 导出")
         })
     }
+}
+
+fn alda_time_marking(milliseconds: f64) -> String {
+    let total_seconds = milliseconds.max(0.0) / 1000.0;
+    let minutes = (total_seconds / 60.0).floor();
+    format!("{minutes:.0}:{:.3}", total_seconds - minutes * 60.0)
 }
 
 fn summarize(value: &str) -> String {
@@ -1219,7 +1306,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("alda");
-        let json = r#"{"events":[{"offset":0,"duration":180000,"audible-duration":180000,"midi-note":60,"part":"piano"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
+        let json = r#"{"markers":{"section_intro":0,"section_develop":45000,"section_contrast":90000,"section_close":135000},"events":[{"offset":0,"duration":180000,"audible-duration":180000,"midi-note":60,"part":"piano"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
         std::fs::write(
             &executable,
             format!(
@@ -1277,12 +1364,20 @@ mod tests {
     }
 
     fn score_response(kind: &str) -> String {
-        let arguments = serde_json::json!({
+        let mut arguments = serde_json::json!({
             "kind": kind,
             "message": "工作乐谱",
             "alda_code": "piano: c"
-        })
-        .to_string();
+        });
+        if kind == "candidate" {
+            arguments["form_plan"] = test_form_plan();
+            arguments["edit_scope"] = serde_json::json!({
+                "mode": "global",
+                "target_sections": [],
+                "intent": "测试完整候选"
+            });
+        }
+        let arguments = arguments.to_string();
         let chunk = serde_json::json!({
             "choices": [{
                 "delta": {
@@ -1300,6 +1395,18 @@ mod tests {
 
     fn candidate_response() -> String {
         score_response("candidate")
+    }
+
+    fn test_form_plan() -> serde_json::Value {
+        serde_json::json!({
+            "target_duration_secs": 180.0,
+            "sections": [
+                { "id": "intro", "target_start_secs": 0.0, "target_end_secs": 45.0, "function": "引子", "material_action": "introduce", "energy": "low" },
+                { "id": "develop", "target_start_secs": 45.0, "target_end_secs": 90.0, "function": "发展", "material_action": "develop", "energy": "medium" },
+                { "id": "contrast", "target_start_secs": 90.0, "target_end_secs": 135.0, "function": "对比", "material_action": "contrast", "energy": "high" },
+                { "id": "close", "target_start_secs": 135.0, "target_end_secs": 180.0, "function": "收束", "material_action": "close", "energy": "peak" }
+            ]
+        })
     }
 
     fn host_tool_response(name: &str, arguments: &serde_json::Value) -> String {
@@ -1714,7 +1821,8 @@ mod tests {
                     "inspect_alda_source",
                     &serde_json::json!({
                         "alda_code": checkpoint_source,
-                        "scope": "candidate"
+                        "scope": "candidate",
+                        "form_plan": test_form_plan()
                     }),
                 ))
             })

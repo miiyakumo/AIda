@@ -1,0 +1,63 @@
+(tempo! 126)
+
+phrase1 = [c8 d e g a g e d]
+phrase2 = [g8 a b > c < g a e]
+melA16  = phrase1 phrase2
+phraseB = [c8 d c e g a g b g8 a g e f g a g]
+phraseC = [c4 g4 a4 > c4 < g4 a4 g4 e4]
+phraseD = [c2. e2. g2. a2. g2.]
+phraseCoda = [c2 g2 a2 > c2 < g2 c2]
+arpA = [c8 e g > c < g e g]
+trem = [c8 c8 c8 c8 g8 g8 g8 g8]
+
+bassdrone = [c1]
+bassA = [c2 g2 a2 e2 f2 c2 g2 c2]
+bassRun = [f2 c2 g2 a2]
+bassC = [c2 g2 a2 > c2 < g2 a2 e2 f2]
+bassD = [c1 g1]
+bassCoda = [c1 g1 a1 f1 g1 c1]
+
+midi-electric-bass-finger: (volume 55) o2
+  %section_intro bassdrone*8
+  %section_a bassA*7
+  %section_b bassRun*14
+  %section_c bassC*6
+  %section_d bassD*12
+  %section_a2 bassA*8
+  %section_coda bassCoda*2
+
+midi-tubular-bells: (volume 60) o5
+  @section_intro [c2 g2] r4
+  @section_coda [c4 g4 a4 > c4 < g4 c2]
+
+midi-flute: (volume 80) o5
+  @section_a melA16*7
+  @section_b o5 phraseB*14
+  @section_c o5 phraseC*12
+  @section_d o5 phraseD*8
+  @section_a2 o5 melA16*8
+  @section_coda o5 phraseCoda*4
+
+midi-violin "violin-1": (volume 65) o4
+  @section_a arpA*28
+  @section_b o4 trem*14
+  @section_c o4 phraseC*12
+  @section_d o4 arpA*24
+  @section_a2 o4 arpA*32
+  @section_coda o4 phraseCoda*4
+
+midi-piano: (volume 50) o4
+  @section_a arpA*28
+  @section_b arpA*28
+  @section_c arpA*24
+  @section_d arpA*24
+  @section_a2 arpA*32
+  @section_coda arpA*12
+
+midi-trumpet: (volume 90) o4
+  @section_c phraseC*12
+  @section_a2 o4 [c4 e4 g4 a4 > c4 < a4 g4 e4]*16
+  @section_coda o4 phraseCoda*4
+
+midi-tremolo-strings: (volume 60) o4
+  @section_b trem*14

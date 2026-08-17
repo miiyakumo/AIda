@@ -25,6 +25,17 @@ fn tool_response(kind: &str, message: &str, code: Option<&str>) -> String {
     if let Some(code) = code {
         arguments["alda_code"] = serde_json::Value::String(code.to_string());
     }
+    if kind == "candidate" {
+        arguments["form_plan"] = serde_json::json!({
+            "target_duration_secs": 180.0,
+            "sections": [
+                { "id": "intro", "target_start_secs": 0.0, "target_end_secs": 45.0, "function": "引子", "material_action": "introduce", "energy": "low" },
+                { "id": "develop", "target_start_secs": 45.0, "target_end_secs": 90.0, "function": "发展", "material_action": "develop", "energy": "medium" },
+                { "id": "contrast", "target_start_secs": 90.0, "target_end_secs": 135.0, "function": "对比", "material_action": "contrast", "energy": "high" },
+                { "id": "close", "target_start_secs": 135.0, "target_end_secs": 180.0, "function": "收束", "material_action": "close", "energy": "peak" }
+            ]
+        });
+    }
     let arguments = arguments.to_string();
     let chunk = serde_json::json!({
         "choices": [{
@@ -85,7 +96,7 @@ fn response_server(responses: Vec<String>) -> String {
 fn fake_alda() -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let executable = directory.path().join("alda");
-    let json = r#"{"events":[{"offset":0,"duration":180000,"audible-duration":180000,"midi-note":60,"part":"piano"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
+    let json = r#"{"markers":{"section_intro":0,"section_develop":45000,"section_contrast":90000,"section_close":135000},"events":[{"offset":0,"duration":180000,"audible-duration":180000,"midi-note":60,"part":"piano"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
     let script = format!(
         "#!/bin/sh\ncase \"$1\" in parse) printf '%s\\n' '{json}' ;; export) while [ \"$#\" -gt 0 ]; do if [ \"$1\" = -o ]; then shift; : > \"$1\"; exit 0; fi; shift; done; exit 1 ;; play|stop) exit 0 ;; *) exit 1 ;; esac\n"
     );
@@ -222,6 +233,14 @@ async fn progressive_workflow_only_versions_an_accepted_candidate() {
         project.working_score().unwrap().kind,
         WorkingScoreKind::Candidate
     );
+    let working_plan = project
+        .working_score()
+        .unwrap()
+        .form_plan
+        .as_ref()
+        .expect("long candidate form plan must survive restart");
+    assert!((working_plan.target_duration_secs - 180.0).abs() < f64::EPSILON);
+    assert_eq!(working_plan.sections.len(), 4);
     let mut application = Application::from_project(project, Some(AldaRunner::new(alda_path)));
     let accepted = application
         .execute(UserAction::Project(ProjectAction::Accept), &mut reporter)
@@ -235,6 +254,11 @@ async fn progressive_workflow_only_versions_an_accepted_candidate() {
     let restarted = Project::load_or_create(root, "ignored", "ignored").unwrap();
     assert_eq!(restarted.current_version(), 1);
     assert_eq!(restarted.versions().len(), 1);
+    let version_plan = restarted
+        .current_form_plan()
+        .expect("accepted version form plan must survive restart");
+    assert!((version_plan.target_duration_secs - 180.0).abs() < f64::EPSILON);
+    assert_eq!(version_plan.sections[2].id, "contrast");
     assert!(!restarted.conversation().messages().is_empty());
     let metadata = fs::read_to_string(restarted.root().join("project.json")).unwrap();
     assert!(!metadata.contains("secret-test-value"));

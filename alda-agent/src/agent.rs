@@ -1,9 +1,11 @@
-use crate::alda::{AldaCheck, AldaRunner, CheckStatus, ScoreValidation};
+use crate::alda::{AldaCheck, AldaRunner, CheckStatus, ScoreInfo, ScoreValidation};
 use crate::audio::{ArtifactReport, AudioRenderer};
 use crate::conversation::{ConversationMessage, ConversationRole, ConversationToolCall};
 use crate::deepseek::{DeepSeekClient, FunctionDef, Message, StreamDelta, StreamEvent, Tool};
-use crate::instructions::CompiledInstructions;
+use crate::instructions::{CompiledInstructions, DurationConstraint};
+use crate::project::FormPlan;
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -18,6 +20,49 @@ use std::time::{Duration, Instant};
 // ============================================================
 // 工具定义
 // ============================================================
+
+fn form_plan_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "target_duration_secs": { "type": "number", "exclusiveMinimum": 0 },
+            "sections": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+                        "target_start_secs": { "type": "number", "minimum": 0 },
+                        "target_end_secs": { "type": "number", "exclusiveMinimum": 0 },
+                        "function": { "type": "string", "minLength": 1 },
+                        "material_action": { "type": "string", "enum": ["introduce", "develop", "contrast", "reprise", "close"] },
+                        "energy": { "type": "string", "enum": ["low", "medium", "high", "peak"] }
+                    },
+                    "required": ["id", "target_start_secs", "target_end_secs", "function", "material_action", "energy"]
+                }
+            }
+        },
+        "required": ["target_duration_secs", "sections"]
+    })
+}
+
+fn edit_scope_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "mode": { "type": "string", "enum": ["local", "global"] },
+            "target_sections": {
+                "type": "array",
+                "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+                "uniqueItems": true
+            },
+            "intent": { "type": "string", "minLength": 1 }
+        },
+        "required": ["mode", "target_sections", "intent"]
+    })
+}
 
 fn submit_result_tool() -> Tool {
     Tool {
@@ -41,6 +86,16 @@ fn submit_result_tool() -> Tool {
                         "description": "draft 或 candidate 的紧凑 Alda 乐谱代码",
                         "maxLength": crate::deepseek::MAX_TOOL_ARGUMENT_BYTES
                     },
+                    "candidate_ref": {
+                        "type": "object",
+                        "description": "kind=candidate 时可引用最近一次通过 inspect_alda_source(scope=candidate) 的检查点，避免重复完整源码",
+                        "properties": {
+                            "source_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                        },
+                        "required": ["source_hash"]
+                    },
+                    "form_plan": form_plan_schema(),
+                    "edit_scope": edit_scope_schema(),
                     "plan": {
                         "type": "object",
                         "description": "kind=plan 时必填；必须自包含，不能引用工具外的隐藏文本",
@@ -76,6 +131,35 @@ fn score_tool(name: &str, description: &str) -> Tool {
     }
 }
 
+fn play_score_tool() -> Tool {
+    Tool {
+        ty: "function".to_string(),
+        function: FunctionDef {
+            name: "play_score".to_string(),
+            description: "真实发起播放当前或工作乐谱。默认播放整曲；只有需要定位局部问题时才传 section_id，宿主会按 Marker 段落并附带前后上下文播放。只有工具成功后才能告诉用户已经播放。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "enum": ["work", "current"] },
+                    "section_id": {
+                        "type": "string",
+                        "pattern": "^(section_)?[a-z][a-z0-9_]*$",
+                        "description": "可选 form_plan 段落 id；可省略 section_ 前缀"
+                    },
+                    "context_secs": {
+                        "type": "integer",
+                        "minimum": 5,
+                        "maximum": 15,
+                        "default": 10,
+                        "description": "局部播放时在段落前后附加的上下文秒数"
+                    }
+                },
+                "required": ["target"]
+            }),
+        },
+    }
+}
+
 const MAX_INSPECT_ALDA_SOURCE_BYTES: usize = 32 * 1024;
 
 fn inspect_alda_source_tool() -> Tool {
@@ -83,7 +167,7 @@ fn inspect_alda_source_tool() -> Tool {
         ty: "function".to_string(),
         function: FunctionDef {
             name: "inspect_alda_source".to_string(),
-            description: "真实解析尚未提交的 Alda 临时源码，返回总时长、Marker 实际位置、各声部结束时间和事件数，并分开报告硬失败与诊断。fragment 只检查局部材料且不保留；candidate 使用项目完整约束并作为故障恢复检查点，但不会保存工作乐谱、渲染或计作正式提交。".to_string(),
+            description: "真实解析尚未提交的 Alda 临时源码，返回总时长、Marker 划分的段落边界/事件/声部覆盖、各声部结束时间，并分开报告硬失败与诊断。fragment 只检查局部材料且不保留；candidate 使用项目完整约束并作为故障恢复检查点，但不会保存工作乐谱、渲染或计作正式提交。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -96,9 +180,48 @@ fn inspect_alda_source_tool() -> Tool {
                         "type": "string",
                         "enum": ["fragment", "candidate"],
                         "description": "fragment 不检查项目目标时长或配器约束且不保留；candidate 检查完整项目约束并更新故障恢复检查点，但仍需自行调用 submit_result 正式提交"
-                    }
+                    },
+                    "form_plan": form_plan_schema()
+                    ,"edit_scope": edit_scope_schema()
                 },
                 "required": ["alda_code", "scope"]
+            }),
+        },
+    }
+}
+
+fn inspect_alda_patch_tool() -> Tool {
+    Tool {
+        ty: "function".to_string(),
+        function: FunctionDef {
+            name: "inspect_alda_patch".to_string(),
+            description: "对 work/current 基线执行 1–8 个唯一文本替换，在内存中生成候选并运行完整候选、form_plan 与 edit_scope 检查；不会修改项目文件。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "base": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["work", "current"] },
+                            "source_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                        },
+                        "required": ["kind", "source_hash"]
+                    },
+                    "replacements": {
+                        "type": "array", "minItems": 1, "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old": { "type": "string", "minLength": 1 },
+                                "new": { "type": "string" }
+                            },
+                            "required": ["old", "new"]
+                        }
+                    },
+                    "form_plan": form_plan_schema(),
+                    "edit_scope": edit_scope_schema()
+                },
+                "required": ["base", "replacements", "form_plan", "edit_scope"]
             }),
         },
     }
@@ -132,9 +255,10 @@ fn model_tools(host_tools: bool) -> Vec<Tool> {
     ];
     if host_tools {
         tools.extend([
-            score_tool("inspect_score", "真实解析并检查当前或工作乐谱，返回时长、声部、事件、乐器和约束检查。"),
+            inspect_alda_patch_tool(),
+            score_tool("inspect_score", "真实解析并检查当前或工作乐谱，返回源码哈希、时长、段落、声部、事件、乐器和约束检查；源码哈希可直接作为 inspect_alda_patch 的基线。"),
             score_tool("render_score", "真实导出 MIDI 并用 FluidSynth 渲染 WAV，返回音频时长、采样率、峰值、RMS 和静音判断。"),
-            score_tool("play_score", "真实发起播放当前或工作乐谱。只有工具成功后才能告诉用户已经播放。"),
+            play_score_tool(),
         ]);
     }
     tools
@@ -191,6 +315,8 @@ pub struct CreationResult {
     pub checks: Vec<AldaCheck>,
     /// 通过时的 Alda 源码
     pub alda_code: Option<String>,
+    /// 与候选一同验证并持久化的长曲结构计划。
+    pub form_plan: Option<FormPlan>,
     /// 模型的解读文本
     pub interpretation: String,
     /// 是否被截断
@@ -223,10 +349,28 @@ pub enum RecoveryCheckpoint {
     InspectedCandidate,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CandidateCheckpoint {
     alda_code: String,
     checks: Vec<AldaCheck>,
+    form_plan: Option<FormPlan>,
+    source_hash: String,
+    edit_scope: Option<EditScope>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+struct EditScope {
+    mode: EditMode,
+    #[serde(default)]
+    target_sections: Vec<String>,
+    intent: String,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EditMode {
+    Local,
+    Global,
 }
 
 #[derive(Debug)]
@@ -258,7 +402,7 @@ fn oversized_source_inspection(source: &str, scope: &str, candidate: bool) -> Mo
             MAX_INSPECT_ALDA_SOURCE_BYTES
         )
     };
-    let checks = vec![AldaCheck {
+    let checks = [AldaCheck {
         name: "源码大小",
         status: CheckStatus::Fail,
         detail: size_detail,
@@ -268,6 +412,7 @@ fn oversized_source_inspection(source: &str, scope: &str, candidate: bool) -> Mo
         "parse_ok": false,
         "duration_secs": null,
         "markers": [],
+        "sections": [],
         "parts": [],
         "hard_failures": [{
             "name": "源码大小",
@@ -278,10 +423,7 @@ fn oversized_source_inspection(source: &str, scope: &str, candidate: bool) -> Mo
     .to_string();
     ModelToolResult {
         content,
-        candidate_checkpoint: candidate.then(|| CandidateCheckpoint {
-            alda_code: source.to_string(),
-            checks,
-        }),
+        candidate_checkpoint: None,
     }
 }
 
@@ -322,6 +464,7 @@ pub struct ProjectPromptRequest {
     pub current_alda: Option<String>,
     pub working_alda: Option<String>,
     pub revision_alda: Option<String>,
+    pub form_plan: Option<FormPlan>,
     pub compiled_instructions: CompiledInstructions,
     pub run_policy: RunPolicy,
     pub tool_context: Option<AgentToolContext>,
@@ -334,6 +477,8 @@ pub struct AgentToolContext {
     pub project_root: PathBuf,
     pub current_path: Option<PathBuf>,
     pub working_path: Option<PathBuf>,
+    pub revision_path: Option<PathBuf>,
+    pub form_plan: Option<FormPlan>,
 }
 
 struct ValidationRequest {
@@ -570,13 +715,14 @@ impl Agent {
         let mut protocol_recoveries = 0_usize;
         let mut interpretation = String::new();
         let mut last_alda_code = None;
+        let mut last_form_plan = None;
         let mut last_checks = Vec::new();
         let mut last_was_truncated = false;
         let mut score_kind = None;
         let mut played_target = None;
         let mut rendered_wav = None;
         let mut candidate_artifacts = None;
-        let mut checkpointed_candidate = false;
+        let mut candidate_checkpoint: Option<CandidateCheckpoint> = None;
         let mut terminal_error = None;
         let mut continuing_after_tool = false;
 
@@ -785,10 +931,11 @@ impl Agent {
                     }
                     if let Some(checkpoint) = &outcome.candidate_checkpoint {
                         last_alda_code = Some(checkpoint.alda_code.clone());
+                        last_form_plan.clone_from(&checkpoint.form_plan);
                         last_checks.clone_from(&checkpoint.checks);
                         last_was_truncated = was_truncated;
                         interpretation = "完整候选检查点（尚未正式提交）".to_string();
-                        checkpointed_candidate = true;
+                        candidate_checkpoint = Some(checkpoint.clone());
                     }
                 }
                 messages.push(Message {
@@ -808,7 +955,9 @@ impl Agent {
                 continue;
             }
 
-            let submitted = match parse_submitted_result(&tool_args) {
+            let submitted = match parse_submitted_result(&tool_args).and_then(|submitted| {
+                resolve_candidate_reference(submitted, candidate_checkpoint.as_ref())
+            }) {
                 Ok(submitted) => submitted,
                 Err(error) => {
                     tool_turns += 1;
@@ -934,6 +1083,7 @@ impl Agent {
                     kind: submitted.kind,
                     checks: Vec::new(),
                     alda_code: None,
+                    form_plan: None,
                     interpretation: submitted.message,
                     was_truncated,
                     conversation: messages,
@@ -988,10 +1138,12 @@ impl Agent {
                 continue;
             }
             score_kind = Some(submitted.kind);
-            checkpointed_candidate = false;
+            candidate_checkpoint = None;
             let alda_code = submitted
                 .alda_code
                 .context("草稿或完整候选缺少 alda_code")?;
+            let form_plan = submitted.form_plan;
+            let edit_scope = submitted.edit_scope;
             let tmp_dir = tempfile::tempdir().context("创建临时目录失败")?;
             let tmp_score = tmp_dir.path().join("candidate.alda");
             fs::write(&tmp_score, &alda_code)?;
@@ -1005,6 +1157,25 @@ impl Agent {
                 .runner
                 .validate_async(tmp_score.clone(), score_validation)
                 .await?;
+            if submitted.kind == AgentResultKind::Candidate {
+                let info = self.runner.parse(&tmp_score).ok();
+                if let Some(check) = form_plan_check(
+                    info.as_ref(),
+                    form_plan.as_ref(),
+                    requires_form_plan(&validation.score),
+                ) {
+                    checks.push(check);
+                }
+                if let Some(check) = edit_scope_check(
+                    &self.runner,
+                    validation.tool_context.as_ref(),
+                    info.as_ref(),
+                    form_plan.as_ref(),
+                    edit_scope.as_ref(),
+                ) {
+                    checks.push(check);
+                }
+            }
             if was_truncated {
                 checks.push(AldaCheck {
                     name: "输出完整性",
@@ -1060,6 +1231,7 @@ impl Agent {
             reporter.report(AgentEvent::ValidationCompleted(checks.clone()));
             let all_pass = checks.iter().all(|check| check.status != CheckStatus::Fail);
             last_alda_code = Some(alda_code.clone());
+            last_form_plan.clone_from(&form_plan);
             last_checks.clone_from(&checks);
             last_was_truncated = was_truncated;
             interpretation.clone_from(&submitted.message);
@@ -1089,6 +1261,7 @@ impl Agent {
                     kind: submitted.kind,
                     checks,
                     alda_code: Some(alda_code),
+                    form_plan,
                     interpretation,
                     was_truncated,
                     conversation: messages,
@@ -1117,20 +1290,22 @@ impl Agent {
             },
             success: false,
             needs_input: false,
-            kind: if checkpointed_candidate {
+            kind: if candidate_checkpoint.is_some() {
                 AgentResultKind::Candidate
             } else {
                 score_kind.unwrap_or(AgentResultKind::Candidate)
             },
             checks: last_checks,
             alda_code: last_alda_code,
+            form_plan: last_form_plan,
             interpretation,
             was_truncated: last_was_truncated,
             conversation: messages,
             played_target,
             rendered_wav,
             candidate_artifacts: None,
-            recovery_checkpoint: checkpointed_candidate
+            recovery_checkpoint: candidate_checkpoint
+                .is_some()
                 .then_some(RecoveryCheckpoint::InspectedCandidate),
             terminal_error,
         })
@@ -1147,7 +1322,15 @@ impl Agent {
             return lookup_alda_docs(arguments).map(ModelToolResult::content);
         }
         if name == "inspect_alda_source" {
-            return self.inspect_alda_source(arguments, validation).await;
+            return self
+                .inspect_alda_source(arguments, validation, context)
+                .await;
+        }
+        if name == "inspect_alda_patch" {
+            let context = context.context("当前调用没有项目乐谱上下文")?;
+            return self
+                .inspect_alda_patch(arguments, validation, context)
+                .await;
         }
         let context = context.context("当前调用没有项目乐谱上下文")?;
         let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
@@ -1163,9 +1346,18 @@ impl Agent {
         match name {
             "inspect_score" => {
                 let info = self.runner.parse(&path)?;
+                let source =
+                    fs::read(&path).with_context(|| format!("无法读取乐谱 {}", path.display()))?;
+                let source_hash = format!("{:x}", Sha256::digest(&source));
                 let checks = self.runner.validate_async(path, validation.clone()).await?;
                 Ok(ModelToolResult::content(
-                    serde_json::json!({ "ok": true, "info": info, "checks": checks }).to_string(),
+                    serde_json::json!({
+                        "ok": true,
+                        "source_hash": source_hash,
+                        "info": info,
+                        "checks": checks
+                    })
+                    .to_string(),
                 ))
             }
             "render_score" => {
@@ -1187,20 +1379,63 @@ impl Agent {
                     serde_json::json!({ "ok": true, "artifact": report }).to_string(),
                 ))
             }
-            "play_score" => {
-                self.runner.play_async(path).await?;
-                Ok(ModelToolResult::content(
-                    serde_json::json!({ "ok": true, "played": target }).to_string(),
-                ))
-            }
+            "play_score" => self.execute_play_score(&parsed, target, path).await,
             _ => bail!("未知模型工具 {name:?}"),
         }
+    }
+
+    async fn execute_play_score(
+        &self,
+        arguments: &serde_json::Value,
+        target: &str,
+        path: PathBuf,
+    ) -> Result<ModelToolResult> {
+        let Some(section_id) = arguments["section_id"].as_str() else {
+            self.runner.play_async(path).await?;
+            return Ok(ModelToolResult::content(
+                serde_json::json!({ "ok": true, "played": target }).to_string(),
+            ));
+        };
+        let context_secs = arguments["context_secs"]
+            .as_u64()
+            .and_then(|seconds| u32::try_from(seconds).ok())
+            .unwrap_or(10)
+            .clamp(5, 15);
+        let marker_name = if section_id.starts_with("section_") {
+            section_id.to_string()
+        } else {
+            format!("section_{section_id}")
+        };
+        let info = self.runner.parse(&path)?;
+        let section = info
+            .sections
+            .iter()
+            .find(|section| section.name == marker_name)
+            .with_context(|| format!("乐谱中没有段落 {section_id:?}"))?;
+        let context_ms = f64::from(context_secs) * 1000.0;
+        let from_ms = (section.start_ms - context_ms).max(0.0);
+        let to_ms = (section.end_ms + context_ms).min(info.duration_ms);
+        self.runner
+            .play_range_async(path, alda_time_marking(from_ms), alda_time_marking(to_ms))
+            .await?;
+        Ok(ModelToolResult::content(
+            serde_json::json!({
+                "ok": true,
+                "played": target,
+                "section_id": section_id,
+                "from_secs": from_ms / 1000.0,
+                "to_secs": to_ms / 1000.0,
+                "context_secs": context_secs
+            })
+            .to_string(),
+        ))
     }
 
     async fn inspect_alda_source(
         &self,
         arguments: &str,
         validation: &ScoreValidation,
+        context: Option<&AgentToolContext>,
     ) -> Result<ModelToolResult> {
         let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
         let source = parsed["alda_code"].as_str().context("alda_code 缺失")?;
@@ -1210,6 +1445,14 @@ impl Agent {
             "candidate" => true,
             _ => bail!("scope 必须是 fragment 或 candidate"),
         };
+        let form_plan = parse_form_plan(&parsed["form_plan"])?;
+        let edit_scope = parse_edit_scope(&parsed["edit_scope"])?;
+        if !candidate && form_plan.is_some() {
+            bail!("form_plan 只适用于 scope=candidate");
+        }
+        if !candidate && edit_scope.is_some() {
+            bail!("edit_scope 只适用于 scope=candidate");
+        }
         if source.len() > MAX_INSPECT_ALDA_SOURCE_BYTES {
             return Ok(oversized_source_inspection(source, scope, candidate));
         }
@@ -1226,79 +1469,515 @@ impl Agent {
         } else {
             ScoreValidation::new(None, Vec::new(), Vec::new())
         };
-        let checks = self
+        let mut checks = self
             .runner
             .validate_async(path.clone(), score_validation)
             .await?;
         let parse_ok = checks
             .iter()
             .any(|check| check.name == "Alda 语法" && check.status == CheckStatus::Pass);
-        let hard_failures = checks
-            .iter()
-            .filter(|check| check.status == CheckStatus::Fail)
-            .map(|check| serde_json::json!({ "name": check.name, "detail": check.detail }))
-            .collect::<Vec<_>>();
-        let diagnostics = checks
-            .iter()
-            .filter(|check| check.status == CheckStatus::Unchecked)
-            .map(|check| serde_json::json!({ "name": check.name, "detail": check.detail }))
-            .collect::<Vec<_>>();
         let info = parse_ok.then(|| self.runner.parse(&path)).transpose()?;
-        let duration_secs = info.as_ref().map(|info| info.duration_ms / 1000.0);
-        let parts = info
-            .as_ref()
-            .map(|info| {
-                info.timeline
-                    .parts
-                    .iter()
-                    .map(|part| {
-                        serde_json::json!({
-                            "name": part.part,
-                            "end_secs": part.last_event_ms / 1000.0,
-                            "event_count": part.event_count
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let markers = info
-            .as_ref()
-            .map(|info| {
-                info.markers
-                    .iter()
-                    .map(|marker| {
-                        serde_json::json!({
-                            "name": marker.name,
-                            "offset_secs": marker.offset_ms / 1000.0
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let content = serde_json::json!({
-            "scope": scope,
-            "parse_ok": parse_ok,
-            "duration_secs": duration_secs,
-            "markers": markers,
-            "parts": parts,
-            "hard_failures": hard_failures,
-            "diagnostics": diagnostics
-        })
-        .to_string();
+        if candidate {
+            if let Some(check) = form_plan_check(
+                info.as_ref(),
+                form_plan.as_ref(),
+                requires_form_plan(validation),
+            ) {
+                checks.push(check);
+            }
+        }
+        if candidate {
+            if let Some(check) = edit_scope_check(
+                &self.runner,
+                context,
+                info.as_ref(),
+                form_plan.as_ref(),
+                edit_scope.as_ref(),
+            ) {
+                checks.push(check);
+            }
+        }
+        let source_hash = (candidate
+            && checks.iter().all(|check| check.status != CheckStatus::Fail))
+        .then(|| format!("{:x}", Sha256::digest(source.as_bytes())));
+        let inspection_json = alda_inspection_json(
+            scope,
+            parse_ok,
+            info.as_ref(),
+            source_hash.as_deref(),
+            &checks,
+        );
         Ok(ModelToolResult {
-            content,
-            candidate_checkpoint: candidate.then(|| CandidateCheckpoint {
+            content: inspection_json,
+            candidate_checkpoint: source_hash.map(|source_hash| CandidateCheckpoint {
                 alda_code: source.to_string(),
                 checks,
+                form_plan,
+                source_hash,
+                edit_scope,
             }),
         })
     }
+
+    async fn inspect_alda_patch(
+        &self,
+        arguments: &str,
+        validation: &ScoreValidation,
+        context: &AgentToolContext,
+    ) -> Result<ModelToolResult> {
+        let mut parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
+        let base_kind = parsed["base"]["kind"].as_str().context("base.kind 缺失")?;
+        let expected_hash = parsed["base"]["source_hash"]
+            .as_str()
+            .context("base.source_hash 缺失")?;
+        let base_path = match base_kind {
+            "work" => context.working_path.as_ref().context("项目没有工作乐谱")?,
+            "current" => context
+                .current_path
+                .as_ref()
+                .context("项目没有当前有效版本")?,
+            _ => bail!("base.kind 必须是 work 或 current"),
+        };
+        let active_baseline = context
+            .revision_path
+            .as_ref()
+            .or(context.working_path.as_ref())
+            .or(context.current_path.as_ref())
+            .context("项目没有可用的修改基线")?;
+        if base_path != active_baseline {
+            bail!("补丁必须基于最新工作基线；存在更新的恢复候选时请提交完整候选");
+        }
+        let source = fs::read_to_string(base_path)
+            .with_context(|| format!("无法读取补丁基线 {}", base_path.display()))?;
+        let actual_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+        if actual_hash != expected_hash {
+            bail!("补丁基线 source_hash 已失效；请重新读取当前乐谱");
+        }
+        let replacements = parsed["replacements"]
+            .as_array()
+            .context("replacements 缺失")?;
+        if !(1..=8).contains(&replacements.len()) {
+            bail!("replacements 必须包含 1–8 项");
+        }
+        let mut edits = Vec::with_capacity(replacements.len());
+        for replacement in replacements {
+            let old = replacement["old"]
+                .as_str()
+                .context("replacement.old 缺失")?;
+            let new = replacement["new"]
+                .as_str()
+                .context("replacement.new 缺失")?;
+            if old.is_empty() {
+                bail!("replacement.old 不能为空");
+            }
+            let matches = source.match_indices(old).collect::<Vec<_>>();
+            if matches.len() != 1 {
+                bail!(
+                    "每个 replacement.old 必须在基线中恰好出现一次；{old:?} 出现 {} 次",
+                    matches.len()
+                );
+            }
+            let start = matches[0].0;
+            edits.push((start, start + old.len(), new));
+        }
+        edits.sort_by_key(|(start, _, _)| *start);
+        if edits.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            bail!("replacements 不能相互重叠");
+        }
+        let mut candidate = String::with_capacity(source.len());
+        let mut cursor = 0;
+        for (start, end, new) in edits {
+            candidate.push_str(&source[cursor..start]);
+            candidate.push_str(new);
+            cursor = end;
+        }
+        candidate.push_str(&source[cursor..]);
+
+        parsed["alda_code"] = serde_json::Value::String(candidate);
+        parsed["scope"] = serde_json::Value::String("candidate".to_string());
+        parsed
+            .as_object_mut()
+            .expect("tool arguments are an object")
+            .remove("base");
+        parsed
+            .as_object_mut()
+            .expect("tool arguments are an object")
+            .remove("replacements");
+        self.inspect_alda_source(&parsed.to_string(), validation, Some(context))
+            .await
+    }
+}
+
+fn alda_time_marking(milliseconds: f64) -> String {
+    let total_seconds = milliseconds.max(0.0) / 1000.0;
+    let minutes = (total_seconds / 60.0).floor();
+    format!("{minutes:.0}:{:.3}", total_seconds - minutes * 60.0)
 }
 
 // ============================================================
 // 辅助函数
 // ============================================================
+
+fn inspection_sections(info: &ScoreInfo) -> Vec<serde_json::Value> {
+    info.sections
+        .iter()
+        .map(|section| {
+            let parts = section
+                .parts
+                .iter()
+                .map(|part| {
+                    serde_json::json!({
+                        "name": part.part,
+                        "event_count": part.event_count,
+                        "sounding_secs": part.sounding_ms / 1000.0,
+                        "coverage_ratio": part.coverage_ratio
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "name": section.name,
+                "start_secs": section.start_ms / 1000.0,
+                "end_secs": section.end_ms / 1000.0,
+                "event_count": section.event_count,
+                "parts": parts
+            })
+        })
+        .collect()
+}
+
+fn alda_inspection_json(
+    scope: &str,
+    parse_ok: bool,
+    info: Option<&ScoreInfo>,
+    source_hash: Option<&str>,
+    checks: &[AldaCheck],
+) -> String {
+    let hard_failures = checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Fail)
+        .map(|check| serde_json::json!({ "name": check.name, "detail": check.detail }))
+        .collect::<Vec<_>>();
+    let diagnostics = checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Unchecked)
+        .map(|check| serde_json::json!({ "name": check.name, "detail": check.detail }))
+        .collect::<Vec<_>>();
+    let duration_secs = info.map(|score| score.duration_ms / 1000.0);
+    let parts = info
+        .map(|score| {
+            score
+                .timeline
+                .parts
+                .iter()
+                .map(|part| {
+                    serde_json::json!({
+                        "name": part.part,
+                        "end_secs": part.last_event_ms / 1000.0,
+                        "event_count": part.event_count
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let markers = info
+        .map(|score| {
+            score
+                .markers
+                .iter()
+                .map(|marker| {
+                    serde_json::json!({
+                        "name": marker.name,
+                        "offset_secs": marker.offset_ms / 1000.0
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let sections = info.map_or_else(Vec::new, inspection_sections);
+    serde_json::json!({
+        "scope": scope,
+        "parse_ok": parse_ok,
+        "duration_secs": duration_secs,
+        "markers": markers,
+        "sections": sections,
+        "parts": parts,
+        "source_hash": source_hash,
+        "hard_failures": hard_failures,
+        "diagnostics": diagnostics
+    })
+    .to_string()
+}
+
+pub(crate) fn requires_form_plan(validation: &ScoreValidation) -> bool {
+    validation
+        .target_duration()
+        .is_some_and(|duration| match duration {
+            DurationConstraint::Exact(seconds) => seconds >= 120.0,
+            DurationConstraint::Range { min_secs, .. } => min_secs >= 120.0,
+        })
+}
+
+fn parse_form_plan(value: &serde_json::Value) -> Result<Option<FormPlan>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let plan = serde_json::from_value::<FormPlan>(value.clone()).context("form_plan 结构无效")?;
+    plan.validate()?;
+    Ok(Some(plan))
+}
+
+pub(crate) fn form_plan_check(
+    info: Option<&ScoreInfo>,
+    form_plan: Option<&FormPlan>,
+    required: bool,
+) -> Option<AldaCheck> {
+    let Some(plan) = form_plan else {
+        return required.then(|| AldaCheck {
+            name: "曲式计划",
+            status: CheckStatus::Fail,
+            detail: "目标时长下限不少于 120 秒，完整候选必须提供 form_plan".to_string(),
+        });
+    };
+    let Some(info) = info else {
+        return Some(AldaCheck {
+            name: "曲式计划",
+            status: CheckStatus::Fail,
+            detail: "Alda 解析失败，无法核对 form_plan 与 Marker".to_string(),
+        });
+    };
+    let expected = plan
+        .sections
+        .iter()
+        .map(|section| format!("section_{}", section.id))
+        .collect::<Vec<_>>();
+    let actual = info
+        .markers
+        .iter()
+        .map(|marker| marker.name.clone())
+        .collect::<Vec<_>>();
+    if actual != expected {
+        return Some(AldaCheck {
+            name: "曲式计划",
+            status: CheckStatus::Fail,
+            detail: format!(
+                "Marker 必须按计划精确对应；期望 {}，实际 {}",
+                expected.join(", "),
+                actual.join(", ")
+            ),
+        });
+    }
+    for ((section, marker), expected_name) in plan.sections.iter().zip(&info.markers).zip(&expected)
+    {
+        let target_duration = section.target_end_secs - section.target_start_secs;
+        let tolerance = 2.0_f64.max(target_duration * 0.1);
+        let actual_start = marker.offset_ms / 1000.0;
+        if (actual_start - section.target_start_secs).abs() > tolerance {
+            return Some(AldaCheck {
+                name: "曲式计划",
+                status: CheckStatus::Fail,
+                detail: format!(
+                    "%{expected_name} 位于 {actual_start:.1}秒，计划 {:.1}秒，超出 ±{tolerance:.1}秒容差",
+                    section.target_start_secs
+                ),
+            });
+        }
+    }
+    let final_section = plan
+        .sections
+        .last()
+        .expect("form plan has at least four sections");
+    let final_tolerance =
+        2.0_f64.max((final_section.target_end_secs - final_section.target_start_secs) * 0.1);
+    let actual_end = info.duration_ms / 1000.0;
+    if (actual_end - final_section.target_end_secs).abs() > final_tolerance {
+        return Some(AldaCheck {
+            name: "曲式计划",
+            status: CheckStatus::Fail,
+            detail: format!(
+                "全曲结束于 {actual_end:.1}秒，计划 {:.1}秒，超出 ±{final_tolerance:.1}秒容差",
+                final_section.target_end_secs
+            ),
+        });
+    }
+    Some(AldaCheck {
+        name: "曲式计划",
+        status: CheckStatus::Pass,
+        detail: format!("{} 个计划段落与 Marker 顺序及边界对齐", plan.sections.len()),
+    })
+}
+
+fn edit_scope_check(
+    runner: &AldaRunner,
+    context: Option<&AgentToolContext>,
+    candidate_info: Option<&ScoreInfo>,
+    candidate_plan: Option<&FormPlan>,
+    edit_scope: Option<&EditScope>,
+) -> Option<AldaCheck> {
+    let baseline_plan = context.and_then(|context| context.form_plan.as_ref());
+    let Some(baseline_plan) = baseline_plan else {
+        return edit_scope.map(|scope| AldaCheck {
+            name: "修改范围",
+            status: if scope.mode == EditMode::Global {
+                CheckStatus::Pass
+            } else {
+                CheckStatus::Fail
+            },
+            detail: if scope.mode == EditMode::Global {
+                "首次结构化创作采用全局模式".to_string()
+            } else {
+                "没有带 form_plan 的基线，不能执行局部修改".to_string()
+            },
+        });
+    };
+    let Some(scope) = edit_scope else {
+        return Some(AldaCheck {
+            name: "修改范围",
+            status: CheckStatus::Fail,
+            detail: "已有结构化乐谱；新候选必须声明 local 或 global edit_scope".to_string(),
+        });
+    };
+    if scope.mode == EditMode::Global {
+        return Some(AldaCheck {
+            name: "修改范围",
+            status: CheckStatus::Pass,
+            detail: format!("全局重写：{}", scope.intent.trim()),
+        });
+    }
+
+    let targets = scope
+        .target_sections
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Err(failure) = check_local_plan(baseline_plan, candidate_plan, &targets) {
+        return Some(failure);
+    }
+    Some(check_local_event_hashes(
+        runner,
+        context,
+        candidate_info,
+        baseline_plan,
+        scope,
+        &targets,
+    ))
+}
+
+fn check_local_plan(
+    baseline_plan: &FormPlan,
+    candidate_plan: Option<&FormPlan>,
+    targets: &std::collections::BTreeSet<&str>,
+) -> std::result::Result<(), AldaCheck> {
+    if let Some(unknown) = targets.iter().find(|id| {
+        !baseline_plan
+            .sections
+            .iter()
+            .any(|section| section.id == ***id)
+    }) {
+        return Err(edit_scope_failure(format!(
+            "目标段落 {unknown:?} 不在基线 form_plan 中"
+        )));
+    }
+    let Some(candidate_plan) = candidate_plan else {
+        return Err(edit_scope_failure("局部修改缺少候选 form_plan"));
+    };
+    if baseline_plan.sections.len() != candidate_plan.sections.len()
+        || baseline_plan
+            .sections
+            .iter()
+            .zip(&candidate_plan.sections)
+            .any(|(base, candidate)| base.id != candidate.id)
+    {
+        return Err(edit_scope_failure(
+            "局部修改不能增加、删除或重排 form_plan 段落",
+        ));
+    }
+    for (base, candidate) in baseline_plan.sections.iter().zip(&candidate_plan.sections) {
+        if targets.contains(base.id.as_str()) {
+            continue;
+        }
+        let base_duration = base.target_end_secs - base.target_start_secs;
+        let candidate_duration = candidate.target_end_secs - candidate.target_start_secs;
+        if base.function != candidate.function
+            || base.material_action != candidate.material_action
+            || base.energy != candidate.energy
+            || (base_duration - candidate_duration).abs() > 0.001
+        {
+            return Err(edit_scope_failure(format!(
+                "保持段落 {:?} 的职责、材料动作、能量或目标时长发生变化",
+                base.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_local_event_hashes(
+    runner: &AldaRunner,
+    context: Option<&AgentToolContext>,
+    candidate_info: Option<&ScoreInfo>,
+    baseline_plan: &FormPlan,
+    scope: &EditScope,
+    targets: &std::collections::BTreeSet<&str>,
+) -> AldaCheck {
+    let Some(context) = context else {
+        return edit_scope_failure("局部修改没有项目基线上下文");
+    };
+    let baseline_path = context
+        .revision_path
+        .as_ref()
+        .or(context.working_path.as_ref())
+        .or(context.current_path.as_ref());
+    let Some(baseline_path) = baseline_path else {
+        return edit_scope_failure("局部修改没有可读取的基线乐谱");
+    };
+    let baseline_info = match runner.parse(baseline_path) {
+        Ok(info) => info,
+        Err(error) => return edit_scope_failure(format!("无法解析基线乐谱：{error}")),
+    };
+    let Some(candidate_info) = candidate_info else {
+        return edit_scope_failure("无法解析候选乐谱");
+    };
+    let baseline_hashes = baseline_info
+        .sections
+        .iter()
+        .map(|section| (section.name.as_str(), section.event_hash.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let candidate_hashes = candidate_info
+        .sections
+        .iter()
+        .map(|section| (section.name.as_str(), section.event_hash.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let changed = baseline_plan
+        .sections
+        .iter()
+        .filter(|section| !targets.contains(section.id.as_str()))
+        .filter_map(|section| {
+            let marker = format!("section_{}", section.id);
+            (baseline_hashes.get(marker.as_str()) != candidate_hashes.get(marker.as_str()))
+                .then_some(section.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        AldaCheck {
+            name: "修改范围",
+            status: CheckStatus::Pass,
+            detail: format!(
+                "仅允许修改 {}；其余段落事件保持",
+                scope.target_sections.join(", ")
+            ),
+        }
+    } else {
+        edit_scope_failure(format!("非目标段落事件发生变化：{}", changed.join(", ")))
+    }
+}
+
+fn edit_scope_failure(detail: impl Into<String>) -> AldaCheck {
+    AldaCheck {
+        name: "修改范围",
+        status: CheckStatus::Fail,
+        detail: detail.into(),
+    }
+}
 
 fn tool_call_message(id: &str, name: &str, arguments: &str, content: String) -> Message {
     Message {
@@ -1601,6 +2280,14 @@ fn build_project_context(request: &ProjectPromptRequest) -> String {
     } else {
         message.push_str("\n项目尚无有效版本；请根据对话中的用户请求创作。\n");
     }
+    if let Some(form_plan) = &request.form_plan {
+        message.push_str("\n【当前结构计划｜段落 id 对应 %section_<id>】\n");
+        message.push_str(
+            &serde_json::to_string(form_plan)
+                .expect("serializing a validated form plan cannot fail"),
+        );
+        message.push('\n');
+    }
     message
 }
 
@@ -1609,6 +2296,37 @@ struct SubmittedResult {
     kind: AgentResultKind,
     message: String,
     alda_code: Option<String>,
+    candidate_ref: Option<String>,
+    form_plan: Option<FormPlan>,
+    edit_scope: Option<EditScope>,
+}
+
+fn parse_edit_scope(value: &serde_json::Value) -> Result<Option<EditScope>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let scope =
+        serde_json::from_value::<EditScope>(value.clone()).context("edit_scope 结构无效")?;
+    if scope.intent.trim().is_empty() {
+        bail!("edit_scope.intent 不能为空");
+    }
+    match scope.mode {
+        EditMode::Local if scope.target_sections.is_empty() => {
+            bail!("local edit_scope 必须指定 target_sections")
+        }
+        EditMode::Global if !scope.target_sections.is_empty() => {
+            bail!("global edit_scope 的 target_sections 必须为空")
+        }
+        _ => {}
+    }
+    let unique = scope
+        .target_sections
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique.len() != scope.target_sections.len() {
+        bail!("edit_scope.target_sections 不能重复");
+    }
+    Ok(Some(scope))
 }
 
 fn parse_submitted_result(args: &str) -> Result<SubmittedResult> {
@@ -1656,14 +2374,43 @@ fn parse_submitted_result(args: &str) -> Result<SubmittedResult> {
         kind = AgentResultKind::Clarification;
     }
     let code = parsed["alda_code"].as_str();
-    if matches!(kind, AgentResultKind::Draft | AgentResultKind::Candidate) && code.is_none() {
-        bail!("草稿或完整候选缺少 alda_code");
+    let candidate_ref = parsed["candidate_ref"]["source_hash"]
+        .as_str()
+        .map(str::to_string);
+    let form_plan = parse_form_plan(&parsed["form_plan"])?;
+    let edit_scope = parse_edit_scope(&parsed["edit_scope"])?;
+    match kind {
+        AgentResultKind::Draft if code.is_none() => bail!("草稿缺少 alda_code"),
+        AgentResultKind::Draft if candidate_ref.is_some() => {
+            bail!("草稿不能使用 candidate_ref")
+        }
+        AgentResultKind::Candidate if code.is_some() == candidate_ref.is_some() => {
+            bail!("完整候选必须且只能提供 alda_code 或 candidate_ref.source_hash 之一")
+        }
+        AgentResultKind::Candidate if candidate_ref.is_some() && form_plan.is_some() => {
+            bail!("candidate_ref 已绑定检查点 form_plan，引用提交不能重复提供 form_plan")
+        }
+        AgentResultKind::Candidate if candidate_ref.is_some() && edit_scope.is_some() => {
+            bail!("candidate_ref 已绑定检查点 edit_scope，引用提交不能重复提供 edit_scope")
+        }
+        AgentResultKind::Answer | AgentResultKind::Clarification | AgentResultKind::Plan
+            if code.is_some()
+                || candidate_ref.is_some()
+                || form_plan.is_some()
+                || edit_scope.is_some() =>
+        {
+            bail!("文本结果不能携带乐谱源码、候选引用或 form_plan")
+        }
+        _ => {}
     }
     let Some(code) = code else {
         return Ok(SubmittedResult {
             kind,
             message,
             alda_code: None,
+            candidate_ref,
+            form_plan,
+            edit_scope,
         });
     };
 
@@ -1679,7 +2426,29 @@ fn parse_submitted_result(args: &str) -> Result<SubmittedResult> {
         kind,
         message,
         alda_code: Some(code.to_string()),
+        candidate_ref,
+        form_plan,
+        edit_scope,
     })
+}
+
+fn resolve_candidate_reference(
+    mut submitted: SubmittedResult,
+    checkpoint: Option<&CandidateCheckpoint>,
+) -> Result<SubmittedResult> {
+    let Some(source_hash) = submitted.candidate_ref.take() else {
+        return Ok(submitted);
+    };
+    let checkpoint = checkpoint.context(
+        "candidate_ref 不可用：本轮尚无通过 inspect_alda_source(scope=candidate) 的检查点",
+    )?;
+    if checkpoint.source_hash != source_hash {
+        bail!("candidate_ref 只能引用本轮最近一次有效检查点的 source_hash");
+    }
+    submitted.alda_code = Some(checkpoint.alda_code.clone());
+    submitted.form_plan.clone_from(&checkpoint.form_plan);
+    submitted.edit_scope.clone_from(&checkpoint.edit_scope);
+    Ok(submitted)
 }
 
 fn requests_user_input(message: &str) -> bool {
@@ -2008,6 +2777,35 @@ mod tests {
         let target = r#"{"markers":{"theme":1500,"intro":0},"events":[{"offset":0,"audible-duration":3000,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n  parse)\n    if grep -q syntax_bad \"$3\"; then echo invalid >&2; exit 1\n    elif grep -q closer \"$3\"; then printf '%s\\n' '{closer}'\n    elif grep -q target \"$3\"; then printf '%s\\n' '{target}'\n    else printf '%s\\n' '{short}'\n    fi ;;\n  export) printf midi > \"$5\" ;;\n  play|stop) exit 0 ;;\n  *) exit 1 ;;\nesac\n"
+        );
+        fs::write(&executable, script).unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        (directory, AldaRunner::new(executable))
+    }
+
+    fn section_runner() -> (tempfile::TempDir, AldaRunner) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("alda");
+        let markers =
+            r#""section_intro":0,"section_theme":1000,"section_climax":2000,"section_coda":3000"#;
+        let parts = r#""piano":{"name":"piano","stock-instrument":"midi-piano","tempo":120}"#;
+        let baseline = format!(
+            r#"{{"markers":{{{markers}}},"events":[{{"offset":100,"audible-duration":500,"midi-note":60,"part":"piano"}},{{"offset":1100,"audible-duration":500,"midi-note":60,"part":"piano"}},{{"offset":2100,"audible-duration":500,"midi-note":60,"part":"piano"}},{{"offset":3100,"audible-duration":500,"midi-note":60,"part":"piano"}}],"parts":{{{parts}}}}}"#
+        );
+        let target_changed = baseline.replacen(
+            r#""offset":2100,"audible-duration":500,"midi-note":60"#,
+            r#""offset":2100,"audible-duration":500,"midi-note":61"#,
+            1,
+        );
+        let non_target_changed = baseline.replacen(
+            r#""offset":1100,"audible-duration":500,"midi-note":60"#,
+            r#""offset":1100,"audible-duration":500,"midi-note":62"#,
+            1,
+        );
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  parse)\n    if grep -q non_target_changed \"$3\"; then printf '%s\\n' '{non_target_changed}'\n    elif grep -q target_changed \"$3\"; then printf '%s\\n' '{target_changed}'\n    else printf '%s\\n' '{baseline}'\n    fi ;;\n  play|stop) exit 0 ;;\n  *) exit 1 ;;\nesac\n"
         );
         fs::write(&executable, script).unwrap();
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
@@ -2900,6 +3698,403 @@ mod tests {
         );
     }
 
+    #[test]
+    fn play_score_tool_keeps_whole_score_default_and_exposes_optional_section_window() {
+        let tools = model_tools(true);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.function.name == "play_score")
+            .unwrap();
+
+        assert_eq!(
+            tool.function.parameters["required"],
+            serde_json::json!(["target"])
+        );
+        assert_eq!(
+            tool.function.parameters["properties"]["context_secs"]["minimum"],
+            5
+        );
+        assert_eq!(
+            tool.function.parameters["properties"]["context_secs"]["maximum"],
+            15
+        );
+        assert!(tool.function.parameters["properties"]["section_id"].is_object());
+    }
+
+    fn test_form_plan() -> FormPlan {
+        use crate::project::{FormSection, MaterialAction, SectionEnergy};
+
+        FormPlan {
+            target_duration_secs: 120.0,
+            sections: vec![
+                (
+                    "intro",
+                    0.0,
+                    30.0,
+                    MaterialAction::Introduce,
+                    SectionEnergy::Low,
+                ),
+                (
+                    "theme",
+                    30.0,
+                    60.0,
+                    MaterialAction::Develop,
+                    SectionEnergy::Medium,
+                ),
+                (
+                    "climax",
+                    60.0,
+                    90.0,
+                    MaterialAction::Contrast,
+                    SectionEnergy::Peak,
+                ),
+                (
+                    "coda",
+                    90.0,
+                    120.0,
+                    MaterialAction::Close,
+                    SectionEnergy::High,
+                ),
+            ]
+            .into_iter()
+            .map(|(id, start, end, material_action, energy)| FormSection {
+                id: id.to_string(),
+                target_start_secs: start,
+                target_end_secs: end,
+                function: id.to_string(),
+                material_action,
+                energy,
+            })
+            .collect(),
+        }
+    }
+
+    fn score_with_markers(markers: &[(&str, f64)], duration_secs: f64) -> ScoreInfo {
+        ScoreInfo {
+            duration_ms: duration_secs * 1000.0,
+            part_count: 1,
+            event_count: 1,
+            instruments: vec!["midi-piano".to_string()],
+            tempo: 120.0,
+            markers: markers
+                .iter()
+                .map(|(name, seconds)| crate::alda::ScoreMarker {
+                    name: (*name).to_string(),
+                    offset_ms: seconds * 1000.0,
+                })
+                .collect(),
+            sections: Vec::new(),
+            timeline: crate::alda::TimelineDiagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn long_form_plan_requires_exact_marker_order_and_tolerant_boundaries() {
+        let plan = test_form_plan();
+        let valid = score_with_markers(
+            &[
+                ("section_intro", 0.0),
+                ("section_theme", 31.0),
+                ("section_climax", 59.0),
+                ("section_coda", 90.0),
+            ],
+            119.0,
+        );
+        assert_eq!(
+            form_plan_check(Some(&valid), Some(&plan), true)
+                .unwrap()
+                .status,
+            CheckStatus::Pass
+        );
+
+        for invalid in [
+            score_with_markers(
+                &[
+                    ("section_intro", 0.0),
+                    ("section_theme", 30.0),
+                    ("section_coda", 90.0),
+                ],
+                120.0,
+            ),
+            score_with_markers(
+                &[
+                    ("section_intro", 0.0),
+                    ("section_climax", 60.0),
+                    ("section_theme", 30.0),
+                    ("section_coda", 90.0),
+                ],
+                120.0,
+            ),
+            score_with_markers(
+                &[
+                    ("section_intro", 0.0),
+                    ("section_theme", 40.0),
+                    ("section_climax", 60.0),
+                    ("section_coda", 90.0),
+                ],
+                120.0,
+            ),
+        ] {
+            assert_eq!(
+                form_plan_check(Some(&invalid), Some(&plan), true)
+                    .unwrap()
+                    .status,
+                CheckStatus::Fail
+            );
+        }
+
+        assert_eq!(
+            form_plan_check(Some(&valid), None, true).unwrap().status,
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn candidate_reference_resolves_matching_checkpoint_and_rejects_invalid_ones() {
+        let submitted = parse_submitted_result(
+            &serde_json::json!({
+                "kind": "candidate",
+                "message": "引用预检候选",
+                "candidate_ref": { "source_hash": "a".repeat(64) }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(resolve_candidate_reference(submitted, None).is_err());
+
+        let checkpoint = CandidateCheckpoint {
+            source_hash: "b".repeat(64),
+            alda_code: "piano: c".to_string(),
+            form_plan: None,
+            edit_scope: None,
+            checks: Vec::new(),
+        };
+        let submitted = parse_submitted_result(
+            &serde_json::json!({
+                "kind": "candidate",
+                "message": "引用预检候选",
+                "candidate_ref": { "source_hash": "a".repeat(64) }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(resolve_candidate_reference(submitted, Some(&checkpoint)).is_err());
+
+        let plan = test_form_plan();
+        let edit_scope = EditScope {
+            mode: EditMode::Global,
+            target_sections: Vec::new(),
+            intent: "建立完整结构".to_string(),
+        };
+        let checkpoint = CandidateCheckpoint {
+            source_hash: "c".repeat(64),
+            alda_code: "piano: c d e f".to_string(),
+            form_plan: Some(plan.clone()),
+            edit_scope: Some(edit_scope.clone()),
+            checks: Vec::new(),
+        };
+        let submitted = parse_submitted_result(
+            &serde_json::json!({
+                "kind": "candidate",
+                "message": "提交预检候选",
+                "candidate_ref": { "source_hash": "c".repeat(64) }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let resolved = resolve_candidate_reference(submitted, Some(&checkpoint)).unwrap();
+        assert_eq!(resolved.alda_code.as_deref(), Some("piano: c d e f"));
+        assert_eq!(resolved.form_plan, Some(plan));
+        assert_eq!(resolved.edit_scope, Some(edit_scope));
+    }
+
+    #[test]
+    fn local_edit_scope_allows_target_changes_and_rejects_non_target_changes() {
+        let (directory, runner) = section_runner();
+        let baseline_path = directory.path().join("baseline.alda");
+        let target_path = directory.path().join("target.alda");
+        let non_target_path = directory.path().join("non-target.alda");
+        fs::write(&baseline_path, "baseline").unwrap();
+        fs::write(&target_path, "target_changed").unwrap();
+        fs::write(&non_target_path, "non_target_changed").unwrap();
+        let plan = test_form_plan();
+        let context = AgentToolContext {
+            project_root: directory.path().to_path_buf(),
+            current_path: None,
+            working_path: Some(baseline_path),
+            revision_path: None,
+            form_plan: Some(plan.clone()),
+        };
+        let local = EditScope {
+            mode: EditMode::Local,
+            target_sections: vec!["climax".to_string()],
+            intent: "增强高潮".to_string(),
+        };
+
+        let target_info = runner.parse(&target_path).unwrap();
+        assert_eq!(
+            edit_scope_check(
+                &runner,
+                Some(&context),
+                Some(&target_info),
+                Some(&plan),
+                Some(&local),
+            )
+            .unwrap()
+            .status,
+            CheckStatus::Pass
+        );
+
+        let non_target_info = runner.parse(&non_target_path).unwrap();
+        let failure = edit_scope_check(
+            &runner,
+            Some(&context),
+            Some(&non_target_info),
+            Some(&plan),
+            Some(&local),
+        )
+        .unwrap();
+        assert_eq!(failure.status, CheckStatus::Fail);
+        assert!(failure.detail.contains("theme"));
+
+        let global = EditScope {
+            mode: EditMode::Global,
+            target_sections: Vec::new(),
+            intent: "整体重写".to_string(),
+        };
+        assert_eq!(
+            edit_scope_check(
+                &runner,
+                Some(&context),
+                Some(&non_target_info),
+                Some(&plan),
+                Some(&global),
+            )
+            .unwrap()
+            .status,
+            CheckStatus::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_alda_patch_validates_in_memory_and_rejects_stale_baseline() {
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = section_runner();
+        let baseline_path = directory.path().join("baseline.alda");
+        let baseline_source = "baseline";
+        fs::write(&baseline_path, baseline_source).unwrap();
+        let mut plan = test_form_plan();
+        plan.target_duration_secs = 3.6;
+        for (section, (start, end)) in
+            plan.sections
+                .iter_mut()
+                .zip([(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 3.6)])
+        {
+            section.target_start_secs = start;
+            section.target_end_secs = end;
+        }
+        let context = AgentToolContext {
+            project_root: directory.path().to_path_buf(),
+            current_path: None,
+            working_path: Some(baseline_path.clone()),
+            revision_path: None,
+            form_plan: Some(plan.clone()),
+        };
+        let validation = ScoreValidation::new(None, Vec::new(), Vec::new());
+        let agent = Agent::new(client, runner);
+        let source_hash = format!("{:x}", Sha256::digest(baseline_source.as_bytes()));
+        let arguments = serde_json::json!({
+            "base": { "kind": "work", "source_hash": source_hash },
+            "replacements": [{ "old": "baseline", "new": "target_changed" }],
+            "form_plan": plan,
+            "edit_scope": {
+                "mode": "local",
+                "target_sections": ["climax"],
+                "intent": "增强高潮"
+            }
+        });
+
+        let inspected = agent
+            .execute_model_tool(
+                "inspect_alda_patch",
+                &arguments.to_string(),
+                Some(&context),
+                &validation,
+            )
+            .await
+            .unwrap();
+        let inspection: serde_json::Value = serde_json::from_str(&inspected.content).unwrap();
+        assert_eq!(inspection["hard_failures"], serde_json::json!([]));
+        assert!(inspected.candidate_checkpoint.is_some());
+        assert_eq!(fs::read_to_string(&baseline_path).unwrap(), baseline_source);
+
+        let mut stale = arguments.clone();
+        stale["base"]["source_hash"] = serde_json::Value::String("0".repeat(64));
+        let error = agent
+            .execute_model_tool(
+                "inspect_alda_patch",
+                &stale.to_string(),
+                Some(&context),
+                &validation,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("source_hash 已失效"));
+
+        let revision_path = directory.path().join("revision.alda");
+        fs::write(&revision_path, "newer revision").unwrap();
+        let newer_context = AgentToolContext {
+            revision_path: Some(revision_path),
+            ..context
+        };
+        let error = agent
+            .execute_model_tool(
+                "inspect_alda_patch",
+                &arguments.to_string(),
+                Some(&newer_context),
+                &validation,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("最新工作基线"));
+    }
+
+    fn assert_valid_source_inspection(valid: &serde_json::Value) {
+        assert_eq!(valid["parse_ok"], true);
+        assert_eq!(valid["duration_secs"], 3.0);
+        assert_eq!(
+            valid["markers"],
+            serde_json::json!([
+                {"name": "intro", "offset_secs": 0.0},
+                {"name": "theme", "offset_secs": 1.5}
+            ])
+        );
+        assert_eq!(valid["sections"][0]["name"], "intro");
+        assert_eq!(valid["sections"][0]["start_secs"], 0.0);
+        assert_eq!(valid["sections"][0]["end_secs"], 1.5);
+        assert_eq!(valid["sections"][0]["event_count"], 1);
+        assert_eq!(valid["sections"][0]["parts"][0]["name"], "piano");
+        assert_eq!(valid["sections"][0]["parts"][0]["sounding_secs"], 1.5);
+        assert_eq!(valid["sections"][0]["parts"][0]["coverage_ratio"], 1.0);
+        assert_eq!(valid["sections"][1]["name"], "theme");
+        assert_eq!(valid["sections"][1]["event_count"], 0);
+        assert_eq!(valid["sections"][1]["parts"][0]["sounding_secs"], 1.5);
+        assert_eq!(valid["parts"][0]["name"], "piano");
+        assert_eq!(valid["parts"][0]["end_secs"], 3.0);
+        assert_eq!(valid["parts"][0]["event_count"], 1);
+        assert_eq!(valid["hard_failures"], serde_json::json!([]));
+        assert!(valid["diagnostics"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["name"] == "声部时间轴/事件空档")
+        }));
+    }
+
     #[tokio::test]
     async fn inspect_alda_source_reports_real_timing_failures_and_size_limit() {
         let client = DeepSeekClient::new(
@@ -2927,24 +4122,7 @@ mod tests {
             .unwrap();
         assert!(valid.candidate_checkpoint.is_none());
         let valid: serde_json::Value = serde_json::from_str(&valid.content).unwrap();
-        assert_eq!(valid["parse_ok"], true);
-        assert_eq!(valid["duration_secs"], 3.0);
-        assert_eq!(
-            valid["markers"],
-            serde_json::json!([
-                {"name": "intro", "offset_secs": 0.0},
-                {"name": "theme", "offset_secs": 1.5}
-            ])
-        );
-        assert_eq!(valid["parts"][0]["name"], "piano");
-        assert_eq!(valid["parts"][0]["end_secs"], 3.0);
-        assert_eq!(valid["parts"][0]["event_count"], 1);
-        assert_eq!(valid["hard_failures"], serde_json::json!([]));
-        assert!(valid["diagnostics"].as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item["name"] == "声部时间轴/事件空档")
-        }));
+        assert_valid_source_inspection(&valid);
 
         let invalid = agent
             .execute_model_tool(
@@ -2963,6 +4141,7 @@ mod tests {
         assert_eq!(invalid["parse_ok"], false);
         assert!(invalid["duration_secs"].is_null());
         assert_eq!(invalid["markers"], serde_json::json!([]));
+        assert_eq!(invalid["sections"], serde_json::json!([]));
         assert!(
             invalid["hard_failures"]
                 .as_array()
@@ -2986,6 +4165,7 @@ mod tests {
         let oversized: serde_json::Value = serde_json::from_str(&oversized.content).unwrap();
         assert_eq!(oversized["parse_ok"], false);
         assert_eq!(oversized["markers"], serde_json::json!([]));
+        assert_eq!(oversized["sections"], serde_json::json!([]));
         assert_eq!(oversized["hard_failures"][0]["name"], "源码大小");
         assert!(
             oversized["hard_failures"][0]["detail"]
@@ -2998,6 +4178,43 @@ mod tests {
             entries, 1,
             "inspection must not persist source beside the project"
         );
+    }
+
+    #[tokio::test]
+    async fn inspect_score_returns_patch_ready_source_hash() {
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = progress_runner();
+        let source = "midi-acoustic-grand-piano: target";
+        let current = directory.path().join("current.alda");
+        fs::write(&current, source).unwrap();
+        let context = AgentToolContext {
+            project_root: directory.path().to_path_buf(),
+            current_path: Some(current),
+            working_path: None,
+            revision_path: None,
+            form_plan: None,
+        };
+        let result = Agent::new(client, runner)
+            .execute_model_tool(
+                "inspect_score",
+                &serde_json::json!({ "target": "current" }).to_string(),
+                Some(&context),
+                &ScoreValidation::new(None, Vec::new(), Vec::new()),
+            )
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+
+        assert_eq!(
+            result["source_hash"],
+            format!("{:x}", Sha256::digest(source.as_bytes()))
+        );
+        assert_eq!(result["info"]["sections"][0]["name"], "intro");
     }
 
     #[tokio::test]
@@ -3046,13 +4263,12 @@ mod tests {
             .await
             .unwrap();
         let candidate_json: serde_json::Value = serde_json::from_str(&candidate.content).unwrap();
-        let checkpoint = candidate.candidate_checkpoint.unwrap();
-        assert_eq!(checkpoint.alda_code, "midi-acoustic-grand-piano: target");
+        assert!(candidate.candidate_checkpoint.is_none());
+        assert!(candidate_json["source_hash"].is_null());
         assert!(
-            checkpoint
-                .checks
-                .iter()
-                .any(|check| { check.name == "时长" && check.status == CheckStatus::Fail })
+            candidate_json["hard_failures"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["name"] == "时长"))
         );
         assert!(
             candidate_json["hard_failures"]
@@ -3194,6 +4410,8 @@ mod tests {
                         project_root: directory.path().to_path_buf(),
                         current_path: Some(current),
                         working_path: None,
+                        revision_path: None,
+                        form_plan: None,
                     }),
                     require_candidate: false,
                     forbid_clarification: false,

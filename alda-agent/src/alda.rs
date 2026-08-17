@@ -1,6 +1,7 @@
 use crate::instructions::DurationConstraint;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Read;
@@ -28,12 +29,14 @@ struct ParseOutput {
     parts: HashMap<String, Part>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Event {
     part: String,
     offset: f64,
     #[serde(rename = "audible-duration")]
     audible_duration: f64,
+    #[serde(flatten)]
+    details: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +66,8 @@ pub struct ScoreInfo {
     pub tempo: f64,
     /// 按实际时间排序的 Alda Marker。
     pub markers: Vec<ScoreMarker>,
+    /// 由相邻 Marker 划分的实际段落时间线。
+    pub sections: Vec<SectionTimeline>,
     /// 各声部时间范围与全局事件空档，仅用于诊断，不参与候选通过/失败判断。
     pub timeline: TimelineDiagnostics,
 }
@@ -71,6 +76,29 @@ pub struct ScoreInfo {
 pub struct ScoreMarker {
     pub name: String,
     pub offset_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SectionTimeline {
+    pub name: String,
+    pub start_ms: f64,
+    pub end_ms: f64,
+    pub duration_ms: f64,
+    /// 起音位于本段的事件数量；跨段延音不会重复计数。
+    pub event_count: usize,
+    /// 起音归入本段的规范化事件哈希；段首时间平移不改变此值。
+    pub event_hash: String,
+    pub parts: Vec<SectionPartTimeline>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SectionPartTimeline {
+    pub part: String,
+    /// 起音位于本段的该声部事件数量。
+    pub event_count: usize,
+    /// 该声部事件与段落区间相交后的合并发声时长。
+    pub sounding_ms: f64,
+    pub coverage_ratio: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -124,6 +152,101 @@ fn parse_score_markers(markers: &BTreeMap<String, f64>) -> Result<Vec<ScoreMarke
     Ok(parsed)
 }
 
+fn analyze_sections(
+    parsed: &ParseOutput,
+    markers: &[ScoreMarker],
+    audible_end_ms: f64,
+) -> Vec<SectionTimeline> {
+    let timeline_end_ms = markers.last().map_or(audible_end_ms, |marker| {
+        audible_end_ms.max(marker.offset_ms)
+    });
+
+    markers
+        .iter()
+        .enumerate()
+        .map(|(index, marker)| {
+            let start_ms = marker.offset_ms;
+            let end_ms = markers
+                .get(index + 1)
+                .map_or(timeline_end_ms, |next| next.offset_ms);
+            let duration_ms = (end_ms - start_ms).max(0.0);
+            let mut event_count = 0;
+            let mut canonical_events = Vec::new();
+            let mut part_events: BTreeMap<&str, usize> = BTreeMap::new();
+            let mut part_intervals: BTreeMap<&str, Vec<(f64, f64)>> = BTreeMap::new();
+
+            for event in &parsed.events {
+                let event_end = event.offset + event.audible_duration;
+                if event.offset >= start_ms && event.offset < end_ms {
+                    event_count += 1;
+                    *part_events.entry(&event.part).or_default() += 1;
+                    canonical_events.push(serde_json::json!({
+                        "part": readable_part_name(parsed, &event.part),
+                        "offset_ms": event.offset - start_ms,
+                        "audible_duration_ms": event.audible_duration,
+                        "details": event.details,
+                    }));
+                }
+                let overlap_start = event.offset.max(start_ms);
+                let overlap_end = event_end.min(end_ms);
+                if overlap_end > overlap_start {
+                    part_intervals
+                        .entry(&event.part)
+                        .or_default()
+                        .push((overlap_start, overlap_end));
+                }
+            }
+
+            let mut part_ids = part_events
+                .keys()
+                .chain(part_intervals.keys())
+                .copied()
+                .collect::<Vec<_>>();
+            part_ids.sort_unstable();
+            part_ids.dedup();
+            let mut parts = part_ids
+                .into_iter()
+                .map(|part_id| {
+                    let sounding_ms =
+                        merge_intervals(part_intervals.remove(part_id).unwrap_or_default(), 0.0)
+                            .iter()
+                            .map(|(start, end)| end - start)
+                            .sum::<f64>();
+                    SectionPartTimeline {
+                        part: readable_part_name(parsed, part_id),
+                        event_count: part_events.get(part_id).copied().unwrap_or_default(),
+                        sounding_ms,
+                        coverage_ratio: if duration_ms > 0.0 {
+                            (sounding_ms / duration_ms).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            parts.sort_by(|left, right| left.part.cmp(&right.part));
+            canonical_events.sort_by_key(serde_json::Value::to_string);
+            let event_hash = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&canonical_events)
+                        .expect("canonical score events are serializable")
+                )
+            );
+
+            SectionTimeline {
+                name: marker.name.clone(),
+                start_ms,
+                end_ms,
+                duration_ms,
+                event_count,
+                event_hash,
+                parts,
+            }
+        })
+        .collect()
+}
+
 /// 检查项结果
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AldaCheck {
@@ -165,6 +288,11 @@ impl ScoreValidation {
     pub fn without_duration(mut self) -> Self {
         self.target_duration = None;
         self
+    }
+
+    #[must_use]
+    pub fn target_duration(&self) -> Option<DurationConstraint> {
+        self.target_duration
     }
 }
 
@@ -577,6 +705,7 @@ impl AldaRunner {
 
         let (duration_ms, timeline) = analyze_events(&parsed).context("Alda 事件数据无效")?;
         let markers = parse_score_markers(&parsed.markers).context("Alda Marker 数据无效")?;
+        let sections = analyze_sections(&parsed, &markers, duration_ms);
 
         let part_count = parsed.parts.len();
         let event_count = parsed.events.len();
@@ -597,6 +726,7 @@ impl AldaRunner {
             instruments,
             tempo,
             markers,
+            sections,
             timeline,
         })
     }
@@ -621,6 +751,20 @@ impl AldaRunner {
     /// 播放（非阻塞）
     pub fn play(&self, score_path: &Path) -> Result<()> {
         self.run_alda_no_capture(&["play", "-f", &score_path.to_string_lossy()])?;
+        Ok(())
+    }
+
+    /// 从指定时间播放到指定时间（非阻塞）。
+    pub fn play_range(&self, score_path: &Path, from: &str, to: &str) -> Result<()> {
+        self.run_alda_no_capture(&[
+            "play",
+            "-f",
+            &score_path.to_string_lossy(),
+            "--from",
+            from,
+            "--to",
+            to,
+        ])?;
         Ok(())
     }
 
@@ -888,6 +1032,18 @@ impl AldaRunner {
             .context("Alda 播放任务异常退出")?
     }
 
+    pub async fn play_range_async(
+        &self,
+        score_path: PathBuf,
+        from: String,
+        to: String,
+    ) -> Result<()> {
+        let runner = self.clone();
+        tokio::task::spawn_blocking(move || runner.play_range(&score_path, &from, &to))
+            .await
+            .context("Alda 局部播放任务异常退出")?
+    }
+
     pub async fn stop_async(&self) -> Result<()> {
         let runner = self.clone();
         tokio::task::spawn_blocking(move || runner.stop())
@@ -1098,8 +1254,10 @@ mod tests {
     fn runner() -> (tempfile::TempDir, AldaRunner) {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("alda");
+        let arguments = directory.path().join("args");
         let script = format!(
             r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
 command="$1"
 if [ "$command" = "parse" ]; then
   score="$3"
@@ -1127,7 +1285,8 @@ elif [ "$command" = "play" ] || [ "$command" = "stop" ]; then
 else
   exit 1
 fi
-"#
+"#,
+            arguments.display()
         );
         fs::write(&executable, script).unwrap();
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
@@ -1161,6 +1320,24 @@ fi
         assert!(
             (actual - expected).abs() < 1.0e-9,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn play_uses_whole_score_by_default_and_range_only_when_requested() {
+        let (directory, runner) = runner();
+        let score = score_file(&directory, "play.alda", "piano: c1");
+
+        runner.play(&score).unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("args")).unwrap(),
+            format!("play\n-f\n{}\n", score.display())
+        );
+
+        runner.play_range(&score, "12.5s", "38s").unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("args")).unwrap(),
+            format!("play\n-f\n{}\n--from\n12.5s\n--to\n38s\n", score.display())
         );
     }
 
@@ -1204,16 +1381,19 @@ fi
                     part: "piano".into(),
                     offset: 1_000.0,
                     audible_duration: 500.0,
+                    details: BTreeMap::new(),
                 },
                 Event {
                     part: "piano".into(),
                     offset: 0.0,
                     audible_duration: 800.0,
+                    details: BTreeMap::new(),
                 },
                 Event {
                     part: "piano".into(),
                     offset: 700.0,
                     audible_duration: 500.0,
+                    details: BTreeMap::new(),
                 },
             ],
             parts: HashMap::from([("piano".into(), part("midi-piano"))]),
@@ -1306,16 +1486,19 @@ fi
                 part: "piano".into(),
                 offset: f64::NAN,
                 audible_duration: 100.0,
+                details: BTreeMap::new(),
             },
             Event {
                 part: "piano".into(),
                 offset: 0.0,
                 audible_duration: -1.0,
+                details: BTreeMap::new(),
             },
             Event {
                 part: "missing".into(),
                 offset: 0.0,
                 audible_duration: 100.0,
+                details: BTreeMap::new(),
             },
         ] {
             let parsed = ParseOutput {
@@ -1357,6 +1540,110 @@ fi
             let invalid = BTreeMap::from([("bad".to_string(), offset)]);
             assert!(parse_score_markers(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn sections_assign_event_onsets_once_and_measure_cross_boundary_sound() {
+        let parsed = ParseOutput {
+            aliases: HashMap::new(),
+            markers: BTreeMap::from([
+                ("coda".to_string(), 2_000.0),
+                ("intro".to_string(), 0.0),
+                ("theme".to_string(), 1_000.0),
+            ]),
+            events: vec![
+                Event {
+                    part: "piano".into(),
+                    offset: 0.0,
+                    audible_duration: 600.0,
+                    details: BTreeMap::new(),
+                },
+                Event {
+                    part: "piano".into(),
+                    offset: 800.0,
+                    audible_duration: 700.0,
+                    details: BTreeMap::new(),
+                },
+                Event {
+                    part: "flute".into(),
+                    offset: 1_000.0,
+                    audible_duration: 500.0,
+                    details: BTreeMap::new(),
+                },
+                Event {
+                    part: "piano".into(),
+                    offset: 1_500.0,
+                    audible_duration: 1_000.0,
+                    details: BTreeMap::new(),
+                },
+            ],
+            parts: HashMap::from([
+                ("piano".into(), part("midi-piano")),
+                ("flute".into(), part("midi-flute")),
+            ]),
+        };
+        let (duration_ms, _) = analyze_events(&parsed).unwrap();
+        let markers = parse_score_markers(&parsed.markers).unwrap();
+        let sections = analyze_sections(&parsed, &markers, duration_ms);
+
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].name, "intro");
+        assert_approx(sections[0].start_ms, 0.0);
+        assert_approx(sections[0].end_ms, 1_000.0);
+        assert_eq!(sections[0].event_count, 2);
+        assert_eq!(sections[0].parts.len(), 1);
+        assert_eq!(sections[0].parts[0].part, "piano");
+        assert_eq!(sections[0].parts[0].event_count, 2);
+        assert_approx(sections[0].parts[0].sounding_ms, 800.0);
+        assert_approx(sections[0].parts[0].coverage_ratio, 0.8);
+
+        assert_eq!(sections[1].name, "theme");
+        assert_eq!(sections[1].event_count, 2);
+        let theme_piano = sections[1]
+            .parts
+            .iter()
+            .find(|part| part.part == "piano")
+            .unwrap();
+        assert_eq!(theme_piano.event_count, 1);
+        assert_approx(theme_piano.sounding_ms, 1_000.0);
+        assert_approx(theme_piano.coverage_ratio, 1.0);
+
+        assert_eq!(sections[2].name, "coda");
+        assert_approx(sections[2].start_ms, 2_000.0);
+        assert_approx(sections[2].end_ms, 2_500.0);
+        assert_eq!(sections[2].event_count, 0);
+        assert_eq!(sections[2].parts[0].event_count, 0);
+        assert_approx(sections[2].parts[0].sounding_ms, 500.0);
+        assert_approx(sections[2].parts[0].coverage_ratio, 1.0);
+
+        assert!(analyze_sections(&parsed, &[], duration_ms).is_empty());
+    }
+
+    #[test]
+    fn section_event_hash_is_stable_when_the_whole_section_moves_in_time() {
+        let score = |shift_ms: f64| ParseOutput {
+            aliases: HashMap::new(),
+            markers: BTreeMap::from([("section_theme".to_string(), shift_ms)]),
+            events: vec![Event {
+                part: "piano".into(),
+                offset: shift_ms + 250.0,
+                audible_duration: 500.0,
+                details: BTreeMap::from([("midi-note".to_string(), serde_json::json!(60))]),
+            }],
+            parts: HashMap::from([("piano".into(), part("midi-piano"))]),
+        };
+
+        let original = score(0.0);
+        let moved = score(5_000.0);
+        let original_markers = parse_score_markers(&original.markers).unwrap();
+        let moved_markers = parse_score_markers(&moved.markers).unwrap();
+        let original_sections = analyze_sections(&original, &original_markers, 750.0);
+        let moved_sections = analyze_sections(&moved, &moved_markers, 5_750.0);
+
+        assert_eq!(
+            original_sections[0].event_hash,
+            moved_sections[0].event_hash
+        );
     }
 
     #[test]

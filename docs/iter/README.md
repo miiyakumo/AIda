@@ -22,4 +22,4 @@ description：确定性指示编译、Skill 安全加载、项目启用配置、
 description：补齐 Alda 到 WAV 的真实产物链、官方手册快照、宿主工具状态机、约束持久化和状态反馈。
 
 [长篇叙事作曲 Agent 困境分析](long-form-composition-agent-diagnosis/README.md)
-description：记录五分钟真实创作运行中的目标坍缩、时间轴误解、状态漂移、证据边界和下一步优化基线。
+description：对比两次五分钟运行、结构机制效果、剩余作曲问题与任务专用角色拆分的触发证据。

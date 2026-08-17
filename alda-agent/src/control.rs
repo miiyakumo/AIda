@@ -24,6 +24,10 @@ enum ControlAction {
     AldaPlay {
         #[serde(default)]
         target: Option<String>,
+        #[serde(default)]
+        section_id: Option<String>,
+        #[serde(default = "default_play_context_secs")]
+        context_secs: u32,
     },
     AldaStop,
     AldaCheck {
@@ -98,9 +102,18 @@ impl ControlAction {
                 }
                 UserAction::Agent(prompt)
             }
-            Self::AldaPlay { target } => {
-                UserAction::Alda(AldaAction::Play(parse_play_target(target.as_deref())?))
-            }
+            Self::AldaPlay {
+                target,
+                section_id,
+                context_secs,
+            } => match section_id {
+                Some(section_id) => UserAction::Alda(AldaAction::PlaySection {
+                    target: parse_play_target(target.as_deref())?,
+                    section_id,
+                    context_secs: context_secs.clamp(5, 15),
+                }),
+                None => UserAction::Alda(AldaAction::Play(parse_play_target(target.as_deref())?)),
+            },
             Self::AldaStop => UserAction::Alda(AldaAction::Stop),
             Self::AldaCheck { target, file } => {
                 let target = match (target.as_deref(), file) {
@@ -164,6 +177,10 @@ impl ControlAction {
         };
         Ok(action)
     }
+}
+
+fn default_play_context_secs() -> u32 {
+    10
 }
 
 fn valid_version(version: u32) -> Result<u32> {
