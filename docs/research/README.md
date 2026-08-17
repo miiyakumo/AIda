@@ -11,3 +11,6 @@ description：DeepSeek Harness 的插件运行时、Agent 循环、会话日志�
 
 [DeepSeek Harness 提示词编写风格](deepseek-harness-prompt-style.md)
 description：分析其操作契约、结构边界、提示词与运行时同源机制，并对照 alda-agent 提出改进建议。
+
+[Coding Agent 市场横向调研](coding-agent-landscape.md)
+description：市面 Coding Agent 的独有功能轴与 memory/goal/subagent 取舍，以及并行只读工具等优先级。

@@ -1,10 +1,11 @@
 # 可组合指示系统首期
 
-> 需求来源：[可组合指示、Skill 与 Agent 角色派生](../../todo/composable-instructions-skills-and-agent-roles.md)
+> 需求来源：渐进式创作闭环的真实使用与后续扩展讨论
 >
 > 方案日期：2026-08-14
 >
-> 状态：代码实施完成，自动化验证通过，待真实模型任务验收
+> 状态：代码实施和自动化验证完成；未实施范围见
+> [Workflow 产物与 Agent 角色派生](../../todo/workflow-artifacts-and-agent-roles.md)
 
 ## 目标
 

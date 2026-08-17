@@ -1,0 +1,44 @@
+(tempo! 168)
+
+# ===== 核心材料 =====
+theme_a  = [o5 c8 e f g a f e c6 d e f e < b4 > e8]
+theme_a2 = [e8 f g a > c d c a g4 f8 e d e < a4]
+group_a  = [theme_a theme_a2]
+counter_b  = [o4 a8 c5 e f e c a4 g8 a b > c b g e4]
+counter_b2 = [< a8 c5 e f g a > c4 < a8 g e d < b4 > e4]
+group_b    = [counter_b counter_b2]
+owl_motif = [o5 c+8 d+ c+ g+ a+ g+4 r8 f+8 g+ a+ g+ d+4]
+bass_a  = [o3 a4 e4 f4 c4 g4 d4 e4 < b4]
+bass_a2 = [a4 e4 f4 c4 g4 d4 a2]
+group_low = [bass_a bass_a2]
+spring_arp = [o4 c8 e g > c8 < g e c4 r8 c8 e g > c8 < g e c4]
+queen_shriek = [o5 c8 d+ c8 d+ c8 d+ c8 g+4]
+
+# ===== 引子+敕令 =====
+midi-flute:      o5 r2 e8 f8 r8 e8 d8 r8 e8 f8 r4 e8 f8 r4
+midi-bassoon:    o3 r2 a2 o3 a4 r4 a4 > e4 r4 a2 r2
+midi-cello:      o3 r2 a2 r2 a2
+midi-trumpet:    r1 r1 o4 a8 > c < a8 f8 e8 d8 e4 r2
+
+# ===== 主题大段 =====
+midi-flute:      [group_a]*45
+midi-cello:      [group_low]*48
+midi-bassoon:    [group_low]*48
+midi-harpsichord:[group_b]*36
+
+# ===== 叙事插段 =====
+midi-harpsichord:[owl_motif]*3 [spring_arp]*3 [owl_motif]*3
+midi-soprano-sax: r1*165 [owl_motif]*3
+midi-harp:        r1*168 [spring_arp]*3
+midi-vibraphone:  r1*168 [spring_arp]*3
+midi-tremolo-strings: r1*170 [queen_shriek]*2
+midi-cello:       o3 c4 g4 a4 e4 f4 c4 g2 r1 r1
+midi-bassoon:     o3 c4 g4 a4 e4 f4 c4 g2 r1 r1
+
+# ===== 凯旋收束 =====
+midi-trumpet:    r1*190 o4 c8 e g > c8 < g e c4 g8 > c e g4 f8 e d c e4 o3 c4 g4 a4 e4 f4 c4 g4 c2
+midi-flute:      o5 c8 e g > c8 < g e c4 g8 > c e g4 f8 e d c e4 c2
+midi-harpsichord:o5 c8 e g > c8 < g e c4 g8 > c e g4 f8 e d c e4 c2
+midi-cello:      o3 c4 g4 a4 e4 f4 c4 g4 c2 r1
+midi-bassoon:    o3 c4 g4 a4 e4 f4 c4 g4 c2
+midi-timpani:    r1*180 o3 c1
