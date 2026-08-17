@@ -2,6 +2,15 @@ use std::time::{Duration, Instant};
 
 const LOCAL_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
+#[must_use]
+pub(crate) const fn install_script() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "scripts/install-macos.sh"
+    } else {
+        "scripts/install-linux.sh"
+    }
+}
+
 struct CheckResult {
     name: &'static str,
     status: CheckStatus,
@@ -35,12 +44,12 @@ fn run_runtime_checks(
 }
 
 fn check_fluidsynth(exec: &impl Fn(&str, &[&str]) -> Option<String>) -> CheckResult {
-    exec("which", &["fluidsynth"]).map_or_else(
+    find_program(exec, "fluidsynth", &["--version"]).map_or_else(
         || CheckResult {
             name: "FluidSynth",
             status: CheckStatus::Fail,
             detail: "未找到 fluidsynth".to_string(),
-            suggestion: Some("运行 scripts/install-linux.sh 安装 FluidSynth".to_string()),
+            suggestion: Some(format!("运行 {} 安装 FluidSynth", install_script())),
         },
         |output| CheckResult {
             name: "FluidSynth",
@@ -57,7 +66,10 @@ fn check_soundfont(find: &impl Fn() -> Option<std::path::PathBuf>) -> CheckResul
             name: "GM SoundFont",
             status: CheckStatus::Fail,
             detail: "未找到 General MIDI SoundFont".to_string(),
-            suggestion: Some("安装 fluid-soundfont-gm，或设置 ALDA_AGENT_SOUNDFONT".to_string()),
+            suggestion: Some(format!(
+                "运行 {}，或设置 ALDA_AGENT_SOUNDFONT",
+                install_script()
+            )),
         },
         |path| CheckResult {
             name: "GM SoundFont",
@@ -86,7 +98,15 @@ fn check_rust(exec: &impl Fn(&str, &[&str]) -> Option<String>) -> CheckResult {
 }
 
 fn check_java(exec: &impl Fn(&str, &[&str]) -> Option<String>) -> CheckResult {
-    match exec("java", &["-version"]) {
+    let output = exec("java", &["-version"]).or_else(|| {
+        [
+            "/opt/homebrew/opt/openjdk/bin/java",
+            "/usr/local/opt/openjdk/bin/java",
+        ]
+        .into_iter()
+        .find_map(|path| exec(path, &["-version"]))
+    });
+    match output {
         Some(output) => {
             let first_line = output.lines().next().unwrap_or("");
             let parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -108,49 +128,52 @@ fn check_java(exec: &impl Fn(&str, &[&str]) -> Option<String>) -> CheckResult {
             name: "Java 运行环境",
             status: CheckStatus::Fail,
             detail: "未找到 java".to_string(),
-            suggestion: Some("运行 scripts/install-linux.sh 或安装 OpenJDK 21+".to_string()),
+            suggestion: Some(format!("运行 {} 或安装 OpenJDK 21+", install_script())),
         },
     }
 }
 
 fn check_alda(exec: &impl Fn(&str, &[&str]) -> Option<String>) -> CheckResult {
-    if let Some(path) = exec("which", &["alda"]) {
-        let path = path.trim().to_string();
-        if !path.is_empty() {
-            return CheckResult {
-                name: "Alda",
-                status: CheckStatus::Pass,
-                detail: path,
-                suggestion: None,
-            };
-        }
-    }
-
-    for dir in [
-        "/usr/local/bin",
-        "/usr/bin",
-        "/opt/homebrew/bin",
-        "/home/linuxbrew/.linuxbrew/bin",
-    ] {
-        let full = format!("{dir}/alda");
-        if std::path::Path::new(&full).exists() {
-            return CheckResult {
-                name: "Alda",
-                status: CheckStatus::Pass,
-                detail: full,
-                suggestion: None,
-            };
-        }
+    if let Some(path) = find_program(exec, "alda", &["version"]) {
+        return CheckResult {
+            name: "Alda",
+            status: CheckStatus::Pass,
+            detail: path,
+            suggestion: None,
+        };
     }
 
     CheckResult {
         name: "Alda",
         status: CheckStatus::Fail,
         detail: "未找到 alda".to_string(),
-        suggestion: Some(
-            "运行 scripts/install-linux.sh 或访问 https://alda.io/install".to_string(),
-        ),
+        suggestion: Some(format!(
+            "运行 {} 或访问 https://alda.io/install",
+            install_script()
+        )),
     }
+}
+
+fn find_program(
+    exec: &impl Fn(&str, &[&str]) -> Option<String>,
+    name: &str,
+    probe_args: &[&str],
+) -> Option<String> {
+    if let Some(path) = exec("which", &[name]) {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Some(path.to_string());
+        }
+    }
+    [
+        "/usr/local/bin",
+        "/usr/bin",
+        "/opt/homebrew/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+    ]
+    .into_iter()
+    .map(|dir| format!("{dir}/{name}"))
+    .find(|path| exec(path, probe_args).is_some())
 }
 
 pub async fn run(
@@ -183,8 +206,9 @@ pub fn require_runtime() -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "运行环境不完整，未启动 Alda Agent：{}。请先运行 scripts/install-linux.sh 安装依赖，再用 `alda-agent doctor` 验证",
-        missing.join("、")
+        "运行环境不完整，未启动 Alda Agent：{}。请先运行 {} 安装依赖，再用 `alda-agent doctor` 验证",
+        missing.join("、"),
+        install_script()
     )
 }
 

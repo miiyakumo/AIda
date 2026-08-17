@@ -119,13 +119,18 @@ Project 与进程内能力状态派生，不是新的事实来源。
 
 Java、Alda、FluidSynth 与 General MIDI SoundFont 是启动 REPL、`control` 或 `compose` 的统一运行时
 前置条件。Shell 在选择或创建项目、读取 compose stdin、进入 UI 之前一次检查全部四项；任一项不可发现
-就拒绝启动，并提示先运行 `scripts/install-linux.sh` 后用 `alda-agent doctor` 验证。外部探测命令各自
+就拒绝启动，并按当前平台提示运行 `scripts/install-linux.sh` 或 `scripts/install-macos.sh`，再用
+`alda-agent doctor` 验证。外部探测命令各自
 限制为 3 秒，命令阻塞或超时按依赖不可用处理，不会卡住启动过程。`projects` 和
 `doctor` 本身不受门禁限制，缺少依赖时仍可列项目和诊断环境。Rust 只用于从源码构建，不是已编译程序的
 运行时门禁。
 
-Linux 安装脚本在应用启动前安装或检查四项运行时依赖，可用 `ALDA_AGENT_SOUNDFONT` 指向非标准
-SoundFont。`doctor` 还报告源码构建所需的 Rust 工具链；Alda probe 会真实执行 Alda → MIDI → WAV，
+Linux 与 macOS 安装脚本在应用启动前安装或检查四项运行时依赖，可用 `--check` 执行无安装检查，或用
+`ALDA_AGENT_SOUNDFONT` 指向非标准 SoundFont。macOS 脚本通过 Homebrew 安装 Alda、OpenJDK 依赖与
+FluidSynth，不使用 sudo；GeneralUser GS 固定到上游 commit 和 SHA-256，默认安装到
+`~/Library/Application Support/alda-agent/soundfonts/GeneralUser-GS.sf2`，设置 `XDG_DATA_HOME` 时改用
+其下的 `alda-agent/soundfonts`。运行时同时发现 Apple Silicon `/opt/homebrew`、Intel `/usr/local` 与上述
+SoundFont 路径。`doctor` 还报告源码构建所需的 Rust 工具链；Alda probe 会真实执行 Alda → MIDI → WAV，
 并拒绝零帧或静音 WAV。
 
 模型配置完整性、最近模型服务状态和对话请求状态彼此独立。限流、认证、网络或模型拒绝不会把完整配置

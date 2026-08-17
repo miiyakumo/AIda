@@ -58,11 +58,16 @@ pub struct AudioRenderer {
 
 impl AudioRenderer {
     pub fn discover() -> Result<Self> {
-        let fluidsynth_path = find_program("fluidsynth")
-            .ok_or_else(|| anyhow::anyhow!("未找到 fluidsynth；请运行 scripts/install-linux.sh"))?;
+        let fluidsynth_path = find_program("fluidsynth").ok_or_else(|| {
+            anyhow::anyhow!(
+                "未找到 fluidsynth；请运行 {}",
+                crate::doctor::install_script()
+            )
+        })?;
         let soundfont_path = find_soundfont().ok_or_else(|| {
             anyhow::anyhow!(
-                "未找到 General MIDI SoundFont；请安装 fluid-soundfont-gm，或设置 ALDA_AGENT_SOUNDFONT"
+                "未找到 General MIDI SoundFont；请运行 {}，或设置 ALDA_AGENT_SOUNDFONT",
+                crate::doctor::install_script()
             )
         })?;
         Ok(Self {
@@ -369,25 +374,54 @@ fn find_program(name: &str) -> Option<PathBuf> {
         .into_iter()
         .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
         .map(|dir| dir.join(name))
+        .chain(
+            ["/opt/homebrew/bin", "/usr/local/bin"]
+                .into_iter()
+                .map(|dir| Path::new(dir).join(name)),
+        )
         .find(|path| path.is_file())
 }
 
 #[must_use]
 pub fn find_soundfont() -> Option<PathBuf> {
-    let configured = std::env::var_os("ALDA_AGENT_SOUNDFONT").map(PathBuf::from);
-    configured
+    soundfont_candidates(
+        std::env::var_os("ALDA_AGENT_SOUNDFONT"),
+        std::env::var_os("HOME"),
+        std::env::var_os("XDG_DATA_HOME"),
+    )
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+fn soundfont_candidates(
+    configured: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    xdg_data_home: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = configured {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(path) = xdg_data_home {
+        candidates.push(PathBuf::from(path).join("alda-agent/soundfonts/GeneralUser-GS.sf2"));
+    }
+    if let Some(path) = home {
+        candidates.push(
+            PathBuf::from(path)
+                .join("Library/Application Support/alda-agent/soundfonts/GeneralUser-GS.sf2"),
+        );
+    }
+    candidates.extend(
+        [
+            "/usr/share/soundfonts/FluidR3_GM.sf2",
+            "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+            "/usr/share/soundfonts/default.sf2",
+            "/usr/local/share/soundfonts/FluidR3_GM.sf2",
+        ]
         .into_iter()
-        .chain(
-            [
-                "/usr/share/soundfonts/FluidR3_GM.sf2",
-                "/usr/share/sounds/sf2/FluidR3_GM.sf2",
-                "/usr/share/soundfonts/default.sf2",
-                "/usr/local/share/soundfonts/FluidR3_GM.sf2",
-            ]
-            .into_iter()
-            .map(PathBuf::from),
-        )
-        .find(|path| path.is_file())
+        .map(PathBuf::from),
+    );
+    candidates
 }
 
 #[cfg(test)]
@@ -401,6 +435,27 @@ mod tests {
         assert!(
             (actual - expected).abs() < 0.001,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn includes_macos_and_xdg_soundfont_locations() {
+        let candidates = soundfont_candidates(
+            Some("/configured.sf2".into()),
+            Some("/Users/test".into()),
+            Some("/tmp/data".into()),
+        );
+
+        assert_eq!(candidates[0], PathBuf::from("/configured.sf2"));
+        assert_eq!(
+            candidates[1],
+            PathBuf::from("/tmp/data/alda-agent/soundfonts/GeneralUser-GS.sf2")
+        );
+        assert_eq!(
+            candidates[2],
+            PathBuf::from(
+                "/Users/test/Library/Application Support/alda-agent/soundfonts/GeneralUser-GS.sf2"
+            )
         );
     }
 
