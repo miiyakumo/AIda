@@ -1,6 +1,8 @@
 use crate::instructions::DurationConstraint;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -19,11 +21,12 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Deserialize)]
 struct ParseOutput {
     events: Vec<Event>,
-    parts: std::collections::HashMap<String, Part>,
+    parts: HashMap<String, Part>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Event {
+    part: String,
     offset: f64,
     #[serde(rename = "audible-duration")]
     audible_duration: f64,
@@ -52,6 +55,38 @@ pub struct ScoreInfo {
     pub instruments: Vec<String>,
     /// tempo
     pub tempo: f64,
+    /// 各声部时间范围与全局事件空档，仅用于诊断，不参与候选通过/失败判断。
+    pub timeline: TimelineDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PartTimeline {
+    pub part: String,
+    pub first_event_ms: f64,
+    pub last_event_ms: f64,
+    pub event_count: usize,
+    pub sounding_ms: f64,
+    pub max_silent_gap_ms: f64,
+    pub coverage_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EventGap {
+    pub start_ms: f64,
+    pub end_ms: f64,
+    pub duration_ms: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TimelineDiagnostics {
+    pub parts: Vec<PartTimeline>,
+    pub ending_parts: Vec<String>,
+    /// 全曲结尾与第二晚结束声部之间的差值；单声部或并列结束时为 0。
+    pub ending_tail_ms: f64,
+    /// 按时间顺序排列的全局事件空档。
+    pub event_gaps: Vec<EventGap>,
+    pub total_event_gap_ms: f64,
+    pub event_gap_ratio: f64,
 }
 
 /// 检查项结果
@@ -106,6 +141,305 @@ impl std::fmt::Display for CheckStatus {
             CheckStatus::Unchecked => write!(f, "未检查"),
         }
     }
+}
+
+const GLOBAL_EVENT_GAP_TOLERANCE_MS: f64 = 150.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerKind {
+    Definition,
+    Reference,
+}
+
+#[derive(Debug, Clone)]
+struct MarkerOccurrence {
+    name: String,
+    kind: MarkerKind,
+    line: usize,
+    order: usize,
+}
+
+#[derive(Debug, Default)]
+struct MarkerAnalysis {
+    definition_count: usize,
+    reference_count: usize,
+    errors: Vec<String>,
+}
+
+fn analyze_markers(source: &str) -> MarkerAnalysis {
+    let occurrences = scan_markers(source);
+    let mut definitions: BTreeMap<&str, Vec<&MarkerOccurrence>> = BTreeMap::new();
+    let mut references = Vec::new();
+
+    for occurrence in &occurrences {
+        match occurrence.kind {
+            MarkerKind::Definition => definitions
+                .entry(&occurrence.name)
+                .or_default()
+                .push(occurrence),
+            MarkerKind::Reference => references.push(occurrence),
+        }
+    }
+
+    let mut errors = Vec::new();
+    for (name, placements) in &definitions {
+        if placements.len() > 1 {
+            let lines = placements
+                .iter()
+                .map(|placement| placement.line.to_string())
+                .collect::<Vec<_>>()
+                .join("、");
+            errors.push(format!("标记 %{name} 重复定义于第 {lines} 行"));
+        }
+    }
+
+    for reference in &references {
+        match definitions.get(reference.name.as_str()) {
+            None => errors.push(format!(
+                "标记 @{} 在第 {} 行引用但未定义",
+                reference.name, reference.line
+            )),
+            Some(placements) if placements[0].order > reference.order => errors.push(format!(
+                "标记 @{} 在第 {} 行先引用，后在第 {} 行定义",
+                reference.name, reference.line, placements[0].line
+            )),
+            Some(_) => {}
+        }
+    }
+
+    MarkerAnalysis {
+        definition_count: definitions.values().map(Vec::len).sum(),
+        reference_count: references.len(),
+        errors,
+    }
+}
+
+fn scan_markers(source: &str) -> Vec<MarkerOccurrence> {
+    let bytes = source.as_bytes();
+    let mut occurrences = Vec::new();
+    let mut index = 0;
+    let mut line = 1;
+    let mut in_comment = false;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\n' {
+            line += 1;
+            in_comment = false;
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if in_comment {
+            index += 1;
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'#' {
+            in_comment = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'%' | b'@') {
+            let start = index + 1;
+            let mut end = start;
+            while end < bytes.len() && is_marker_name_byte(bytes[end]) {
+                end += 1;
+            }
+            if end > start {
+                occurrences.push(MarkerOccurrence {
+                    name: source[start..end].to_owned(),
+                    kind: if byte == b'%' {
+                        MarkerKind::Definition
+                    } else {
+                        MarkerKind::Reference
+                    },
+                    line,
+                    order: index,
+                });
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    occurrences
+}
+
+fn is_marker_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'\'' | b'(' | b')')
+}
+
+fn marker_check(score_path: &Path) -> AldaCheck {
+    match fs::read_to_string(score_path) {
+        Err(error) => AldaCheck {
+            name: "标记",
+            status: CheckStatus::Fail,
+            detail: format!("无法读取乐谱以检查标记：{error}"),
+        },
+        Ok(source) => {
+            let analysis = analyze_markers(&source);
+            if analysis.errors.is_empty() {
+                AldaCheck {
+                    name: "标记",
+                    status: CheckStatus::Pass,
+                    detail: format!(
+                        "{} 个定义，{} 个引用；定义唯一且引用顺序有效",
+                        analysis.definition_count, analysis.reference_count
+                    ),
+                }
+            } else {
+                AldaCheck {
+                    name: "标记",
+                    status: CheckStatus::Fail,
+                    detail: analysis.errors.join("；"),
+                }
+            }
+        }
+    }
+}
+
+fn analyze_events(parsed: &ParseOutput) -> Result<(f64, TimelineDiagnostics)> {
+    let mut by_part: BTreeMap<&str, Vec<(f64, f64)>> = BTreeMap::new();
+    let mut all_intervals = Vec::with_capacity(parsed.events.len());
+
+    for (index, event) in parsed.events.iter().enumerate() {
+        if !event.offset.is_finite() || event.offset < 0.0 {
+            bail!("事件 {} 的 offset 必须是有限且非负的数值", index + 1);
+        }
+        if !event.audible_duration.is_finite() || event.audible_duration < 0.0 {
+            bail!(
+                "事件 {} 的 audible-duration 必须是有限且非负的数值",
+                index + 1
+            );
+        }
+        if !parsed.parts.contains_key(&event.part) {
+            bail!("事件 {} 引用了不存在的声部 {:?}", index + 1, event.part);
+        }
+        let end = event.offset + event.audible_duration;
+        if !end.is_finite() {
+            bail!("事件 {} 的结束时间不是有限数值", index + 1);
+        }
+        let interval = (event.offset, end);
+        by_part.entry(&event.part).or_default().push(interval);
+        all_intervals.push(interval);
+    }
+
+    let duration_ms = all_intervals
+        .iter()
+        .map(|(_, end)| *end)
+        .fold(0.0_f64, f64::max);
+    let mut parts = Vec::with_capacity(by_part.len());
+    for (part, intervals) in by_part {
+        let event_count = intervals.len();
+        let merged = merge_intervals(intervals, 0.0);
+        let first_event_ms = merged.first().map_or(0.0, |(start, _)| *start);
+        let last_event_ms = merged.last().map_or(0.0, |(_, end)| *end);
+        let sounding_ms: f64 = merged.iter().map(|(start, end)| end - start).sum();
+        let max_silent_gap_ms = merged
+            .windows(2)
+            .map(|pair| pair[1].0 - pair[0].1)
+            .fold(0.0_f64, f64::max);
+        let span_ms = last_event_ms - first_event_ms;
+        let coverage_ratio = if span_ms > 0.0 {
+            (sounding_ms / span_ms).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        parts.push(PartTimeline {
+            part: part.to_owned(),
+            first_event_ms,
+            last_event_ms,
+            event_count,
+            sounding_ms,
+            max_silent_gap_ms,
+            coverage_ratio,
+        });
+    }
+
+    let ending_parts = parts
+        .iter()
+        .filter(|part| (part.last_event_ms - duration_ms).abs() <= 0.001)
+        .map(|part| part.part.clone())
+        .collect();
+    let mut part_endings = parts
+        .iter()
+        .map(|part| part.last_event_ms)
+        .collect::<Vec<_>>();
+    part_endings.sort_by(|left, right| right.total_cmp(left));
+    let ending_tail_ms = part_endings
+        .get(1)
+        .map_or(0.0, |second| (duration_ms - second).max(0.0));
+    let merged_global = merge_intervals(all_intervals, GLOBAL_EVENT_GAP_TOLERANCE_MS);
+    let mut event_gaps = Vec::new();
+    if let Some((first_start, _)) = merged_global.first()
+        && *first_start > GLOBAL_EVENT_GAP_TOLERANCE_MS
+    {
+        event_gaps.push(EventGap {
+            start_ms: 0.0,
+            end_ms: *first_start,
+            duration_ms: *first_start,
+        });
+    }
+    event_gaps.extend(merged_global.windows(2).map(|pair| EventGap {
+        start_ms: pair[0].1,
+        end_ms: pair[1].0,
+        duration_ms: pair[1].0 - pair[0].1,
+    }));
+    let total_event_gap_ms = event_gaps.iter().map(|gap| gap.duration_ms).sum();
+    let event_gap_ratio = if duration_ms > 0.0 {
+        total_event_gap_ms / duration_ms
+    } else {
+        0.0
+    };
+
+    Ok((
+        duration_ms,
+        TimelineDiagnostics {
+            parts,
+            ending_parts,
+            ending_tail_ms,
+            event_gaps,
+            total_event_gap_ms,
+            event_gap_ratio,
+        },
+    ))
+}
+
+fn merge_intervals(mut intervals: Vec<(f64, f64)>, tolerance_ms: f64) -> Vec<(f64, f64)> {
+    intervals.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.total_cmp(&right.1))
+    });
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        match merged.last_mut() {
+            Some((_, previous_end)) if start <= *previous_end + tolerance_ms => {
+                *previous_end = previous_end.max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 // ============================================================
@@ -175,12 +509,7 @@ impl AldaRunner {
         let parsed: ParseOutput =
             serde_json::from_str(&output).context("无法解析 alda parse 输出为 JSON")?;
 
-        // 计算时长：max(offset + audible_duration)
-        let duration_ms = parsed
-            .events
-            .iter()
-            .map(|e| e.offset + e.audible_duration)
-            .fold(0.0_f64, f64::max);
+        let (duration_ms, timeline) = analyze_events(&parsed).context("Alda 事件数据无效")?;
 
         let part_count = parsed.parts.len();
         let event_count = parsed.events.len();
@@ -200,6 +529,7 @@ impl AldaRunner {
             event_count,
             instruments,
             tempo,
+            timeline,
         })
     }
 
@@ -258,6 +588,7 @@ impl AldaRunner {
         duration_tolerance_pct: f64,
     ) -> Vec<AldaCheck> {
         let mut checks = Vec::new();
+        let markers = marker_check(score_path);
 
         let info = match self.parse(score_path) {
             Ok(info) => info,
@@ -267,6 +598,7 @@ impl AldaRunner {
                     status: CheckStatus::Fail,
                     detail: format!("{e}"),
                 });
+                checks.push(markers);
                 // 语法失败则后续检查跳过
                 checks.push(AldaCheck {
                     name: "时长",
@@ -288,6 +620,7 @@ impl AldaRunner {
             status: CheckStatus::Pass,
             detail: "解析成功".into(),
         });
+        checks.push(markers);
 
         // Alda 会接受空文件，因此解析成功后仍需验证作品确实可播放。
         if info.part_count == 0 || info.event_count == 0 || info.duration_ms <= 0.0 {
@@ -311,6 +644,41 @@ impl AldaRunner {
                 ),
             });
         }
+
+        let endings = if info.timeline.ending_parts.is_empty() {
+            "无".to_string()
+        } else {
+            info.timeline.ending_parts.join("、")
+        };
+        let gaps = if info.timeline.event_gaps.is_empty() {
+            "无超过 150ms 的全局事件空档".to_string()
+        } else {
+            let mut longest = info.timeline.event_gaps.iter().collect::<Vec<_>>();
+            longest.sort_by(|left, right| right.duration_ms.total_cmp(&left.duration_ms));
+            longest
+                .into_iter()
+                .take(3)
+                .map(|gap| {
+                    format!(
+                        "{:.1}–{:.1}秒（{:.1}秒）",
+                        gap.start_ms / 1000.0,
+                        gap.end_ms / 1000.0,
+                        gap.duration_ms / 1000.0
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("，")
+        };
+        checks.push(AldaCheck {
+            name: "声部时间轴/事件空档",
+            status: CheckStatus::Unchecked,
+            detail: format!(
+                "{} 个有事件声部；决定结尾：{endings}；结尾尾差 {:.1}秒；事件空档占比 {:.1}%；{gaps}",
+                info.timeline.parts.len(),
+                info.timeline.ending_tail_ms / 1000.0,
+                info.timeline.event_gap_ratio * 100.0,
+            ),
+        });
 
         // 2. 时长检查
         if let Some(target) = target_duration {
@@ -654,6 +1022,9 @@ mod tests {
 
     const SIMPLE_JSON: &str = r#"{"events":[{"offset":0,"duration":500,"audible-duration":450,"midi-note":60,"part":"piano"},{"offset":500,"duration":500,"audible-duration":450,"midi-note":62,"part":"piano"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
     const MULTI_JSON: &str = r#"{"events":[{"offset":0,"duration":500,"audible-duration":450,"midi-note":60,"part":"piano"},{"offset":0,"duration":500,"audible-duration":450,"midi-note":69,"part":"violin"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120},"violin":{"name":"violin","stock-instrument":"midi-violin","tempo":120}}}"#;
+    const TIMELINE_JSON: &str = r#"{"events":[{"offset":5000,"audible-duration":1000,"part":"piano"},{"offset":0,"audible-duration":1000,"part":"piano"},{"offset":3000,"audible-duration":500,"part":"flute"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120},"flute":{"stock-instrument":"midi-flute","tempo":120}}}"#;
+    const INVALID_TIME_JSON: &str = r#"{"events":[{"offset":-1,"audible-duration":100,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
+    const UNKNOWN_PART_JSON: &str = r#"{"events":[{"offset":0,"audible-duration":100,"part":"missing"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
     const EMPTY_JSON: &str = r#"{"events":[],"parts":{}}"#;
 
     fn runner() -> (tempfile::TempDir, AldaRunner) {
@@ -668,6 +1039,9 @@ if [ "$command" = "parse" ]; then
     *slow.alda) sleep 2 ;;
     *invalid_syntax.alda|*invalid_instrument.alda) echo "invalid score" >&2; exit 1 ;;
     *empty.alda) printf '%s\n' '{EMPTY_JSON}' ;;
+    *invalid_time_event.alda) printf '%s\n' '{INVALID_TIME_JSON}' ;;
+    *unknown_part_event.alda) printf '%s\n' '{UNKNOWN_PART_JSON}' ;;
+    *timeline.alda) printf '%s\n' '{TIMELINE_JSON}' ;;
     *valid_multi_part.alda) printf '%s\n' '{MULTI_JSON}' ;;
     *) printf '%s\n' '{SIMPLE_JSON}' ;;
   esac
@@ -701,6 +1075,26 @@ fi
             .join(name)
     }
 
+    fn score_file(directory: &tempfile::TempDir, name: &str, source: &str) -> PathBuf {
+        let path = directory.path().join(name);
+        fs::write(&path, source).unwrap();
+        path
+    }
+
+    fn part(stock_instrument: &str) -> Part {
+        Part {
+            stock_instrument: stock_instrument.to_string(),
+            tempo: 120.0,
+        }
+    }
+
+    fn assert_approx(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1.0e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
     #[test]
     fn test_parse_valid_simple() {
         let (_directory, runner) = runner();
@@ -716,6 +1110,154 @@ fi
         let info = runner.parse(&fixture("valid_multi_part.alda")).unwrap();
         assert_eq!(info.part_count, 2);
         assert!(info.instruments.len() == 2);
+    }
+
+    #[test]
+    fn timeline_merges_overlapping_unsorted_events() {
+        let parsed = ParseOutput {
+            events: vec![
+                Event {
+                    part: "piano".into(),
+                    offset: 1_000.0,
+                    audible_duration: 500.0,
+                },
+                Event {
+                    part: "piano".into(),
+                    offset: 0.0,
+                    audible_duration: 800.0,
+                },
+                Event {
+                    part: "piano".into(),
+                    offset: 700.0,
+                    audible_duration: 500.0,
+                },
+            ],
+            parts: HashMap::from([("piano".into(), part("midi-piano"))]),
+        };
+
+        let (duration, diagnostics) = analyze_events(&parsed).unwrap();
+        assert_approx(duration, 1_500.0);
+        assert_eq!(diagnostics.ending_parts, ["piano"]);
+        let piano = &diagnostics.parts[0];
+        assert_approx(piano.first_event_ms, 0.0);
+        assert_approx(piano.last_event_ms, 1_500.0);
+        assert_eq!(piano.event_count, 3);
+        assert_approx(piano.sounding_ms, 1_500.0);
+        assert_approx(piano.max_silent_gap_ms, 0.0);
+        assert_approx(piano.coverage_ratio, 1.0);
+        assert_approx(diagnostics.ending_tail_ms, 0.0);
+        assert!(diagnostics.event_gaps.is_empty());
+        assert_approx(diagnostics.total_event_gap_ms, 0.0);
+        assert_approx(diagnostics.event_gap_ratio, 0.0);
+    }
+
+    #[test]
+    fn late_entry_and_long_rests_are_diagnostics_not_failures() {
+        let (directory, runner) = runner();
+        let path = score_file(
+            &directory,
+            "timeline.alda",
+            "piano: c1 r1~1~1~1 c1\nflute: r1~1~1 c2",
+        );
+        let info = runner.parse(&path).unwrap();
+        assert_eq!(info.timeline.parts.len(), 2);
+        assert_eq!(info.timeline.ending_parts, ["piano"]);
+        assert_approx(info.timeline.ending_tail_ms, 2_500.0);
+        assert_eq!(info.timeline.event_gaps.len(), 2);
+        assert_approx(info.timeline.event_gaps[0].duration_ms, 2_000.0);
+        assert_approx(info.timeline.event_gaps[1].duration_ms, 1_500.0);
+        assert_approx(info.timeline.total_event_gap_ms, 3_500.0);
+        assert_approx(info.timeline.event_gap_ratio, 3_500.0 / 6_000.0);
+
+        let checks = runner.validate(&path, &[], &[], None, 10.0);
+        assert!(!checks.iter().any(|check| check.status == CheckStatus::Fail));
+        let timeline = checks
+            .iter()
+            .find(|check| check.name == "声部时间轴/事件空档")
+            .unwrap();
+        assert_eq!(timeline.status, CheckStatus::Unchecked);
+        assert!(timeline.detail.contains("piano"));
+    }
+
+    #[test]
+    fn invalid_event_times_and_unknown_parts_are_rejected() {
+        for event in [
+            Event {
+                part: "piano".into(),
+                offset: f64::NAN,
+                audible_duration: 100.0,
+            },
+            Event {
+                part: "piano".into(),
+                offset: 0.0,
+                audible_duration: -1.0,
+            },
+            Event {
+                part: "missing".into(),
+                offset: 0.0,
+                audible_duration: 100.0,
+            },
+        ] {
+            let parsed = ParseOutput {
+                events: vec![event],
+                parts: HashMap::from([("piano".into(), part("midi-piano"))]),
+            };
+            assert!(analyze_events(&parsed).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_rejects_invalid_event_data_from_alda_output() {
+        let (directory, runner) = runner();
+        let invalid_time = score_file(&directory, "invalid_time_event.alda", "piano: c1");
+        let unknown_part = score_file(&directory, "unknown_part_event.alda", "piano: c1");
+
+        let time_error = format!("{:#}", runner.parse(&invalid_time).unwrap_err());
+        assert!(time_error.contains("offset"), "{time_error}");
+        let part_error = format!("{:#}", runner.parse(&unknown_part).unwrap_err());
+        assert!(part_error.contains("不存在的声部"), "{part_error}");
+    }
+
+    #[test]
+    fn marker_scanner_allows_one_definition_and_multiple_references() {
+        let analysis = analyze_markers(
+            "# %ignored @ignored\npiano \"alias-%ignored\": r1 %theme\nflute: @theme c1\noboe: @theme e1",
+        );
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        assert_eq!(analysis.definition_count, 1);
+        assert_eq!(analysis.reference_count, 2);
+    }
+
+    #[test]
+    fn marker_scanner_rejects_duplicate_undefined_and_forward_references() {
+        let duplicate = analyze_markers("piano: %theme c1\nflute: %theme e1");
+        assert!(duplicate.errors[0].contains("%theme"));
+        assert!(duplicate.errors[0].contains("第 1、2 行"));
+
+        let undefined = analyze_markers("piano: @missing c1");
+        assert!(undefined.errors[0].contains("@missing"));
+        assert!(undefined.errors[0].contains("第 1 行"));
+        assert!(undefined.errors[0].contains("未定义"));
+
+        let forward = analyze_markers("piano: @later c1\nflute: r1 %later");
+        assert!(forward.errors[0].contains("@later"));
+        assert!(forward.errors[0].contains("第 1 行"));
+        assert!(forward.errors[0].contains("第 2 行"));
+    }
+
+    #[test]
+    fn marker_errors_are_hard_validation_failures() {
+        let (directory, runner) = runner();
+        let path = score_file(
+            &directory,
+            "markers.alda",
+            "piano: %theme c1\nflute: %theme e1",
+        );
+        let checks = runner.validate(&path, &[], &[], None, 10.0);
+        let markers = checks.iter().find(|check| check.name == "标记").unwrap();
+        assert_eq!(markers.status, CheckStatus::Fail);
+        assert!(markers.detail.contains("%theme"));
+        assert!(markers.detail.contains("第 1、2 行"));
     }
 
     #[test]
