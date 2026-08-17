@@ -83,7 +83,7 @@ fn inspect_alda_source_tool() -> Tool {
         ty: "function".to_string(),
         function: FunctionDef {
             name: "inspect_alda_source".to_string(),
-            description: "真实解析尚未提交的 Alda 临时源码，返回总时长、各声部结束时间和事件数，并分开报告硬失败与诊断。fragment 只检查局部材料且不保留；candidate 使用项目完整约束并作为故障恢复检查点，但不会保存工作乐谱、渲染或计作正式提交。".to_string(),
+            description: "真实解析尚未提交的 Alda 临时源码，返回总时长、Marker 实际位置、各声部结束时间和事件数，并分开报告硬失败与诊断。fragment 只检查局部材料且不保留；candidate 使用项目完整约束并作为故障恢复检查点，但不会保存工作乐谱、渲染或计作正式提交。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -267,6 +267,7 @@ fn oversized_source_inspection(source: &str, scope: &str, candidate: bool) -> Mo
         "scope": scope,
         "parse_ok": false,
         "duration_secs": null,
+        "markers": [],
         "parts": [],
         "hard_failures": [{
             "name": "源码大小",
@@ -1260,11 +1261,26 @@ impl Agent {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let markers = info
+            .as_ref()
+            .map(|info| {
+                info.markers
+                    .iter()
+                    .map(|marker| {
+                        serde_json::json!({
+                            "name": marker.name,
+                            "offset_secs": marker.offset_ms / 1000.0
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         let content = serde_json::json!({
             "scope": scope,
             "parse_ok": parse_ok,
             "duration_secs": duration_secs,
+            "markers": markers,
             "parts": parts,
             "hard_failures": hard_failures,
             "diagnostics": diagnostics
@@ -1989,7 +2005,7 @@ mod tests {
         let executable = directory.path().join("alda");
         let short = r#"{"events":[{"offset":0,"audible-duration":1000,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
         let closer = r#"{"events":[{"offset":0,"audible-duration":2000,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
-        let target = r#"{"events":[{"offset":0,"audible-duration":3000,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
+        let target = r#"{"markers":{"theme":1500,"intro":0},"events":[{"offset":0,"audible-duration":3000,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n  parse)\n    if grep -q syntax_bad \"$3\"; then echo invalid >&2; exit 1\n    elif grep -q closer \"$3\"; then printf '%s\\n' '{closer}'\n    elif grep -q target \"$3\"; then printf '%s\\n' '{target}'\n    else printf '%s\\n' '{short}'\n    fi ;;\n  export) printf midi > \"$5\" ;;\n  play|stop) exit 0 ;;\n  *) exit 1 ;;\nesac\n"
         );
@@ -2913,6 +2929,13 @@ mod tests {
         let valid: serde_json::Value = serde_json::from_str(&valid.content).unwrap();
         assert_eq!(valid["parse_ok"], true);
         assert_eq!(valid["duration_secs"], 3.0);
+        assert_eq!(
+            valid["markers"],
+            serde_json::json!([
+                {"name": "intro", "offset_secs": 0.0},
+                {"name": "theme", "offset_secs": 1.5}
+            ])
+        );
         assert_eq!(valid["parts"][0]["name"], "piano");
         assert_eq!(valid["parts"][0]["end_secs"], 3.0);
         assert_eq!(valid["parts"][0]["event_count"], 1);
@@ -2939,6 +2962,7 @@ mod tests {
         let invalid: serde_json::Value = serde_json::from_str(&invalid.content).unwrap();
         assert_eq!(invalid["parse_ok"], false);
         assert!(invalid["duration_secs"].is_null());
+        assert_eq!(invalid["markers"], serde_json::json!([]));
         assert!(
             invalid["hard_failures"]
                 .as_array()
@@ -2961,6 +2985,7 @@ mod tests {
             .unwrap();
         let oversized: serde_json::Value = serde_json::from_str(&oversized.content).unwrap();
         assert_eq!(oversized["parse_ok"], false);
+        assert_eq!(oversized["markers"], serde_json::json!([]));
         assert_eq!(oversized["hard_failures"][0]["name"], "源码大小");
         assert!(
             oversized["hard_failures"][0]["detail"]

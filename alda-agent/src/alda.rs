@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 struct ParseOutput {
     #[serde(default)]
     aliases: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    markers: BTreeMap<String, f64>,
     events: Vec<Event>,
     parts: HashMap<String, Part>,
 }
@@ -59,8 +61,16 @@ pub struct ScoreInfo {
     pub instruments: Vec<String>,
     /// tempo
     pub tempo: f64,
+    /// 按实际时间排序的 Alda Marker。
+    pub markers: Vec<ScoreMarker>,
     /// 各声部时间范围与全局事件空档，仅用于诊断，不参与候选通过/失败判断。
     pub timeline: TimelineDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScoreMarker {
+    pub name: String,
+    pub offset_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -91,6 +101,27 @@ pub struct TimelineDiagnostics {
     pub event_gaps: Vec<EventGap>,
     pub total_event_gap_ms: f64,
     pub event_gap_ratio: f64,
+}
+
+fn parse_score_markers(markers: &BTreeMap<String, f64>) -> Result<Vec<ScoreMarker>> {
+    let mut parsed = markers
+        .iter()
+        .map(|(name, &offset_ms)| {
+            if !offset_ms.is_finite() || offset_ms < 0.0 {
+                bail!("Marker {name:?} 的 offset 必须是非负有限数，实际为 {offset_ms}");
+            }
+            Ok(ScoreMarker {
+                name: name.clone(),
+                offset_ms,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    parsed.sort_by(|left, right| {
+        left.offset_ms
+            .total_cmp(&right.offset_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(parsed)
 }
 
 /// 检查项结果
@@ -545,6 +576,7 @@ impl AldaRunner {
             serde_json::from_str(&output).context("无法解析 alda parse 输出为 JSON")?;
 
         let (duration_ms, timeline) = analyze_events(&parsed).context("Alda 事件数据无效")?;
+        let markers = parse_score_markers(&parsed.markers).context("Alda Marker 数据无效")?;
 
         let part_count = parsed.parts.len();
         let event_count = parsed.events.len();
@@ -564,6 +596,7 @@ impl AldaRunner {
             event_count,
             instruments,
             tempo,
+            markers,
             timeline,
         })
     }
@@ -1055,7 +1088,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    const SIMPLE_JSON: &str = r#"{"events":[{"offset":0,"duration":500,"audible-duration":450,"midi-note":60,"part":"piano"},{"offset":500,"duration":500,"audible-duration":450,"midi-note":62,"part":"piano"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
+    const SIMPLE_JSON: &str = r#"{"markers":{"theme":1500,"intro":0},"events":[{"offset":0,"duration":500,"audible-duration":450,"midi-note":60,"part":"piano"},{"offset":500,"duration":500,"audible-duration":450,"midi-note":62,"part":"piano"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
     const MULTI_JSON: &str = r#"{"events":[{"offset":0,"duration":500,"audible-duration":450,"midi-note":60,"part":"piano"},{"offset":0,"duration":500,"audible-duration":450,"midi-note":69,"part":"violin"}],"parts":{"piano":{"name":"piano","stock-instrument":"midi-acoustic-grand-piano","tempo":120},"violin":{"name":"violin","stock-instrument":"midi-violin","tempo":120}}}"#;
     const TIMELINE_JSON: &str = r#"{"events":[{"offset":5000,"audible-duration":1000,"part":"piano"},{"offset":0,"audible-duration":1000,"part":"piano"},{"offset":3000,"audible-duration":500,"part":"flute"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120},"flute":{"stock-instrument":"midi-flute","tempo":120}}}"#;
     const INVALID_TIME_JSON: &str = r#"{"events":[{"offset":-1,"audible-duration":100,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
@@ -1138,6 +1171,19 @@ fi
         assert_eq!(info.part_count, 1);
         assert!(info.duration_ms > 0.0);
         assert!(info.instruments.len() == 1);
+        assert_eq!(
+            info.markers,
+            [
+                ScoreMarker {
+                    name: "intro".into(),
+                    offset_ms: 0.0,
+                },
+                ScoreMarker {
+                    name: "theme".into(),
+                    offset_ms: 1_500.0,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1152,6 +1198,7 @@ fi
     fn timeline_merges_overlapping_unsorted_events() {
         let parsed = ParseOutput {
             aliases: HashMap::new(),
+            markers: BTreeMap::new(),
             events: vec![
                 Event {
                     part: "piano".into(),
@@ -1273,10 +1320,42 @@ fi
         ] {
             let parsed = ParseOutput {
                 aliases: HashMap::new(),
+                markers: BTreeMap::new(),
                 events: vec![event],
                 parts: HashMap::from([("piano".into(), part("midi-piano"))]),
             };
             assert!(analyze_events(&parsed).is_err());
+        }
+    }
+
+    #[test]
+    fn score_markers_are_sorted_and_invalid_offsets_are_rejected() {
+        let markers = BTreeMap::from([
+            ("z_same_time".to_string(), 1_500.0),
+            ("intro".to_string(), 0.0),
+            ("a_same_time".to_string(), 1_500.0),
+        ]);
+        assert_eq!(
+            parse_score_markers(&markers).unwrap(),
+            [
+                ScoreMarker {
+                    name: "intro".into(),
+                    offset_ms: 0.0,
+                },
+                ScoreMarker {
+                    name: "a_same_time".into(),
+                    offset_ms: 1_500.0,
+                },
+                ScoreMarker {
+                    name: "z_same_time".into(),
+                    offset_ms: 1_500.0,
+                },
+            ]
+        );
+
+        for offset in [-1.0, f64::NAN, f64::INFINITY] {
+            let invalid = BTreeMap::from([("bad".to_string(), offset)]);
+            assert!(parse_score_markers(&invalid).is_err());
         }
     }
 
