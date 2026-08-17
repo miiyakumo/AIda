@@ -457,6 +457,7 @@ impl Agent {
         let mut round = 0_usize;
         let mut model_calls = 0_usize;
         let mut tool_turns = 0_usize;
+        let mut protocol_recoveries = 0_usize;
         let mut interpretation = String::new();
         let mut last_alda_code = None;
         let mut last_checks = Vec::new();
@@ -526,7 +527,8 @@ impl Agent {
             }
             if calls.len() > 1 {
                 tool_turns += 1;
-                if tool_turns > max_protocol_recoveries {
+                protocol_recoveries += 1;
+                if protocol_recoveries > max_protocol_recoveries {
                     bail!(
                         "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
                     );
@@ -565,7 +567,8 @@ impl Agent {
             }
             if calls.is_empty() {
                 tool_turns += 1;
-                if tool_turns > max_protocol_recoveries {
+                protocol_recoveries += 1;
+                if protocol_recoveries > max_protocol_recoveries {
                     bail!(
                         "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
                     );
@@ -601,11 +604,6 @@ impl Agent {
 
             if tool_name != "submit_result" {
                 tool_turns += 1;
-                if tool_turns > max_protocol_recoveries {
-                    bail!(
-                        "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
-                    );
-                }
                 messages.push(tool_call_message(
                     &tool_call_id,
                     &tool_name,
@@ -661,7 +659,8 @@ impl Agent {
                 Ok(submitted) => submitted,
                 Err(error) => {
                     tool_turns += 1;
-                    if tool_turns > max_protocol_recoveries {
+                    protocol_recoveries += 1;
+                    if protocol_recoveries > max_protocol_recoveries {
                         bail!(
                             "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
                         );
@@ -2058,7 +2057,7 @@ mod tests {
                 }],
                 ValidationRequest {
                     score: ScoreValidation::new(None, Vec::new(), Vec::new()),
-                    run_policy: test_policy(5),
+                    run_policy: test_policy(3),
                     tool_context: None,
                     require_candidate: true,
                     forbid_clarification: false,
@@ -2446,7 +2445,11 @@ mod tests {
                 }],
                 ValidationRequest {
                     score: ScoreValidation::new(None, Vec::new(), Vec::new()),
-                    run_policy: test_policy(5),
+                    run_policy: RunPolicy {
+                        max_model_calls: 5,
+                        max_protocol_recoveries: 1,
+                        ..RunPolicy::default()
+                    },
                     tool_context: Some(AgentToolContext {
                         project_root: directory.path().to_path_buf(),
                         current_path: Some(current),
