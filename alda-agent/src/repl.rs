@@ -543,10 +543,10 @@ impl AgentReporter for TerminalReporter {
                 self.close_model();
                 eprintln!("! 隐私提示 · 创作要求、当前乐谱和校验错误将发送到配置的模型服务");
             }
-            AgentEvent::RoundStarted { round, max_rounds } => {
+            AgentEvent::RoundStarted { attempt } => {
                 self.close_model();
                 self.stage(
-                    &format!("Agent · 生成第 {round}/{max_rounds} 轮 · 等待模型"),
+                    &format!("Agent · 第 {attempt} 次提交 · 等待模型"),
                     "等待模型响应",
                 );
             }
@@ -572,11 +572,11 @@ impl AgentReporter for TerminalReporter {
                 self.finish_spinner();
                 eprintln!("↻ Agent · 自动恢复工具参数 · {tool_name} 参数不完整或无效");
             }
-            AgentEvent::ValidationStarted { round, max_rounds } => {
+            AgentEvent::ValidationStarted { attempt } => {
                 self.close_model();
                 self.alda_active.store(true, Ordering::SeqCst);
                 self.stage(
-                    &format!("Tool · Alda 校验 · 第 {round}/{max_rounds} 轮"),
+                    &format!("Tool · 候选校验 · 第 {attempt} 次提交"),
                     "正在运行 Alda",
                 );
             }
@@ -618,10 +618,9 @@ fn render_event(event: &AgentEvent, writer: &mut impl Write) -> Result<()> {
             writer,
             "! 隐私提示 · 创作要求、当前乐谱和校验错误将发送到配置的模型服务"
         )?,
-        AgentEvent::RoundStarted { round, max_rounds } => writeln!(
-            writer,
-            "◇ Agent · 生成第 {round}/{max_rounds} 轮 · 等待模型"
-        )?,
+        AgentEvent::RoundStarted { attempt } => {
+            writeln!(writer, "◇ Agent · 第 {attempt} 次提交 · 等待模型")?;
+        }
         AgentEvent::ToolContinuationStarted { turn } => writeln!(
             writer,
             "◇ Agent · 工具返回后继续 · 第 {turn} 次往返 · 等待模型"
@@ -642,17 +641,16 @@ fn render_event(event: &AgentEvent, writer: &mut impl Write) -> Result<()> {
                 writeln!(writer, "模型\n  {}", text.trim().replace('\n', "\n  "))?;
             }
         }
-        AgentEvent::ValidationStarted { round, max_rounds } => {
-            writeln!(writer, "◇ Tool · Alda 校验 · 第 {round}/{max_rounds} 轮")?;
+        AgentEvent::ValidationStarted { attempt } => {
+            writeln!(writer, "◇ Tool · 候选校验 · 第 {attempt} 次提交")?;
         }
         AgentEvent::ValidationCompleted(checks) => render_checks(checks, writer)?,
         AgentEvent::RevisionStarted {
-            next_round,
-            max_rounds,
+            next_attempt,
             failures,
         } => writeln!(
             writer,
-            "↻ Agent · 自动修正第 {next_round}/{max_rounds} 轮 · {failures} 项未通过"
+            "↻ Agent · 继续自动修正 · 下一次提交 {next_attempt} · {failures} 项未通过"
         )?,
     }
     Ok(())

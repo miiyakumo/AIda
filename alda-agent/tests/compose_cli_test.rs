@@ -216,7 +216,7 @@ fn compose_candidate_preserves_stdout_exit_and_output_contract() {
     assert!(run.output.status.success());
     let stdout = String::from_utf8(run.output.stdout).unwrap();
     assert!(stdout.contains("=== 开始创作 ==="));
-    assert!(stdout.contains("=== 创作完成 (1/3 轮) ==="));
+    assert!(stdout.contains("=== 创作完成（提交 1 次）==="));
     assert!(stdout.contains("状态: ✅ 成功"));
     assert!(stdout.contains("校验结果:"));
     assert!(stdout.contains("作品已保存到:"));

@@ -165,7 +165,6 @@ async fn compose(options: ComposeOptions) -> anyhow::Result<()> {
         project_name,
         source_material,
         preferences,
-        max_rounds: 3,
     };
 
     let prepared = prepare_compose(request)?;
@@ -174,7 +173,7 @@ async fn compose(options: ComposeOptions) -> anyhow::Result<()> {
 
     let result = compose_once(prepared).await?;
 
-    println!("\n=== 创作完成 ({}/{} 轮) ===\n", result.rounds, 3);
+    println!("\n=== 创作完成（提交 {} 次）===\n", result.rounds);
     println!(
         "状态: {}",
         if result.success {

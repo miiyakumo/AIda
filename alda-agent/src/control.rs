@@ -301,8 +301,7 @@ enum ControlEvent<'a> {
 enum EventBody<'a> {
     PrivacyNotice,
     RoundStarted {
-        round: usize,
-        max_rounds: usize,
+        attempt: usize,
     },
     ToolContinuationStarted {
         turn: usize,
@@ -318,15 +317,13 @@ enum EventBody<'a> {
         text: &'a str,
     },
     ValidationStarted {
-        round: usize,
-        max_rounds: usize,
+        attempt: usize,
     },
     ValidationCompleted {
         checks: &'a [crate::alda::AldaCheck],
     },
     RevisionStarted {
-        next_round: usize,
-        max_rounds: usize,
+        next_attempt: usize,
         failures: usize,
     },
 }
@@ -344,10 +341,7 @@ impl<W: Write> AgentReporter for ControlReporter<'_, W> {
         }
         let event = match &event {
             AgentEvent::PrivacyNotice => EventBody::PrivacyNotice,
-            AgentEvent::RoundStarted { round, max_rounds } => EventBody::RoundStarted {
-                round: *round,
-                max_rounds: *max_rounds,
-            },
+            AgentEvent::RoundStarted { attempt } => EventBody::RoundStarted { attempt: *attempt },
             AgentEvent::ToolContinuationStarted { turn } => {
                 EventBody::ToolContinuationStarted { turn: *turn }
             }
@@ -359,18 +353,15 @@ impl<W: Write> AgentReporter for ControlReporter<'_, W> {
                 EventBody::ToolArgumentsRetry { tool_name }
             }
             AgentEvent::ModelText(text) => EventBody::ModelText { text },
-            AgentEvent::ValidationStarted { round, max_rounds } => EventBody::ValidationStarted {
-                round: *round,
-                max_rounds: *max_rounds,
-            },
+            AgentEvent::ValidationStarted { attempt } => {
+                EventBody::ValidationStarted { attempt: *attempt }
+            }
             AgentEvent::ValidationCompleted(checks) => EventBody::ValidationCompleted { checks },
             AgentEvent::RevisionStarted {
-                next_round,
-                max_rounds,
+                next_attempt,
                 failures,
             } => EventBody::RevisionStarted {
-                next_round: *next_round,
-                max_rounds: *max_rounds,
+                next_attempt: *next_attempt,
                 failures: *failures,
             },
         };
@@ -591,10 +582,7 @@ mod tests {
             writer: &mut output,
             write_error: None,
         };
-        reporter.report(AgentEvent::RoundStarted {
-            round: 1,
-            max_rounds: 3,
-        });
+        reporter.report(AgentEvent::RoundStarted { attempt: 1 });
         reporter.report(AgentEvent::ModelText("正在发展主题".to_string()));
         assert!(reporter.write_error.is_none());
         drop(reporter);
@@ -607,6 +595,7 @@ mod tests {
         assert_eq!(events[0]["id"], "request-7");
         assert_eq!(events[0]["type"], "event");
         assert_eq!(events[0]["event"], "round_started");
+        assert_eq!(events[0]["attempt"], 1);
         assert_eq!(events[1]["event"], "model_text");
         assert_eq!(events[1]["text"], "正在发展主题");
     }

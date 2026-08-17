@@ -1,6 +1,6 @@
 use crate::agent::{
     Agent, AgentReporter, AgentResultKind, AgentToolContext, CreationRequest, CreationResult,
-    ProjectPromptRequest,
+    ProjectPromptRequest, RunPolicy,
 };
 use crate::alda::{AldaCheck, AldaRunner, CancellationToken, CheckStatus, find_alda};
 use crate::audio::AudioRenderer;
@@ -23,7 +23,6 @@ pub struct ComposeRequest {
     pub project_name: String,
     pub source_material: String,
     pub preferences: ProjectPreferences,
-    pub max_rounds: usize,
 }
 
 pub struct PreparedCompose {
@@ -60,7 +59,7 @@ pub fn prepare_compose(request: ComposeRequest) -> Result<PreparedCompose> {
             source_material: request.source_material,
             instructions: String::new(),
             compiled_instructions,
-            max_rounds: request.max_rounds,
+            run_policy: RunPolicy::default(),
         },
     })
 }
@@ -408,7 +407,7 @@ impl Application {
                         .map(|_| self.project.revision_code())
                         .transpose()?,
                     compiled_instructions,
-                    max_rounds: 3,
+                    run_policy: RunPolicy::default(),
                     tool_context: Some(AgentToolContext {
                         project_root: self.project.root().to_path_buf(),
                         current_path: (self.project.current_version() > 0)

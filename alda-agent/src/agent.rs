@@ -5,10 +5,12 @@ use crate::deepseek::{DeepSeekClient, FunctionDef, Message, StreamEvent, Tool};
 use crate::instructions::CompiledInstructions;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 // ============================================================
 // 系统提示
@@ -118,8 +120,26 @@ pub struct CreationRequest {
     pub instructions: String,
     /// 由宿主编译的不可变有效指示
     pub compiled_instructions: CompiledInstructions,
-    /// 最大自动修正轮数，默认 3
-    pub max_rounds: usize,
+    pub run_policy: RunPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RunPolicy {
+    pub max_elapsed: Duration,
+    pub max_model_calls: usize,
+    pub max_protocol_recoveries: usize,
+    pub max_consecutive_no_progress: usize,
+}
+
+impl Default for RunPolicy {
+    fn default() -> Self {
+        Self {
+            max_elapsed: Duration::from_secs(15 * 60),
+            max_model_calls: 24,
+            max_protocol_recoveries: 8,
+            max_consecutive_no_progress: 2,
+        }
+    }
 }
 
 // ============================================================
@@ -128,7 +148,7 @@ pub struct CreationRequest {
 
 #[derive(Debug)]
 pub struct CreationResult {
-    /// 实际使用的修正轮数
+    /// 实际提交给宿主的结果次数
     pub rounds: usize,
     /// 是否通过必要检查
     pub success: bool,
@@ -192,7 +212,7 @@ pub struct ProjectPromptRequest {
     pub working_alda: Option<String>,
     pub revision_alda: Option<String>,
     pub compiled_instructions: CompiledInstructions,
-    pub max_rounds: usize,
+    pub run_policy: RunPolicy,
     pub tool_context: Option<AgentToolContext>,
     pub require_candidate: bool,
     pub forbid_clarification: bool,
@@ -207,7 +227,7 @@ pub struct AgentToolContext {
 
 struct ValidationRequest {
     score: ScoreValidation,
-    max_rounds: usize,
+    run_policy: RunPolicy,
     tool_context: Option<AgentToolContext>,
     require_candidate: bool,
     forbid_clarification: bool,
@@ -231,8 +251,7 @@ pub trait AgentReporter {
 pub enum AgentEvent {
     PrivacyNotice,
     RoundStarted {
-        round: usize,
-        max_rounds: usize,
+        attempt: usize,
     },
     ToolContinuationStarted {
         turn: usize,
@@ -246,13 +265,11 @@ pub enum AgentEvent {
     },
     ModelText(String),
     ValidationStarted {
-        round: usize,
-        max_rounds: usize,
+        attempt: usize,
     },
     ValidationCompleted(Vec<AldaCheck>),
     RevisionStarted {
-        next_round: usize,
-        max_rounds: usize,
+        next_attempt: usize,
         failures: usize,
     },
 }
@@ -372,7 +389,7 @@ impl Agent {
             messages,
             ValidationRequest {
                 score: validation,
-                max_rounds: request.max_rounds,
+                run_policy: request.run_policy,
                 tool_context: request.tool_context,
                 require_candidate: request.require_candidate,
                 forbid_clarification: request.forbid_clarification,
@@ -413,7 +430,7 @@ impl Agent {
             messages,
             ValidationRequest {
                 score: validation,
-                max_rounds: request.max_rounds,
+                run_policy: request.run_policy,
                 tool_context: None,
                 require_candidate: false,
                 forbid_clarification: false,
@@ -423,7 +440,7 @@ impl Agent {
         .await
     }
 
-    // Tool turns do not consume one of the score revision attempts.
+    // Host tool turns and protocol recovery do not count as submitted results.
     #[allow(clippy::too_many_lines)]
     async fn run_generation(
         &self,
@@ -431,8 +448,14 @@ impl Agent {
         validation: ValidationRequest,
         reporter: &mut impl AgentReporter,
     ) -> Result<CreationResult> {
-        let max_rounds = validation.max_rounds.max(1);
+        let run_policy = validation.run_policy;
+        let started = Instant::now();
+        let max_model_calls = run_policy.max_model_calls.max(1);
+        let max_protocol_recoveries = run_policy.max_protocol_recoveries.max(1);
+        let max_no_progress = run_policy.max_consecutive_no_progress.max(1);
+        let max_elapsed = run_policy.max_elapsed.max(Duration::from_secs(1));
         let mut round = 0_usize;
+        let mut model_calls = 0_usize;
         let mut tool_turns = 0_usize;
         let mut interpretation = String::new();
         let mut last_alda_code = None;
@@ -440,19 +463,40 @@ impl Agent {
         let mut last_was_truncated = false;
         let mut score_kind = None;
         let mut previous_failure_signature = None;
+        let mut seen_failure_signatures = HashSet::new();
+        let mut best_progress = None;
+        let mut consecutive_no_progress = 0_usize;
         let mut played_target = None;
         let mut rendered_wav = None;
         let mut candidate_artifacts = None;
         let mut continuing_after_tool = false;
 
-        while round < max_rounds {
+        loop {
+            let stop_detail = if model_calls >= max_model_calls {
+                Some(format!(
+                    "已达到 {max_model_calls} 次模型调用安全上限；保留最后一份待修正结果"
+                ))
+            } else if started.elapsed() >= max_elapsed {
+                Some(format!(
+                    "自动修正已运行 {:.0} 秒，达到安全时限；保留最后一份待修正结果",
+                    started.elapsed().as_secs_f64()
+                ))
+            } else {
+                None
+            };
+            if let Some(detail) = stop_detail {
+                last_checks.push(AldaCheck {
+                    name: "运行策略",
+                    status: CheckStatus::Fail,
+                    detail,
+                });
+                break;
+            }
+            model_calls += 1;
             if std::mem::take(&mut continuing_after_tool) {
                 reporter.report(AgentEvent::ToolContinuationStarted { turn: tool_turns });
             } else {
-                reporter.report(AgentEvent::RoundStarted {
-                    round: round + 1,
-                    max_rounds,
-                });
+                reporter.report(AgentEvent::RoundStarted { attempt: round + 1 });
             }
             let events = self
                 .client
@@ -482,8 +526,10 @@ impl Agent {
             }
             if calls.len() > 1 {
                 tool_turns += 1;
-                if tool_turns > 8 {
-                    bail!("单轮宿主工具调用超过 8 次，已停止以避免无进展循环");
+                if tool_turns > max_protocol_recoveries {
+                    bail!(
+                        "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
+                    );
                 }
                 reporter.report(AgentEvent::ToolProtocolRetry {
                     call_count: calls.len(),
@@ -519,8 +565,10 @@ impl Agent {
             }
             if calls.is_empty() {
                 tool_turns += 1;
-                if tool_turns > 8 {
-                    bail!("单轮宿主工具调用超过 8 次，已停止以避免无进展循环");
+                if tool_turns > max_protocol_recoveries {
+                    bail!(
+                        "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
+                    );
                 }
                 reporter.report(AgentEvent::ToolCallMissingRetry);
                 messages.push(Message {
@@ -553,8 +601,10 @@ impl Agent {
 
             if tool_name != "submit_result" {
                 tool_turns += 1;
-                if tool_turns > 8 {
-                    bail!("单轮宿主工具调用超过 8 次，已停止以避免无进展循环");
+                if tool_turns > max_protocol_recoveries {
+                    bail!(
+                        "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
+                    );
                 }
                 messages.push(tool_call_message(
                     &tool_call_id,
@@ -611,8 +661,10 @@ impl Agent {
                 Ok(submitted) => submitted,
                 Err(error) => {
                     tool_turns += 1;
-                    if tool_turns > 8 {
-                        bail!("单轮宿主工具调用超过 8 次，已停止以避免无进展循环");
+                    if tool_turns > max_protocol_recoveries {
+                        bail!(
+                            "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
+                        );
                     }
                     reporter.report(AgentEvent::ToolArgumentsRetry {
                         tool_name: tool_name.clone(),
@@ -634,7 +686,7 @@ impl Agent {
                             serde_json::json!({
                                 "ok": false,
                                 "error": detail,
-                                "instruction": "本次结果未执行且不占乐谱修正轮数。请重新调用 submit_result，并提交完整、有效的 JSON 参数。"
+                                "instruction": "本次结果未执行且不计作候选提交。请重新调用 submit_result，并提交完整、有效的 JSON 参数。"
                             })
                             .to_string(),
                         ),
@@ -661,13 +713,27 @@ impl Agent {
                 None
             };
             if let Some(detail) = result_policy_failure {
-                let checks = vec![AldaCheck {
+                let mut checks = vec![AldaCheck {
                     name: "结果类型",
                     status: CheckStatus::Fail,
                     detail: detail.to_string(),
                 }];
+                let signature = failure_signature(&tool_args, &checks);
+                let stop = observe_progress(
+                    &checks,
+                    &signature,
+                    &mut previous_failure_signature,
+                    &mut seen_failure_signatures,
+                    &mut best_progress,
+                    &mut consecutive_no_progress,
+                    max_no_progress,
+                );
+                if let Some(check) = stop {
+                    checks.push(check);
+                }
                 last_checks.clone_from(&checks);
                 last_was_truncated = was_truncated;
+                interpretation.clone_from(&submitted.message);
                 messages.push(tool_call_message(
                     &tool_call_id,
                     "submit_result",
@@ -680,16 +746,18 @@ impl Agent {
                     tool_calls: None,
                     tool_call_id: Some(tool_call_id),
                 });
-                reporter.report(AgentEvent::ValidationCompleted(checks));
-                if round < max_rounds {
-                    reporter.report(AgentEvent::RevisionStarted {
-                        next_round: round + 1,
-                        max_rounds,
-                        failures: 1,
-                    });
-                    continue;
+                reporter.report(AgentEvent::ValidationCompleted(checks.clone()));
+                if checks.iter().any(|check| check.name == "修正进展") {
+                    break;
                 }
-                break;
+                reporter.report(AgentEvent::RevisionStarted {
+                    next_attempt: round + 1,
+                    failures: checks
+                        .iter()
+                        .filter(|check| check.status == CheckStatus::Fail)
+                        .count(),
+                });
+                continue;
             }
             reporter.report(AgentEvent::ModelText(submitted.message.clone()));
             if matches!(
@@ -733,7 +801,7 @@ impl Agent {
             let tmp_dir = tempfile::tempdir().context("创建临时目录失败")?;
             let tmp_score = tmp_dir.path().join("candidate.alda");
             fs::write(&tmp_score, &alda_code)?;
-            reporter.report(AgentEvent::ValidationStarted { round, max_rounds });
+            reporter.report(AgentEvent::ValidationStarted { attempt: round });
             let score_validation = if submitted.kind == AgentResultKind::Candidate {
                 validation.score.clone()
             } else {
@@ -796,14 +864,19 @@ impl Agent {
                 }
             }
             let signature = failure_signature(&alda_code, &checks);
-            let repeated_failure = checks.iter().any(|check| check.status == CheckStatus::Fail)
-                && previous_failure_signature.as_ref() == Some(&signature);
-            if repeated_failure {
-                checks.push(AldaCheck {
-                    name: "修正进展",
-                    status: CheckStatus::Fail,
-                    detail: "模型重复提交了相同源码和相同错误；宿主停止无进展重试".to_string(),
-                });
+            let has_failures = checks.iter().any(|check| check.status == CheckStatus::Fail);
+            if has_failures
+                && let Some(check) = observe_progress(
+                    &checks,
+                    &signature,
+                    &mut previous_failure_signature,
+                    &mut seen_failure_signatures,
+                    &mut best_progress,
+                    &mut consecutive_no_progress,
+                    max_no_progress,
+                )
+            {
+                checks.push(check);
             }
             reporter.report(AgentEvent::ValidationCompleted(checks.clone()));
             let all_pass = checks.iter().all(|check| check.status != CheckStatus::Fail);
@@ -839,13 +912,11 @@ impl Agent {
                     candidate_artifacts,
                 });
             }
-            if repeated_failure {
+            if checks.iter().any(|check| check.name == "修正进展") {
                 break;
             }
-            previous_failure_signature = Some(signature);
             reporter.report(AgentEvent::RevisionStarted {
-                next_round: round + 1,
-                max_rounds,
+                next_attempt: round + 1,
                 failures: checks
                     .iter()
                     .filter(|check| check.status == CheckStatus::Fail)
@@ -973,6 +1044,140 @@ fn failure_signature(code: &str, checks: &[AldaCheck]) -> String {
         hash.update(check.detail.as_bytes());
     }
     format!("{:x}", hash.finalize())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GenerationProgress {
+    stage: u8,
+    duration_distance_secs: Option<f64>,
+    failure_count: usize,
+}
+
+impl GenerationProgress {
+    fn from_checks(checks: &[AldaCheck]) -> Self {
+        let failures = checks
+            .iter()
+            .filter(|check| check.status == CheckStatus::Fail)
+            .collect::<Vec<_>>();
+        let failed = |name: &str| failures.iter().any(|check| check.name == name);
+        let audio_failure = failures.iter().find(|check| check.name == "音频渲染");
+        let duration_distance_secs = failures
+            .iter()
+            .find(|check| check.name == "时长")
+            .and_then(|check| parse_duration_distance(&check.detail));
+        let stage = if failed("结果类型") {
+            0
+        } else if failed("Alda 语法") || !checks.iter().any(|check| check.name == "Alda 语法") {
+            1
+        } else if failed("标记") {
+            2
+        } else if failures
+            .iter()
+            .any(|check| !matches!(check.name, "时长" | "音频渲染"))
+        {
+            3
+        } else if failed("时长") {
+            4
+        } else if let Some(audio) = audio_failure {
+            if audio.detail.contains("静音") {
+                6
+            } else {
+                5
+            }
+        } else if checks
+            .iter()
+            .any(|check| check.name == "音频渲染" && check.status == CheckStatus::Pass)
+        {
+            7
+        } else {
+            4
+        };
+        Self {
+            stage,
+            duration_distance_secs,
+            failure_count: failures.len(),
+        }
+    }
+
+    fn improves(self, best: Self) -> bool {
+        if self.stage != best.stage {
+            return self.stage > best.stage;
+        }
+        if self.stage == 4
+            && let (Some(current), Some(previous)) =
+                (self.duration_distance_secs, best.duration_distance_secs)
+            && current + 0.5 < previous
+        {
+            return true;
+        }
+        self.failure_count < best.failure_count
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_progress(
+    checks: &[AldaCheck],
+    signature: &str,
+    previous_signature: &mut Option<String>,
+    seen_signatures: &mut HashSet<String>,
+    best_progress: &mut Option<GenerationProgress>,
+    consecutive_no_progress: &mut usize,
+    max_consecutive_no_progress: usize,
+) -> Option<AldaCheck> {
+    let repeated = previous_signature.as_deref() == Some(signature);
+    let cycle = !repeated && seen_signatures.contains(signature);
+    if repeated || cycle {
+        return Some(AldaCheck {
+            name: "修正进展",
+            status: CheckStatus::Fail,
+            detail: if repeated {
+                "模型重复提交了相同源码和相同错误；宿主停止无进展重试".to_string()
+            } else {
+                "模型回到了此前失败的源码与错误（检测到修正循环）；宿主停止重试".to_string()
+            },
+        });
+    }
+    seen_signatures.insert(signature.to_string());
+    previous_signature.replace(signature.to_string());
+
+    let current = GenerationProgress::from_checks(checks);
+    if best_progress.is_none_or(|best| current.improves(best)) {
+        *best_progress = Some(current);
+        *consecutive_no_progress = 0;
+        return None;
+    }
+    *consecutive_no_progress += 1;
+    if *consecutive_no_progress < max_consecutive_no_progress {
+        return None;
+    }
+    Some(AldaCheck {
+        name: "修正进展",
+        status: CheckStatus::Fail,
+        detail: format!(
+            "连续 {} 次提交未改善语法、标记、硬约束、时长距离或音频结果；宿主停止重试",
+            *consecutive_no_progress
+        ),
+    })
+}
+
+fn parse_duration_distance(detail: &str) -> Option<f64> {
+    let actual = detail.strip_prefix("约 ")?.split('秒').next()?;
+    let actual = actual.trim().parse::<f64>().ok()?;
+    let target_start = detail.find("目标 ")?.checked_add("目标 ".len())?;
+    let target_end = detail[target_start..].find('秒')?;
+    let target = detail[target_start..target_start + target_end].trim();
+    let mut bounds = target.split(['–', '-', '—']);
+    let minimum = bounds.next()?.trim().parse::<f64>().ok()?;
+    let maximum = bounds
+        .next()
+        .map_or(Some(minimum), |value| value.trim().parse::<f64>().ok())?;
+    Some(if actual < minimum {
+        minimum - actual
+    } else if actual > maximum {
+        actual - maximum
+    } else {
+        0.0
+    })
 }
 
 fn lookup_alda_docs(arguments: &str) -> Result<String> {
@@ -1434,6 +1639,22 @@ mod tests {
         (directory, AldaRunner::new(executable))
     }
 
+    fn progress_runner() -> (tempfile::TempDir, AldaRunner) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("alda");
+        let short = r#"{"events":[{"offset":0,"audible-duration":1000,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
+        let closer = r#"{"events":[{"offset":0,"audible-duration":2000,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
+        let target = r#"{"events":[{"offset":0,"audible-duration":3000,"part":"piano"}],"parts":{"piano":{"stock-instrument":"midi-acoustic-grand-piano","tempo":120}}}"#;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  parse)\n    if grep -q syntax_bad \"$3\"; then echo invalid >&2; exit 1\n    elif grep -q closer \"$3\"; then printf '%s\\n' '{closer}'\n    elif grep -q target \"$3\"; then printf '%s\\n' '{target}'\n    else printf '%s\\n' '{short}'\n    fi ;;\n  export) printf midi > \"$5\" ;;\n  play|stop) exit 0 ;;\n  *) exit 1 ;;\nesac\n"
+        );
+        fs::write(&executable, script).unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        (directory, AldaRunner::new(executable))
+    }
+
     fn fake_audio_renderer(root: &std::path::Path) -> AudioRenderer {
         fake_audio_renderer_with_amplitude(root, 8_000)
     }
@@ -1485,12 +1706,19 @@ mod tests {
         .unwrap()
     }
 
-    fn request(max_rounds: usize) -> CreationRequest {
+    fn test_policy(max_model_calls: usize) -> RunPolicy {
+        RunPolicy {
+            max_model_calls,
+            ..RunPolicy::default()
+        }
+    }
+
+    fn request(max_model_calls: usize) -> CreationRequest {
         CreationRequest {
             source_material: "素材".to_string(),
             instructions: "创作完整器乐作品".to_string(),
             compiled_instructions: compiled_instructions(&ProjectPreferences::default()),
-            max_rounds,
+            run_policy: test_policy(max_model_calls),
         }
     }
 
@@ -1584,6 +1812,122 @@ mod tests {
                 && check.detail.contains("非静音")
         }));
         assert!(result.conversation.len() >= 6);
+    }
+
+    #[tokio::test]
+    async fn improving_candidate_can_succeed_after_more_than_three_submissions() {
+        let (base_url, _requests) = serve(vec![
+            MockResponse::sse(tool_response("syntax_bad", "tool_calls")),
+            MockResponse::sse(tool_response("short", "tool_calls")),
+            MockResponse::sse(tool_response("closer", "tool_calls")),
+            MockResponse::sse(tool_response("target", "tool_calls")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = progress_runner();
+        let mut reporter = RecordingReporter::default();
+        let result = Agent::new(client, runner)
+            .with_audio_renderer(fake_audio_renderer(directory.path()))
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("完成三秒作品".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(
+                        Some(crate::instructions::DurationConstraint::exact(3.0)),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    run_policy: test_policy(8),
+                    tool_context: None,
+                    require_candidate: true,
+                    forbid_clarification: false,
+                },
+                &mut reporter,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.rounds, 4);
+        assert_eq!(result.alda_code.as_deref(), Some("target"));
+        assert_eq!(
+            reporter
+                .events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::RoundStarted { .. }))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn progress_tracker_detects_cycles_and_duration_improvement() {
+        let duration = |actual: f64| {
+            vec![
+                AldaCheck {
+                    name: "Alda 语法",
+                    status: CheckStatus::Pass,
+                    detail: "解析成功".to_string(),
+                },
+                AldaCheck {
+                    name: "标记",
+                    status: CheckStatus::Pass,
+                    detail: "0 个定义".to_string(),
+                },
+                AldaCheck {
+                    name: "时长",
+                    status: CheckStatus::Fail,
+                    detail: format!("约 {actual:.0}秒（目标 300–420秒）"),
+                },
+            ]
+        };
+        let mut previous = None;
+        let mut seen = HashSet::new();
+        let mut best = None;
+        let mut no_progress = 0;
+        assert!(
+            observe_progress(
+                &duration(100.0),
+                "a",
+                &mut previous,
+                &mut seen,
+                &mut best,
+                &mut no_progress,
+                2,
+            )
+            .is_none()
+        );
+        assert!(
+            observe_progress(
+                &duration(200.0),
+                "b",
+                &mut previous,
+                &mut seen,
+                &mut best,
+                &mut no_progress,
+                2,
+            )
+            .is_none()
+        );
+        let cycle = observe_progress(
+            &duration(100.0),
+            "a",
+            &mut previous,
+            &mut seen,
+            &mut best,
+            &mut no_progress,
+            2,
+        )
+        .unwrap();
+        assert!(cycle.detail.contains("修正循环"));
     }
 
     #[tokio::test]
@@ -1705,7 +2049,7 @@ mod tests {
                 }],
                 ValidationRequest {
                     score: ScoreValidation::new(None, Vec::new(), Vec::new()),
-                    max_rounds: 3,
+                    run_policy: test_policy(5),
                     tool_context: None,
                     require_candidate: true,
                     forbid_clarification: false,
@@ -1751,7 +2095,7 @@ mod tests {
                 }],
                 ValidationRequest {
                     score: ScoreValidation::new(None, Vec::new(), Vec::new()),
-                    max_rounds: 3,
+                    run_policy: test_policy(3),
                     tool_context: None,
                     require_candidate: true,
                     forbid_clarification: true,
@@ -1778,7 +2122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_tool_calls_are_rejected_and_retried_without_consuming_a_round() {
+    async fn parallel_tool_calls_are_rejected_without_counting_as_submissions() {
         let (base_url, requests) = serve(vec![
             MockResponse::sse(parallel_tool_response()),
             MockResponse::sse(tool_response("piano: c", "tool_calls")),
@@ -1802,7 +2146,7 @@ mod tests {
                 }],
                 ValidationRequest {
                     score: ScoreValidation::new(None, Vec::new(), Vec::new()),
-                    max_rounds: 3,
+                    run_policy: test_policy(3),
                     tool_context: None,
                     require_candidate: true,
                     forbid_clarification: false,
@@ -1855,7 +2199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_tool_call_is_retried_without_consuming_a_revision_round() {
+    async fn missing_tool_call_is_retried_without_counting_as_a_submission() {
         let (base_url, requests) = serve(vec![
             MockResponse::sse(plain_text_response("普通回答，没有工具调用")),
             MockResponse::sse(tool_response("piano: c", "tool_calls")),
@@ -1879,7 +2223,7 @@ mod tests {
                 }],
                 ValidationRequest {
                     score: ScoreValidation::new(None, Vec::new(), Vec::new()),
-                    max_rounds: 3,
+                    run_policy: test_policy(3),
                     tool_context: None,
                     require_candidate: true,
                     forbid_clarification: true,
@@ -1922,7 +2266,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_submit_result_is_retried_without_consuming_a_revision_round() {
+    async fn model_call_guard_stops_protocol_recovery_without_counting_a_submission() {
+        let (base_url, _requests) = serve(vec![
+            MockResponse::sse(plain_text_response("仍未调用工具")),
+            MockResponse::sse(plain_text_response("还是没有调用工具")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("写成器乐圣咏".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(2),
+                    tool_context: None,
+                    require_candidate: true,
+                    forbid_clarification: true,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.rounds, 0);
+        assert!(result.checks.iter().any(|check| {
+            check.name == "运行策略" && check.detail.contains("2 次模型调用")
+        }));
+    }
+
+    #[tokio::test]
+    async fn malformed_submit_result_is_retried_without_counting_as_a_submission() {
         let (base_url, requests) = serve(vec![
             MockResponse::sse(malformed_submit_result_response("length")),
             MockResponse::sse(tool_response("piano: c", "tool_calls")),
@@ -1960,7 +2344,7 @@ mod tests {
         let _first_request = requests.recv().unwrap();
         let second_request = String::from_utf8(requests.recv().unwrap()).unwrap();
         assert!(second_request.contains("模型响应被截断"));
-        assert!(second_request.contains("不占乐谱修正轮数"));
+        assert!(second_request.contains("不计作候选提交"));
     }
 
     #[test]
@@ -2009,7 +2393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_tools_run_in_sequence_without_consuming_revision_rounds() {
+    async fn host_tools_run_in_sequence_without_counting_as_submissions() {
         let (base_url, _requests) = serve(vec![
             MockResponse::sse(host_tool_response(
                 "lookup_alda_docs",
@@ -2053,7 +2437,7 @@ mod tests {
                 }],
                 ValidationRequest {
                     score: ScoreValidation::new(None, Vec::new(), Vec::new()),
-                    max_rounds: 3,
+                    run_policy: test_policy(5),
                     tool_context: Some(AgentToolContext {
                         project_root: directory.path().to_path_buf(),
                         current_path: Some(current),
@@ -2090,7 +2474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_identical_failure_stops_before_the_revision_limit() {
+    async fn repeated_identical_failure_stops_immediately() {
         let (base_url, _requests) = serve(vec![
             MockResponse::sse(tool_response("", "tool_calls")),
             MockResponse::sse(tool_response("", "tool_calls")),
