@@ -6,6 +6,7 @@ use crate::instructions::{
 use crate::skills::{QualifiedSkillId, SkillOrigin};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -15,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const PROJECT_FILE: &str = "project.json";
 const CURRENT_FILE: &str = "current.alda";
 const WORK_FILE: &str = "work.alda";
+const REVISION_FILE: &str = "revision.alda";
 
 mod persisted_check_status {
     use crate::alda::CheckStatus;
@@ -93,6 +95,14 @@ pub struct WorkingScore {
     pub checks: Vec<CheckRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingRevision {
+    pub kind: WorkingScoreKind,
+    pub summary: String,
+    pub checks: Vec<CheckRecord>,
+    pub source_hash: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub project_name: String,
@@ -103,6 +113,8 @@ pub struct Project {
     current_version: u32,
     versions: BTreeMap<u32, VersionMeta>,
     working_score: Option<WorkingScore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_revision: Option<PendingRevision>,
     conversation: Conversation,
     #[serde(skip)]
     root: PathBuf,
@@ -122,8 +134,12 @@ impl Project {
             let mut project: Self = serde_json::from_str(&content)
                 .with_context(|| format!("无法解析 {}", project_file.display()))?;
             project.root = root;
+            let compacted = project.conversation.compact_provider_trace();
             project.validate_metadata()?;
             project.recover_projections()?;
+            if compacted {
+                project.write_metadata()?;
+            }
             return Ok(project);
         }
 
@@ -136,6 +152,7 @@ impl Project {
             current_version: 0,
             versions: BTreeMap::new(),
             working_score: None,
+            pending_revision: None,
             conversation: Conversation::default(),
             root,
         };
@@ -161,6 +178,11 @@ impl Project {
     #[must_use]
     pub fn working_score(&self) -> Option<&WorkingScore> {
         self.working_score.as_ref()
+    }
+
+    #[must_use]
+    pub fn pending_revision(&self) -> Option<&PendingRevision> {
+        self.pending_revision.as_ref()
     }
 
     #[must_use]
@@ -336,6 +358,64 @@ impl Project {
         Ok(self.root.join(WORK_FILE))
     }
 
+    pub fn revision_code(&self) -> Result<String> {
+        if self.pending_revision.is_none() {
+            bail!("项目没有待修正候选");
+        }
+        fs::read_to_string(self.root.join(REVISION_FILE)).context("无法读取 revision.alda")
+    }
+
+    pub fn revision_path(&self) -> Result<PathBuf> {
+        if self.pending_revision.is_none() {
+            bail!("项目没有待修正候选");
+        }
+        Ok(self.root.join(REVISION_FILE))
+    }
+
+    pub fn save_pending_revision(
+        &mut self,
+        alda_code: &str,
+        kind: WorkingScoreKind,
+        summary: &str,
+        checks: &[AldaCheck],
+    ) -> Result<()> {
+        if alda_code.trim().is_empty() {
+            bail!("不能保存空的待修正候选");
+        }
+        let path = self.root.join(REVISION_FILE);
+        let previous_code = fs::read(&path).ok();
+        let previous_revision = self.pending_revision.clone();
+        write_atomic(&path, alda_code.as_bytes())?;
+        self.pending_revision = Some(PendingRevision {
+            kind,
+            summary: summary.to_string(),
+            checks: checks.iter().map(CheckRecord::from).collect(),
+            source_hash: format!("{:x}", Sha256::digest(alda_code.as_bytes())),
+        });
+        if let Err(error) = self.write_metadata() {
+            self.pending_revision = previous_revision;
+            if let Some(previous_code) = previous_code {
+                let _ = write_atomic(&path, &previous_code);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn clear_pending_revision(&mut self) -> Result<()> {
+        if self.pending_revision.is_none() {
+            return Ok(());
+        }
+        let previous = self.pending_revision.take();
+        if let Err(error) = self.write_metadata() {
+            self.pending_revision = previous;
+            return Err(error);
+        }
+        self.remove_revision_projection()
+    }
+
     pub fn save_working_score(
         &mut self,
         alda_code: &str,
@@ -353,14 +433,17 @@ impl Project {
         let work_path = self.root.join(WORK_FILE);
         let previous_code = fs::read(&work_path).ok();
         let previous_working = self.working_score.clone();
+        let previous_revision = self.pending_revision.clone();
         write_atomic(&work_path, alda_code.as_bytes())?;
         self.working_score = Some(WorkingScore {
             kind,
             summary: summary.to_string(),
             checks: checks.iter().map(CheckRecord::from).collect(),
         });
+        self.pending_revision = None;
         if let Err(error) = self.write_metadata() {
             self.working_score = previous_working;
+            self.pending_revision = previous_revision;
             if let Some(previous_code) = previous_code {
                 let _ = write_atomic(&work_path, &previous_code);
             } else {
@@ -368,6 +451,7 @@ impl Project {
             }
             return Err(error);
         }
+        self.remove_revision_projection()?;
         Ok(())
     }
 
@@ -561,6 +645,17 @@ impl Project {
         if self.working_score.is_some() && !self.root.join(WORK_FILE).is_file() {
             bail!("项目损坏：工作乐谱元数据存在但 work.alda 不存在");
         }
+        if self.pending_revision.is_some() && !self.root.join(REVISION_FILE).is_file() {
+            bail!("项目损坏：待修正候选元数据存在但 revision.alda 不存在");
+        }
+        if let Some(revision) = &self.pending_revision {
+            let source = fs::read(self.root.join(REVISION_FILE))
+                .context("无法读取待修正候选 revision.alda")?;
+            let source_hash = format!("{:x}", Sha256::digest(&source));
+            if source_hash != revision.source_hash {
+                bail!("项目损坏：revision.alda 与待修正候选元数据不一致");
+            }
+        }
         if self.current_version == 0 {
             if !self.versions.is_empty() {
                 bail!("project.json 损坏：存在历史版本但当前版本为 0");
@@ -583,6 +678,17 @@ impl Project {
         self.repair_current_projection()?;
         if self.working_score.is_none() {
             self.remove_work_projection()?;
+        }
+        if self.pending_revision.is_none() {
+            self.remove_revision_projection()?;
+        }
+        Ok(())
+    }
+
+    fn remove_revision_projection(&self) -> Result<()> {
+        let path = self.root.join(REVISION_FILE);
+        if path.exists() {
+            fs::remove_file(&path).with_context(|| format!("无法删除 {}", path.display()))?;
         }
         Ok(())
     }
@@ -984,6 +1090,104 @@ mod tests {
         assert_eq!(project.current_code().unwrap(), "piano: d");
         assert!(project.working_score().is_none());
         assert!(!project.root().join(WORK_FILE).exists());
+    }
+
+    #[test]
+    fn pending_revision_keeps_only_the_latest_source_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        let failed = [AldaCheck {
+            name: "Alda 语法",
+            status: CheckStatus::Fail,
+            detail: "第一次失败".to_string(),
+        }];
+
+        project
+            .save_pending_revision("piano: c+", WorkingScoreKind::Candidate, "第一次", &failed)
+            .unwrap();
+        project
+            .save_pending_revision("piano: d+", WorkingScoreKind::Candidate, "第二次", &failed)
+            .unwrap();
+        drop(project);
+
+        let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
+        assert_eq!(reloaded.revision_code().unwrap(), "piano: d+");
+        let revision = reloaded.pending_revision().unwrap();
+        assert_eq!(revision.summary, "第二次");
+        assert_eq!(revision.kind, WorkingScoreKind::Candidate);
+    }
+
+    #[test]
+    fn successful_working_score_clears_pending_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        project
+            .save_pending_revision(
+                "piano: c+",
+                WorkingScoreKind::Candidate,
+                "失败候选",
+                &[AldaCheck {
+                    name: "Alda 语法",
+                    status: CheckStatus::Fail,
+                    detail: "解析失败".to_string(),
+                }],
+            )
+            .unwrap();
+
+        project
+            .save_working_score(
+                "piano: c",
+                WorkingScoreKind::Candidate,
+                "成功候选",
+                &passing_checks(),
+            )
+            .unwrap();
+
+        assert!(project.pending_revision().is_none());
+        assert!(!root.join(REVISION_FILE).exists());
+        let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
+        assert!(reloaded.pending_revision().is_none());
+        assert_eq!(reloaded.working_code().unwrap(), "piano: c");
+    }
+
+    #[test]
+    fn reload_cleans_orphan_revision_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        drop(project);
+        fs::write(root.join(REVISION_FILE), "piano: orphan").unwrap();
+
+        let project = Project::load_or_create(root.clone(), "ignored", "").unwrap();
+
+        assert!(project.pending_revision().is_none());
+        assert!(!root.join(REVISION_FILE).exists());
+    }
+
+    #[test]
+    fn revision_source_hash_mismatch_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        project
+            .save_pending_revision(
+                "piano: c+",
+                WorkingScoreKind::Candidate,
+                "失败候选",
+                &[AldaCheck {
+                    name: "Alda 语法",
+                    status: CheckStatus::Fail,
+                    detail: "解析失败".to_string(),
+                }],
+            )
+            .unwrap();
+        drop(project);
+        fs::write(root.join(REVISION_FILE), "piano: tampered").unwrap();
+
+        let error = Project::load_or_create(root, "ignored", "").unwrap_err();
+        assert!(error.to_string().contains("元数据不一致"));
     }
 
     #[test]

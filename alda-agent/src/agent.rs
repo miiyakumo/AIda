@@ -164,6 +164,7 @@ pub struct ProjectPromptRequest {
     pub conversation: Vec<ConversationMessage>,
     pub current_alda: Option<String>,
     pub working_alda: Option<String>,
+    pub revision_alda: Option<String>,
     pub compiled_instructions: CompiledInstructions,
     pub max_rounds: usize,
     pub tool_context: Option<AgentToolContext>,
@@ -730,7 +731,7 @@ impl Agent {
             last_alda_code = Some(alda_code.clone());
             last_checks.clone_from(&checks);
             last_was_truncated = was_truncated;
-            interpretation.push_str(&submitted.message);
+            interpretation.clone_from(&submitted.message);
             messages.push(tool_call_message(
                 &tool_call_id,
                 "submit_result",
@@ -1020,7 +1021,10 @@ fn build_project_context(request: &ProjectPromptRequest) -> String {
             preferences.excluded_instruments.join("、")
         );
     }
-    if let Some(score) = &request.working_alda {
+    if let Some(score) = &request.revision_alda {
+        message.push_str("\n【上次未通过的待修正 Alda｜只修正反馈涉及的问题】\n");
+        message.push_str(score);
+    } else if let Some(score) = &request.working_alda {
         message.push_str("\n【当前工作 Alda｜优先继续发展】\n");
         message.push_str(score);
     } else if let Some(score) = &request.current_alda {

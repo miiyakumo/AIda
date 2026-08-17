@@ -1,6 +1,6 @@
 use crate::agent::{
     Agent, AgentReporter, AgentResultKind, AgentToolContext, CreationRequest, CreationResult,
-    ProjectPromptRequest, from_provider_messages,
+    ProjectPromptRequest,
 };
 use crate::alda::{AldaCheck, AldaRunner, CancellationToken, CheckStatus, find_alda};
 use crate::audio::AudioRenderer;
@@ -8,7 +8,7 @@ use crate::command::{
     AldaAction, ConfigAction, ExportFormat, ProjectAction, ScoreTarget, UserAction, help,
 };
 use crate::config::ModelConfig;
-use crate::conversation::{ConversationMessage, ConversationRole, ConversationState};
+use crate::conversation::{ConversationMessage, ConversationState};
 use crate::deepseek::{ChatError, DeepSeekClient};
 use crate::instructions::{CompiledInstructions, DurationConstraint, ProjectPreferences};
 use crate::project::{CheckRecord, Project, WorkingScoreKind};
@@ -311,8 +311,12 @@ impl Application {
         let config = ModelConfig::load(self.project.root()).and_then(|config| config.resolve())?;
         let answered_clarification =
             self.project.conversation().state() == ConversationState::AwaitingInput;
-        let require_candidate =
-            requests_complete_candidate(&prompt) || self.project.conversation().pending_candidate();
+        let require_candidate = requests_complete_candidate(&prompt)
+            || self.project.conversation().pending_candidate()
+            || self
+                .project
+                .pending_revision()
+                .is_some_and(|revision| revision.kind == WorkingScoreKind::Candidate);
         self.project
             .prepare_user_message_with_requirement(&prompt, require_candidate)?;
         if let Some(duration) = explicit_duration_secs(&prompt) {
@@ -346,6 +350,11 @@ impl Application {
                         .project
                         .working_score()
                         .map(|_| self.project.working_code())
+                        .transpose()?,
+                    revision_alda: self
+                        .project
+                        .pending_revision()
+                        .map(|_| self.project.revision_code())
                         .transpose()?,
                     compiled_instructions,
                     max_rounds: 3,
@@ -389,7 +398,19 @@ impl Application {
                     .as_deref()
                     .context("成功结果缺少 Alda 代码")?,
                 kind,
-                &prompt,
+                &result.interpretation,
+                &result.checks,
+            )?;
+        } else if let Some(alda_code) = result.alda_code.as_deref() {
+            let kind = match result.kind {
+                AgentResultKind::Draft => WorkingScoreKind::Draft,
+                AgentResultKind::Candidate => WorkingScoreKind::Candidate,
+                _ => bail!("文本结果不能保存为待修正候选"),
+            };
+            self.project.save_pending_revision(
+                alda_code,
+                kind,
+                &result.interpretation,
                 &result.checks,
             )?;
         }
@@ -408,9 +429,8 @@ impl Application {
         } else {
             ConversationState::RevisionAvailable
         };
-        let mut messages = from_provider_messages(result.conversation);
-        messages.retain(|message| message.role != ConversationRole::System);
-        self.project.replace_conversation(messages, state)?;
+        self.project
+            .finish_agent_turn(result.interpretation.clone(), state)?;
         Ok(ActionResult::AgentCompleted {
             kind: result.kind,
             success: result.success,
@@ -1402,6 +1422,50 @@ mod tests {
         assert!(message.contains("v1"));
         assert_eq!(application.project_view().current_version, Some(1));
         assert!(application.project_view().working_score.is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_turn_persists_only_semantic_history_and_result_summary() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("poem");
+        let mut project = Project::load_or_create(root.clone(), "poem", "").unwrap();
+        project
+            .configure(&ProjectPreferences {
+                target_duration_secs: Some(DurationConstraint::exact(180.0)),
+                ..ProjectPreferences::default()
+            })
+            .unwrap();
+        let (_runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project(project, Some(runner));
+        let (base_url, _requests) = serve(vec![MockResponse::sse(candidate_response())]);
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application.configure(ConfigAction::Url(base_url)).unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+
+        application
+            .execute(UserAction::Agent("继续修正".to_string()), &mut Silent)
+            .await
+            .unwrap();
+
+        let working = application.project.working_score().unwrap();
+        assert_eq!(working.summary, "工作乐谱");
+        let messages = application.project.conversation().messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content.as_deref(), Some("继续修正"));
+        assert_eq!(messages[1].content.as_deref(), Some("工作乐谱"));
+        assert!(
+            messages
+                .iter()
+                .all(|message| { message.tool_calls.is_empty() && message.tool_call_id.is_none() })
+        );
+
+        let metadata = std::fs::read_to_string(root.join("project.json")).unwrap();
+        assert!(!metadata.contains("tool_calls"));
+        assert!(!metadata.contains("piano: c"));
     }
 
     #[tokio::test]
