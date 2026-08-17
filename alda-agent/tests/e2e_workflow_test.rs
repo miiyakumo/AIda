@@ -13,6 +13,14 @@ use std::thread;
 
 fn tool_response(kind: &str, message: &str, code: Option<&str>) -> String {
     let mut arguments = serde_json::json!({ "kind": kind, "message": message });
+    if kind == "plan" {
+        arguments["plan"] = serde_json::json!({
+            "core_material": "机械脉冲与明亮上行动机",
+            "form": "引子—呈示—发展—结尾",
+            "orchestration": "钢琴与弦乐",
+            "development": "通过节奏加密和音区上移逐步推进"
+        });
+    }
     if let Some(code) = code {
         arguments["alda_code"] = serde_json::Value::String(code.to_string());
     }
@@ -111,7 +119,7 @@ async fn progressive_workflow_only_versions_an_accepted_candidate() {
         Project::load_or_create(root.clone(), "mechanical-drive-poem", source).unwrap();
     project
         .configure(&ProjectPreferences {
-            target_duration_secs: Some(180.0),
+            target_duration_secs: Some(alda_agent::instructions::DurationConstraint::exact(180.0)),
             ..ProjectPreferences::default()
         })
         .unwrap();

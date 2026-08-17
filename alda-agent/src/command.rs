@@ -17,7 +17,7 @@ pub enum AldaAction {
     Stop,
     Check(ScoreTarget),
     Export {
-        version: Option<u32>,
+        target: ScoreTarget,
         format: ExportFormat,
     },
 }
@@ -33,6 +33,7 @@ pub enum ScoreTarget {
 pub enum ExportFormat {
     Alda,
     Midi,
+    Wav,
     All,
 }
 
@@ -59,7 +60,9 @@ pub enum ConfigAction {
     Include(Vec<String>),
     Exclude(Vec<String>),
     Model(String),
+    PromptModel,
     Url(String),
+    PromptUrl,
     ApiKey(Option<String>),
 }
 
@@ -115,12 +118,12 @@ pub fn parse(input: &str) -> Result<UserAction> {
         ["/project", "config"] => Ok(UserAction::Project(ProjectAction::Config(
             ConfigAction::Show,
         ))),
-        ["/project", "config", "url"] => {
-            bail!("缺少 API Base URL；用法：/project config url https://api.example.com")
-        }
-        ["/project", "config", "model"] => {
-            bail!("缺少模型名称；用法：/project config model MODEL_NAME")
-        }
+        ["/project", "config", "url"] => Ok(UserAction::Project(ProjectAction::Config(
+            ConfigAction::PromptUrl,
+        ))),
+        ["/project", "config", "model"] => Ok(UserAction::Project(ProjectAction::Config(
+            ConfigAction::PromptModel,
+        ))),
         ["/project", "config", "mode", mode @ ("full" | "improv")] => Ok(UserAction::Project(
             ProjectAction::Config(ConfigAction::Mode((*mode).to_string())),
         )),
@@ -204,7 +207,8 @@ fn parse_instruments(values: &[&str]) -> Vec<String> {
 }
 
 fn parse_export(words: &[&str]) -> Result<AldaAction> {
-    let mut version = None;
+    let mut target = ScoreTarget::Version(None);
+    let mut has_target = false;
     let mut format = ExportFormat::All;
     let mut index = 0;
     while index < words.len() {
@@ -213,28 +217,34 @@ fn parse_export(words: &[&str]) -> Result<AldaAction> {
             format = match words.get(index).copied() {
                 Some("alda") => ExportFormat::Alda,
                 Some("midi") => ExportFormat::Midi,
+                Some("wav") => ExportFormat::Wav,
                 Some("all") => ExportFormat::All,
-                _ => bail!("导出格式必须是 alda、midi 或 all"),
+                _ => bail!("导出格式必须是 alda、midi、wav 或 all"),
             };
-        } else if version.is_none() {
-            version = Some(parse_version(words[index])?);
+        } else if !has_target {
+            target = match words[index] {
+                "current" => ScoreTarget::Version(None),
+                "work" => ScoreTarget::Working,
+                version => ScoreTarget::Version(Some(parse_version(version)?)),
+            };
+            has_target = true;
         } else {
-            bail!("用法：/alda export [VERSION] [--format alda|midi|all]");
+            bail!("用法：/alda export [current|work|VERSION] [--format alda|midi|wav|all]");
         }
         index += 1;
     }
-    Ok(AldaAction::Export { version, format })
+    Ok(AldaAction::Export { target, format })
 }
 
 #[must_use]
 pub fn help(path: &[String]) -> String {
     match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => "自然语言输入用于讨论、规划和发展工作乐谱。\n/alda ...     校验、播放、停止和导出\n/project ...  接受候选、查看版本和修改设置\n/help ...     查看分层帮助\n/quit         退出".to_string(),
-        ["alda"] => "/alda play [VERSION|work]\n/alda stop\n/alda check [VERSION|work]\n/alda check --file PATH\n/alda export [VERSION] [--format alda|midi|all]".to_string(),
+        ["alda"] => "/alda play [VERSION|work]\n/alda stop\n/alda check [VERSION|work]\n/alda check --file PATH\n/alda export [current|work|VERSION] [--format alda|midi|wav|all]".to_string(),
         ["project"] => "/project\n/project instructions\n/project skills [enable|disable QUALIFIED_ID]\n/project accept\n/project discard\n/project versions\n/project switch VERSION\n/project adopt PATH\n/project config ...".to_string(),
         ["project", "skills"] => "/project skills\n/project skills enable user:NAME|project:NAME\n/project skills disable user:NAME|project:NAME".to_string(),
         ["project", "config"] => "/project config\n/project config model NAME\n/project config url URL\n/project config key             # 隐藏输入，不进入历史\n/project config mode full|improv\n/project config duration SECONDS|none\n/project config include INST...|none\n/project config exclude INST...|none".to_string(),
-        ["alda", "export"] => "用法：/alda export [VERSION] [--format alda|midi|all]\n默认导出当前版本的 Alda 和 MIDI。\n示例：/alda export v2 --format midi".to_string(),
+        ["alda", "export"] => "用法：/alda export [current|work|VERSION] [--format alda|midi|wav|all]\n默认一键导出当前版本的 Alda、MIDI 和 WAV。\n示例：/alda export work --format wav".to_string(),
         _ => "没有该帮助主题；输入 /help 查看入口".to_string(),
     }
 }
@@ -270,6 +280,13 @@ mod tests {
             parse("/alda play work").unwrap(),
             UserAction::Alda(AldaAction::Play(ScoreTarget::Working))
         );
+        assert_eq!(
+            parse("/alda export work --format wav").unwrap(),
+            UserAction::Alda(AldaAction::Export {
+                target: ScoreTarget::Working,
+                format: ExportFormat::Wav,
+            })
+        );
         assert!(parse("/play").unwrap_err().to_string().contains("已删除"));
         assert_eq!(
             parse("/project config model example-model").unwrap(),
@@ -284,11 +301,13 @@ mod tests {
         assert!(parse("/project config key secret").is_err());
         assert!(contains_inline_api_key(" /project config key secret"));
         assert!(!contains_inline_api_key("/project config key"));
-        assert!(
-            parse("/project config url")
-                .unwrap_err()
-                .to_string()
-                .contains("API Base URL")
+        assert_eq!(
+            parse("/project config url").unwrap(),
+            UserAction::Project(ProjectAction::Config(ConfigAction::PromptUrl))
+        );
+        assert_eq!(
+            parse("/project config model").unwrap(),
+            UserAction::Project(ProjectAction::Config(ConfigAction::PromptModel))
         );
     }
 }

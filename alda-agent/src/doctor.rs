@@ -10,11 +10,50 @@ enum CheckStatus {
     Fail,
 }
 
-fn run_checks(exec: impl Fn(&str, &[&str]) -> Option<String>) -> Vec<CheckResult> {
+fn run_checks(
+    exec: impl Fn(&str, &[&str]) -> Option<String>,
+    soundfont: impl Fn() -> Option<std::path::PathBuf>,
+) -> Vec<CheckResult> {
     let java = check_java(&exec);
     let alda = check_alda(&exec);
+    let fluidsynth = check_fluidsynth(&exec);
+    let soundfont = check_soundfont(&soundfont);
     let rust = check_rust(&exec);
-    vec![java, alda, rust]
+    vec![java, alda, fluidsynth, soundfont, rust]
+}
+
+fn check_fluidsynth(exec: &impl Fn(&str, &[&str]) -> Option<String>) -> CheckResult {
+    exec("which", &["fluidsynth"]).map_or_else(
+        || CheckResult {
+            name: "FluidSynth",
+            status: CheckStatus::Fail,
+            detail: "未找到 fluidsynth".to_string(),
+            suggestion: Some("运行 scripts/install-linux.sh 安装 FluidSynth".to_string()),
+        },
+        |output| CheckResult {
+            name: "FluidSynth",
+            status: CheckStatus::Pass,
+            detail: output.trim().to_string(),
+            suggestion: None,
+        },
+    )
+}
+
+fn check_soundfont(find: &impl Fn() -> Option<std::path::PathBuf>) -> CheckResult {
+    find().map_or_else(
+        || CheckResult {
+            name: "GM SoundFont",
+            status: CheckStatus::Fail,
+            detail: "未找到 General MIDI SoundFont".to_string(),
+            suggestion: Some("安装 fluid-soundfont-gm，或设置 ALDA_AGENT_SOUNDFONT".to_string()),
+        },
+        |path| CheckResult {
+            name: "GM SoundFont",
+            status: CheckStatus::Pass,
+            detail: path.display().to_string(),
+            suggestion: None,
+        },
+    )
 }
 
 fn check_rust(exec: &impl Fn(&str, &[&str]) -> Option<String>) -> CheckResult {
@@ -122,7 +161,7 @@ pub async fn run(
         }
     };
 
-    let results = run_checks(exec);
+    let results = run_checks(exec, crate::audio::find_soundfont);
     print_results(&results);
     let failed = results
         .iter()
@@ -177,13 +216,16 @@ async fn probe_model(project_root: &std::path::Path) -> anyhow::Result<()> {
 
 async fn probe_alda() -> anyhow::Result<()> {
     use crate::alda::{AldaRunner, find_alda};
+    use crate::audio::AudioRenderer;
     let path = find_alda().ok_or_else(|| anyhow::anyhow!("未找到 alda"))?;
     let score_dir = tempfile::tempdir()?;
     let score = score_dir.path().join("probe.alda");
     std::fs::write(&score, "piano: c")?;
-    let checks = AldaRunner::new(path)
+    let runner = AldaRunner::new(path);
+    let checks = runner
+        .clone()
         .validate_async(
-            score,
+            score.clone(),
             crate::alda::ScoreValidation::new(None, Vec::new(), Vec::new()),
         )
         .await?;
@@ -193,7 +235,18 @@ async fn probe_alda() -> anyhow::Result<()> {
     {
         anyhow::bail!("Alda 真实探测未通过校验");
     }
-    println!("✓ Alda 真实连通探测通过");
+    let report = AudioRenderer::discover()?
+        .render_score_async(
+            runner,
+            score,
+            score_dir.path().join("probe.mid"),
+            score_dir.path().join("probe.wav"),
+        )
+        .await?;
+    println!(
+        "✓ Alda→MIDI→WAV 真实探测通过（解析 {:.2} 秒，音频 {:.2} 秒，peak {:.4}）",
+        report.parsed_duration_secs, report.wav.duration_secs, report.wav.peak
+    );
     Ok(())
 }
 
@@ -230,16 +283,16 @@ mod tests {
 
     #[test]
     fn test_run_checks_all_pass() {
-        let exec = |program: &str, _args: &[&str]| -> Option<String> {
+        let exec = |program: &str, args: &[&str]| -> Option<String> {
             match program {
                 "java" => Some("openjdk version \"21.0.4\" 2024-07-16 LTS\n".to_string()),
-                "which" => Some("/usr/local/bin/alda\n".to_string()),
+                "which" => Some(format!("/usr/local/bin/{}\n", args[0])),
                 "rustc" => Some("rustc 1.85.0\n".to_string()),
                 _ => None,
             }
         };
-        let results = run_checks(exec);
-        assert_eq!(results.len(), 3);
+        let results = run_checks(exec, || Some("/tmp/test.sf2".into()));
+        assert_eq!(results.len(), 5);
         assert!(matches!(results[0].status, CheckStatus::Pass));
         assert!(matches!(results[1].status, CheckStatus::Pass));
         assert!(matches!(results[2].status, CheckStatus::Pass));
@@ -250,8 +303,8 @@ mod tests {
     #[test]
     fn test_run_checks_all_fail() {
         let exec = |_program: &str, _args: &[&str]| -> Option<String> { None };
-        let results = run_checks(exec);
-        assert_eq!(results.len(), 3);
+        let results = run_checks(exec, || None);
+        assert_eq!(results.len(), 5);
         assert!(matches!(results[0].status, CheckStatus::Fail));
         assert!(matches!(results[1].status, CheckStatus::Fail));
         assert!(matches!(results[2].status, CheckStatus::Fail));
@@ -267,8 +320,8 @@ mod tests {
                 _ => None,
             }
         };
-        let results = run_checks(exec);
-        assert_eq!(results.len(), 3);
+        let results = run_checks(exec, || None);
+        assert_eq!(results.len(), 5);
         assert!(matches!(results[0].status, CheckStatus::Pass));
         assert!(matches!(results[1].status, CheckStatus::Fail));
         assert!(results[1].suggestion.is_some());

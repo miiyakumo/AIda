@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 pub struct Conversation {
     messages: Vec<ConversationMessage>,
     state: ConversationState,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pending_candidate: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +58,11 @@ impl Conversation {
     #[must_use]
     pub fn state(&self) -> ConversationState {
         self.state
+    }
+
+    #[must_use]
+    pub fn pending_candidate(&self) -> bool {
+        self.pending_candidate
     }
 
     #[must_use]
@@ -106,5 +118,15 @@ impl Conversation {
 
     pub fn set_state(&mut self, state: ConversationState) {
         self.state = state;
+        if !matches!(
+            state,
+            ConversationState::AwaitingInput | ConversationState::RequestPending
+        ) {
+            self.pending_candidate = false;
+        }
+    }
+
+    pub fn set_pending_candidate(&mut self, pending_candidate: bool) {
+        self.pending_candidate = pending_candidate;
     }
 }

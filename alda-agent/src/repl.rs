@@ -226,6 +226,19 @@ async fn execute_line(
             return Ok(true);
         }
     };
+    action = match action {
+        UserAction::Project(ProjectAction::Config(crate::command::ConfigAction::PromptModel)) => {
+            UserAction::Project(ProjectAction::Config(crate::command::ConfigAction::Model(
+                prompt_plain_value("模型名称：")?,
+            )))
+        }
+        UserAction::Project(ProjectAction::Config(crate::command::ConfigAction::PromptUrl)) => {
+            UserAction::Project(ProjectAction::Config(crate::command::ConfigAction::Url(
+                prompt_plain_value("API Base URL：")?,
+            )))
+        }
+        other => other,
+    };
     if matches!(
         action,
         UserAction::Project(ProjectAction::Config(crate::command::ConfigAction::ApiKey(
@@ -280,6 +293,18 @@ async fn execute_line(
     }
 }
 
+fn prompt_plain_value(label: &str) -> Result<String> {
+    eprint!("{label}");
+    std::io::stderr().flush()?;
+    let mut value = String::new();
+    std::io::stdin().read_line(&mut value)?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        anyhow::bail!("输入不能为空");
+    }
+    Ok(value)
+}
+
 fn render_result(result: &ActionResult, writer: &mut impl Write) -> Result<()> {
     match result {
         ActionResult::Message(message) => writeln!(writer, "{message}")?,
@@ -313,9 +338,13 @@ fn render_result(result: &ActionResult, writer: &mut impl Write) -> Result<()> {
             kind: crate::agent::AgentResultKind::Answer,
             ..
         } => writeln!(writer, "✓ 已回答 · 当前乐谱和版本未改变")?,
-        ActionResult::AgentCompleted { rounds, .. } => writeln!(
+        ActionResult::AgentCompleted {
+            rounds,
+            working_score_status,
+            ..
+        } => writeln!(
             writer,
-            "! {rounds} 轮后修正仍未完成；当前有效版本未改变。\n  下一步：输入“继续修正”，也可以提出新的要求。"
+            "! {rounds} 轮后修正仍未完成；新候选未保存，{working_score_status}；当前有效版本未改变。\n  下一步：输入“继续修正”，也可以提出新的要求。"
         )?,
         ActionResult::None | ActionResult::Quit => {}
     }
@@ -521,6 +550,28 @@ impl AgentReporter for TerminalReporter {
                     "等待模型响应",
                 );
             }
+            AgentEvent::ToolContinuationStarted { turn } => {
+                self.close_model();
+                self.stage(
+                    &format!("Agent · 工具返回后继续 · 第 {turn} 次往返"),
+                    "等待模型响应",
+                );
+            }
+            AgentEvent::ToolProtocolRetry { call_count } => {
+                self.close_model();
+                self.finish_spinner();
+                eprintln!("↻ Agent · 自动恢复工具协议 · 拒绝了 {call_count} 个并行调用");
+            }
+            AgentEvent::ToolCallMissingRetry => {
+                self.close_model();
+                self.finish_spinner();
+                eprintln!("↻ Agent · 自动恢复工具协议 · 模型未调用工具");
+            }
+            AgentEvent::ToolArgumentsRetry { tool_name } => {
+                self.close_model();
+                self.finish_spinner();
+                eprintln!("↻ Agent · 自动恢复工具参数 · {tool_name} 参数不完整或无效");
+            }
             AgentEvent::ValidationStarted { round, max_rounds } => {
                 self.close_model();
                 self.alda_active.store(true, Ordering::SeqCst);
@@ -570,6 +621,21 @@ fn render_event(event: &AgentEvent, writer: &mut impl Write) -> Result<()> {
         AgentEvent::RoundStarted { round, max_rounds } => writeln!(
             writer,
             "◇ Agent · 生成第 {round}/{max_rounds} 轮 · 等待模型"
+        )?,
+        AgentEvent::ToolContinuationStarted { turn } => writeln!(
+            writer,
+            "◇ Agent · 工具返回后继续 · 第 {turn} 次往返 · 等待模型"
+        )?,
+        AgentEvent::ToolProtocolRetry { call_count } => writeln!(
+            writer,
+            "↻ Agent · 自动恢复工具协议 · 拒绝了 {call_count} 个并行调用"
+        )?,
+        AgentEvent::ToolCallMissingRetry => {
+            writeln!(writer, "↻ Agent · 自动恢复工具协议 · 模型未调用工具")?;
+        }
+        AgentEvent::ToolArgumentsRetry { tool_name } => writeln!(
+            writer,
+            "↻ Agent · 自动恢复工具参数 · {tool_name} 参数不完整或无效"
         )?,
         AgentEvent::ModelText(text) => {
             if !text.trim().is_empty() {
@@ -710,7 +776,7 @@ mod tests {
             working_score: None,
             versions: vec![],
             mode: "full".into(),
-            target_duration_secs: Some(180.0),
+            target_duration_secs: Some(crate::instructions::DurationConstraint::exact(180.0)),
             included_instruments: vec!["piano".into()],
             excluded_instruments: vec!["violin".into()],
             enabled_advisory_skills: vec![],

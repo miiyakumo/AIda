@@ -18,14 +18,18 @@ fn check_mode_never_invokes_sudo_or_installers() {
     executable(directory.path(), "java", "echo java 21");
     executable(directory.path(), "alda", "echo alda 2.3.0");
     executable(directory.path(), "rustc", "echo rustc 1.85.0");
+    executable(directory.path(), "fluidsynth", "echo FluidSynth 2.3");
     executable(directory.path(), "sudo", "exit 99");
     executable(directory.path(), "curl", "exit 99");
     let path = format!("{}:/usr/bin:/bin", directory.path().display());
+    let soundfont = directory.path().join("test.sf2");
+    fs::write(&soundfont, b"fake").unwrap();
 
     let output = Command::new("bash")
         .arg("scripts/install-linux.sh")
         .arg("--check")
         .env("PATH", path)
+        .env("ALDA_AGENT_SOUNDFONT", soundfont)
         .output()
         .unwrap();
     assert!(
@@ -55,13 +59,17 @@ fn normal_mode_is_idempotent_when_dependencies_exist() {
     executable(directory.path(), "java", "echo java 21");
     executable(directory.path(), "alda", "echo alda 2.3.0");
     executable(directory.path(), "rustc", "echo rustc 1.85.0");
+    executable(directory.path(), "fluidsynth", "echo FluidSynth 2.3");
     executable(directory.path(), "sudo", "exit 99");
     executable(directory.path(), "curl", "exit 99");
     let path = format!("{}:/usr/bin:/bin", directory.path().display());
+    let soundfont = directory.path().join("test.sf2");
+    fs::write(&soundfont, b"fake").unwrap();
 
     let output = Command::new("bash")
         .arg("scripts/install-linux.sh")
         .env("PATH", path)
+        .env("ALDA_AGENT_SOUNDFONT", soundfont)
         .output()
         .unwrap();
     assert!(

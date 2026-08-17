@@ -17,3 +17,6 @@ description：基于同类 Coding Agent 调研，分离滚动历史、活动状�
 
 [可组合指示系统首期](composable-instructions/README.md)
 description：确定性指示编译、Skill 安全加载、项目启用配置、模型接入与首期非目标。
+
+[Alda 音频产物与 Agent 回合闭环](alda-artifacts-and-agent-turns/README.md)
+description：补齐 Alda 到 WAV 的真实产物链、官方手册快照、宿主工具状态机、约束持久化和状态反馈。

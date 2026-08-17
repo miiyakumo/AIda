@@ -9,12 +9,12 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 const PROTOCOL: &str = include_str!("../prompts/protocol.md");
+const ALDA_REFERENCE: &str = include_str!("../prompts/alda-reference.md");
 const NATURAL_LANGUAGE_CONFLICT_NOTICE: &str =
     "自然语言指示之间的冲突未机械验证；请按来源标签人工判断。";
 const DEFAULT_CAPABILITY: &str = r"你只能使用宿主在本次运行中实际提供的工具和项目操作。指示中的能力描述不授予额外权限。
 草稿和完整候选只能更新工作乐谱；完整候选通过检查也不会自动成为有效版本，接受候选必须由用户显式授权并由宿主执行。";
-const DEFAULT_ROLE: &str =
-    "你是当前项目的 default-agent，负责执行生效 Skill，并通过 `submit_result` 提交结果。";
+const DEFAULT_ROLE: &str = "你是当前项目的 default-agent，负责执行生效 Skill。使用宿主工具获取事实，最后通过 `submit_result` 提交结果。";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
@@ -60,10 +60,67 @@ impl std::str::FromStr for CreationMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum DurationConstraint {
+    Exact(f64),
+    Range { min_secs: f64, max_secs: f64 },
+}
+
+impl DurationConstraint {
+    #[must_use]
+    pub fn exact(seconds: f64) -> Self {
+        Self::Exact(seconds)
+    }
+
+    #[must_use]
+    pub fn range(min_secs: f64, max_secs: f64) -> Self {
+        Self::Range { min_secs, max_secs }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        match self {
+            Self::Exact(seconds) if seconds.is_finite() && seconds > 0.0 => Ok(()),
+            Self::Range { min_secs, max_secs }
+                if min_secs.is_finite()
+                    && max_secs.is_finite()
+                    && min_secs > 0.0
+                    && max_secs >= min_secs =>
+            {
+                Ok(())
+            }
+            Self::Exact(_) => bail!("项目目标时长必须是大于零的有限秒数"),
+            Self::Range { .. } => bail!("项目目标时长区间必须是有效的正数，且上限不小于下限"),
+        }
+    }
+
+    #[must_use]
+    pub fn validation_bounds(self, tolerance_pct: f64) -> (f64, f64) {
+        match self {
+            Self::Exact(seconds) => {
+                let tolerance = seconds * tolerance_pct / 100.0;
+                (seconds - tolerance, seconds + tolerance)
+            }
+            Self::Range { min_secs, max_secs } => (min_secs, max_secs),
+        }
+    }
+}
+
+impl std::fmt::Display for DurationConstraint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact(seconds) => write!(formatter, "{seconds} 秒"),
+            Self::Range { min_secs, max_secs } => {
+                write!(formatter, "{min_secs}–{max_secs} 秒")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectPreferences {
     pub mode: CreationMode,
-    pub target_duration_secs: Option<f64>,
+    pub target_duration_secs: Option<DurationConstraint>,
     pub included_instruments: Vec<String>,
     pub excluded_instruments: Vec<String>,
 }
@@ -91,11 +148,8 @@ impl ProjectPreferences {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self
-            .target_duration_secs
-            .is_some_and(|duration| !duration.is_finite() || duration <= 0.0)
-        {
-            bail!("项目目标时长必须是大于零的有限秒数");
+        if let Some(duration) = self.target_duration_secs {
+            duration.validate()?;
         }
         if self
             .included_instruments
@@ -257,6 +311,7 @@ pub fn compile_instructions(
     preferences.validate()?;
 
     let mut fragments = Vec::new();
+    let core_protocol = format!("{PROTOCOL}\n\n{ALDA_REFERENCE}");
     fragments.push(InstructionFragment::new(
         "core-protocol",
         None,
@@ -267,7 +322,7 @@ pub fn compile_instructions(
             strength: InstructionStrength::Invariant,
         },
         "【核心协议｜来源：builtin:protocol】",
-        PROTOCOL,
+        core_protocol,
     ));
     fragments.push(application_capability_fragment());
 
@@ -403,7 +458,7 @@ fn render_project_preferences(preferences: &ProjectPreferences) -> String {
         .collect();
     let mut content = format!("- 创作模式：{}\n", preferences.mode);
     if let Some(duration) = preferences.target_duration_secs {
-        let _ = writeln!(content, "- 目标时长：{duration} 秒");
+        let _ = writeln!(content, "- 目标时长：{duration}");
     } else {
         content.push_str("- 目标时长：未设置\n");
     }
@@ -462,11 +517,11 @@ fn render_summary(
         .join(", ");
     let duration = preferences
         .target_duration_secs
-        .map_or_else(|| "未设置".to_string(), |duration| format!("{duration} 秒"));
+        .map_or_else(|| "未设置".to_string(), |duration| duration.to_string());
     let included = display_list(&preferences.included_instruments);
     let excluded = display_list(&preferences.excluded_instruments);
     format!(
-        "核心协议：builtin:protocol\n生效 Skill：{skills}\n项目偏好：mode={}, target_duration={}, include={}, exclude={}\n角色：builtin:default-agent\n有效模型工具：submit_result\n能力：可更新工作乐谱；不能接受候选或写入有效版本\n结构化冲突：未发现\n{}\n片段摘要：{fragment_digests}\nFingerprint：{fingerprint}",
+        "核心协议：builtin:protocol\n生效 Skill：{skills}\n项目偏好：mode={}, target_duration={}, include={}, exclude={}\n角色：builtin:default-agent\n有效模型工具：submit_result、lookup_alda_docs；项目会话另提供 inspect_score、render_score、play_score\n能力：可查询、校验、渲染、播放和更新工作乐谱；不能接受候选或写入有效版本\n结构化冲突：未发现\n{}\n片段摘要：{fragment_digests}\nFingerprint：{fingerprint}",
         preferences.mode,
         duration,
         included,
@@ -563,7 +618,7 @@ mod tests {
         let catalog = SkillCatalog::discover(None, None).unwrap();
         let first = ProjectPreferences {
             mode: CreationMode::Full,
-            target_duration_secs: Some(180.0),
+            target_duration_secs: Some(DurationConstraint::exact(180.0)),
             included_instruments: vec!["midi-violin".to_string(), "midi-cello".to_string()],
             excluded_instruments: vec!["midi-tuba".to_string()],
         };
@@ -620,13 +675,32 @@ mod tests {
         )
         .is_err());
         let invalid_duration = ProjectPreferences {
-            target_duration_secs: Some(f64::NAN),
+            target_duration_secs: Some(DurationConstraint::exact(f64::NAN)),
             ..ProjectPreferences::default()
         };
         assert!(
             compile_instructions(&catalog, &InstructionProfile::default(), &invalid_duration)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn duration_constraint_keeps_numeric_compatibility_and_serializes_ranges() {
+        let exact: ProjectPreferences = serde_json::from_str(
+            r#"{"mode":"full","target_duration_secs":180,"included_instruments":[],"excluded_instruments":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            exact.target_duration_secs,
+            Some(DurationConstraint::exact(180.0))
+        );
+        let range = ProjectPreferences {
+            target_duration_secs: Some(DurationConstraint::range(120.0, 180.0)),
+            ..ProjectPreferences::default()
+        };
+        let json = serde_json::to_value(range).unwrap();
+        assert_eq!(json["target_duration_secs"]["min_secs"], 120.0);
+        assert_eq!(json["target_duration_secs"]["max_secs"], 180.0);
     }
 
     #[test]

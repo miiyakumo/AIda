@@ -1,6 +1,6 @@
 # 当前架构
 
-> 代码基线：生成与项目持久化边界收敛（2026-08-15）
+> 代码基线：音频产物与 Agent 工具闭环（2026-08-17）
 >
 > 本文描述当前源码实际行为。
 
@@ -18,7 +18,8 @@ Shell CLI（main.rs）
     ├── application.rs：动作执行、能力装载、双视图快照
     ├── project.rs + conversation.rs：项目聚合与持久对话
     ├── agent.rs + deepseek.rs：模型生成、事件报告与协议转换
-    └── alda.rs：校验、播放、停止、导出与单操作取消
+    ├── alda.rs：解析、校验、播放、停止、MIDI 导出与单操作取消
+    └── audio.rs：FluidSynth 渲染、SoundFont 发现和 WAV 信息分析
 ```
 
 终端不直接修改 Project，也不编排 Agent 生成循环。它把输入解析为 `UserAction`，调用
@@ -66,7 +67,8 @@ alda-agent [--name NAME | --project PATH] control
 | Config | `config_show`、`config_mode`、`config_duration`、`config_include`、`config_exclude`、`config_model`、`config_url` |
 
 `alda_play` 和 `alda_check` 的 `target` 接受 `current`、`work` 或 `vN`；`alda_check` 也可改用 `file` 检查
-外部文件。控制面刻意不支持模型密钥设置，密钥仍只能通过交互终端隐藏输入或已有的私有 `model.json`
+外部文件。`alda_export` 支持 `current`、`work`、`vN` 和 `alda`、`midi`、`wav`、`all` 格式，默认生成全部
+产物。控制面刻意不支持模型密钥设置，密钥仍只能通过交互终端隐藏输入或已有的私有 `model.json`
 提供，避免进入自动化命令与日志。
 
 控制面用于真实模型调用、Alda 操作、状态流转、重启恢复和错误恢复等自动化验收。音乐听感、修改是否符合
@@ -98,7 +100,8 @@ mode 使用可序列化枚举；提示编译和 Alda 校验都从同一份 Proje
 必须满足项目时长。两者都写入 `work.alda`，不会改变有效版本。项目只保留一个工作乐谱，新结果覆盖旧
 结果；`/project accept` 接受完整候选并创建版本，`/project discard` 放弃工作乐谱。
 
-用户第一条消息在模型或 Alda 前置条件检查之前持久化，失败和取消不会丢失输入。`ProjectView` 展示
+用户消息在模型配置前置检查通过后持久化，避免缺失配置时把配置值或无效请求污染创作会话；进入模型请求
+后的失败和取消仍保留请求状态。`ProjectView` 展示
 项目事实、版本、设置和能力；`ConversationView` 展示消息、待处理状态和下一步建议。两者每次从
 Project 与进程内能力状态派生，不是新的事实来源。
 
@@ -106,14 +109,20 @@ Project 与进程内能力状态派生，不是新的事实来源。
 
 项目、Alda 和模型能力独立：打开项目不创建模型客户端；自然语言操作才读取项目内 `model.json` 并
 创建客户端。模型名称、OpenAI-compatible API Base URL 和密钥必须全部设置；模型失败不会阻止
-`/project` 或可用的 `/alda` 操作。Alda 缺失时仍可导出版本的 Alda 源码；请求 MIDI 或 all 会明确
-报告 MIDI 未完成。
+`/project` 或可用的 `/alda` 操作。Alda 缺失时仍可导出版本的 Alda 源码；只请求 MIDI 时会明确报告
+MIDI 未完成。WAV 或 all 还要求 FluidSynth 和 General MIDI SoundFont，找不到时直接返回可操作的安装
+提示，不会伪造成功产物。
+
+Linux 安装脚本同时安装或检查 Java、Alda、FluidSynth 与 GM SoundFont，可用
+`ALDA_AGENT_SOUNDFONT` 指向非标准 SoundFont。`doctor` 本地检查五项依赖；Alda probe 会真实执行
+Alda → MIDI → WAV，并拒绝零帧或静音 WAV。
 
 模型配置完整性、最近模型服务状态和对话请求状态彼此独立。限流、认证、网络或模型拒绝不会把完整配置
 标成不可用；界面按错误类型分别提示稍后重试、更新密钥或检查 API Base URL。用户消息在请求前以
 `request_pending` 状态持久化；失败或取消后重新提交相同内容会复用原消息，不会重复污染模型上下文。
 
-模型名称和 API Base URL 由普通 `/project config` 命令设置。密钥使用 `/project config key` 后的隐藏
+模型名称和 API Base URL 由普通 `/project config` 命令设置；命令缺少值时 TTY 会立即读取一次配置输入，
+不会把下一行当作 Agent 消息。密钥使用 `/project config key` 后的隐藏
 输入，避免进入 `.repl-history`；携带明文参数的 key 命令会被拒绝且不写入历史，启动时也会清理旧历史
 中的同类行。配置视图只显示密钥是否存在。`model.json` 在 Unix 上以 `0600` 权限原子写入。
 程序不读取 `.env` 或模型环境变量。`compose` 与 `doctor --probe model` 通过 Shell 的 `--project` 或
@@ -121,7 +130,8 @@ Project 与进程内能力状态派生，不是新的事实来源。
 
 Alda 操作使用每次前台操作独立的 `CancellationToken`。Ctrl+C 在模型阶段丢弃 HTTP future；在 Alda
 阶段设置 token 并等待子进程组终止后才返回提示符。Ctrl+C 编辑输入只清空缓冲，Ctrl+D 或 `/quit`
-退出。
+退出。Alda 2.3.3 的 MIDI 导出可能在冷启动时先拉起后台 player/JVM，因此默认命令超时为 120 秒；超时或
+取消时仍终止完整子进程组。
 
 ## 可组合指示与 Skill
 
@@ -150,12 +160,42 @@ Agent 只有交互式 `respond_with_reporter` 和一次性 `create` 两个真实
 `application::compose_once` 负责一次性 compose 所需的 Project、模型配置、Skill、指示和 Alda 编排，
 `main.rs` 只处理 CLI 输入输出、文件读取写入与退出语义。
 
-Agent 在每轮报告轮次开始、模型文本增量、Alda 校验开始、完整检查结果和自动修正。模型传输层不写
-stdout/stderr；SSE 文本经 callback 实时交给应用 reporter。终端统一渲染模型、Agent、Alda、项目结果
-和错误。
+Agent 在每轮报告轮次开始、Alda 校验开始、完整检查结果和自动修正。模型传输层不写 stdout/stderr；
+模型自由推演不直接显示，终端统一渲染最终提交消息、宿主阶段事件、Alda、项目结果和错误。
 
-模型每轮通过 `submit_result` 明确返回普通回答、澄清、创作计划、草稿或完整候选。文本结果只更新对话；
-草稿和候选通过各自检查后更新工作乐谱。后续自然语言优先基于工作乐谱继续发展，不会按对话轮次创建版本。
+模型请求在提供工具时显式发送 `parallel_tool_calls: false`，每次响应只允许调用一个工具。除 `submit_result`
+外，宿主提供 `lookup_alda_docs`、`inspect_score`、
+`render_score` 和 `play_score`：分别读取固定官方章节、检查已有乐谱、生成 MIDI/WAV 并返回真实音频指标、
+以及真实发起播放。工具轮不消耗三次乐谱修正次数，但单轮最多八次工具调用；重复提交相同源码和相同错误
+会提前停止。SSE 按 tool-call index 分别聚合；若供应商仍返回多个并行调用，宿主拒绝且不执行全部调用，把
+每个对应错误写回上下文后自动继续，不消耗乐谱修正轮数。工具往返使用独立终端事件，不会重复显示同一个
+“生成第 1/3 轮”。模型只返回普通文本或空响应而未调用工具时，宿主同样把协议错误写回并自动继续；原始
+文本只保留在模型上下文中，不会作为已完成结果展示。这类恢复均不消耗乐谱修正轮数，并受八次工具往返
+上限约束。
+
+模型最后通过 `submit_result` 明确返回普通回答、澄清、创作计划、草稿或完整候选。计划必须结构化携带核心
+材料、曲式、配器和发展方式，宿主将其拼成用户可见正文；带提问意图的回答归类为澄清。文本结果只更新对话；
+草稿和候选由宿主真实解析并通过各自检查后更新工作乐谱。后续自然语言优先基于工作乐谱继续发展，不会按
+对话轮次创建版本。
+
+用户消息中的精确或区间总时长（如“目标 3 分钟”“2–3 分钟”）在模型调用前写入项目偏好；旧数字格式
+保持兼容，区间保存为 `min_secs/max_secs` 并按硬边界校验。“数分钟”等含糊描述不被擅自折算，“第 3 分钟”
+“开头 30 秒”等段落位置不会被误存为总时长。用户明确要求编写完整曲目时，固定工作流要求直接提交完整
+候选；宿主还会拒绝回答、计划或短草稿，并在同一轮自动要求模型改交 `candidate`。每轮结果同时报告工作
+乐谱是否真的改变；校验通过、渲染成功和播放成功是三个
+独立事实，失败候选不会覆盖已有工作稿，播放后替换 work 时播放对象会明确标为修改前工作乐谱。
+
+“编曲/作曲/写曲/写一首/开始创作”等完成意图同样受完整候选策略约束，但“计划/方案/思路/建议”等讨论
+请求不触发。完整候选要求作为对话状态持久化，跨澄清回答、模型请求失败和进程重启保留，直到候选完成或
+对话以非待定结果结束。用户回答一次澄清后，宿主禁止模型再次进入澄清，避免连续询问或把原始创作意图
+降级成拒绝/替代方案。题材、体裁和时长已经明确时，未指定配器等可选项不构成阻塞。
+
+`submit_result` 参数解析失败不再终止用户请求。宿主把不完整或无效参数作为工具错误写回模型并自动重试，
+该往返不占乐谱修正轮数，终端以“自动恢复工具参数”独立显示；仍受八次工具往返上限约束。
+
+系统提示由核心协议和 `prompts/alda-reference.md` 共同编译。完整官方快照保存在
+`vendor/alda-docs/2.4.3/`，含来源提交与 EPL-2.0 许可证；当前运行时兼容目标仍为 Alda 2.3.3，因此精简
+参考中的示例由实际 2.3.3 解析测试验证，官方来源版本与运行时兼容版本不会混称。
 
 Agent 产生的完整候选不会自动调用 `Project::save_version`。`/project accept` 会按当前项目约束重新校验，
 通过后才创建版本并更新 `current.alda`；失败、取消、草稿和未接受候选都不会改变有效版本。接受候选时，
@@ -173,8 +213,11 @@ project-root/
 ├── .repl-history
 ├── skills/<name>/SKILL.md     # 项目级 advisory Skill，可选
 ├── versions/0001.alda ...     # 不可变版本源码
-└── exports/version-0001.alda|mid ...
+└── exports/version-0001.alda|mid|wav ...
 ```
+
+WAV 使用 FluidSynth 离线渲染。产物报告包含 Alda 解析时长、声部数、事件数、乐器，以及 WAV 实际时长、
+采样率、声道数、帧数、peak、RMS 和静音判断；因此“有可播放事件”和“生成了非静音音频”不再混为一谈。
 
 `project.json` 与其引用的 immutable version 文件共同构成已接受版本的规范事实，`current.alda` 是便利投影。
 working metadata 与其引用的 `work.alda` 共同构成规范工作状态；被引用的 `work.alda` 缺失视为项目损坏，
@@ -187,4 +230,5 @@ working metadata 与其引用的 `work.alda` 共同构成规范工作状态；�
 - `cargo clippy --all-targets --all-features -- -D warnings`：通过；
 - `cargo +1.85.0 check --locked`：通过；锁文件固定 Rust 1.85 可用的依赖链。
 
-真实模型、真实 Alda 播放和完整人体工程学流程仍需在 Linux 终端进行最终验收。
+真实 Alda → MIDI → WAV 已在 Linux 环境验收：4.45 秒、44.1 kHz、双声道、peak 0.0140、RMS 0.0021，
+非静音。真实模型的长对话音乐质量和终端人体工程学仍需人工验收。

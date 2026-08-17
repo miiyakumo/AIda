@@ -1,6 +1,8 @@
 use crate::alda::{AldaCheck, CheckStatus};
 use crate::conversation::{Conversation, ConversationMessage, ConversationState};
-use crate::instructions::{CreationMode, InstructionProfile, ProjectPreferences};
+use crate::instructions::{
+    CreationMode, DurationConstraint, InstructionProfile, ProjectPreferences,
+};
 use crate::skills::{QualifiedSkillId, SkillOrigin};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -172,7 +174,7 @@ impl Project {
     }
 
     #[must_use]
-    pub fn target_duration_secs(&self) -> Option<f64> {
+    pub fn target_duration_secs(&self) -> Option<DurationConstraint> {
         self.preferences.target_duration_secs
     }
 
@@ -205,6 +207,14 @@ impl Project {
     }
 
     pub fn prepare_user_message(&mut self, content: &str) -> Result<()> {
+        self.prepare_user_message_with_requirement(content, false)
+    }
+
+    pub fn prepare_user_message_with_requirement(
+        &mut self,
+        content: &str,
+        require_candidate: bool,
+    ) -> Result<()> {
         if content.trim().is_empty() {
             bail!("对话消息不能为空");
         }
@@ -214,6 +224,7 @@ impl Project {
         if !is_same_pending_request {
             self.conversation.add_user_message(content.to_string());
         }
+        self.conversation.set_pending_candidate(require_candidate);
         self.conversation
             .set_state(ConversationState::RequestPending);
         self.write_metadata()
@@ -1010,7 +1021,7 @@ mod tests {
             Project::load_or_create(directory.path().to_path_buf(), "test", "material").unwrap();
         let error = project
             .configure(&ProjectPreferences {
-                target_duration_secs: Some(0.0),
+                target_duration_secs: Some(DurationConstraint::exact(0.0)),
                 ..ProjectPreferences::default()
             })
             .unwrap_err();
@@ -1067,5 +1078,25 @@ mod tests {
         let mut restarted = Project::load_or_create(root, "ignored", "").unwrap();
         restarted.prepare_user_message("同一个请求").unwrap();
         assert_eq!(restarted.conversation().messages().len(), 1);
+    }
+
+    #[test]
+    fn pending_candidate_requirement_survives_restart_until_the_turn_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+
+        project
+            .prepare_user_message_with_requirement("写一首圣咏", true)
+            .unwrap();
+        assert!(project.conversation().pending_candidate());
+        drop(project);
+
+        let mut restarted = Project::load_or_create(root, "ignored", "").unwrap();
+        assert!(restarted.conversation().pending_candidate());
+        restarted
+            .finish_agent_turn("完成".to_string(), ConversationState::Ready)
+            .unwrap();
+        assert!(!restarted.conversation().pending_candidate());
     }
 }

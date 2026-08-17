@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod alda;
 pub mod application;
+pub mod audio;
 pub mod command;
 pub mod config;
 pub mod control;

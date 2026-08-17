@@ -14,13 +14,13 @@ set -euo pipefail
 
 if [[ "${1:-}" == "--help" ]]; then
     echo "用法: $0 [--check]"
-    echo "  --check  只检查 Java、Alda 与 Rust，不安装或提权"
+    echo "  --check  只检查 Java、Alda、FluidSynth、GM SoundFont 与 Rust，不安装或提权"
     exit 0
 fi
 
 if [[ "${1:-}" == "--check" ]]; then
     failures=0
-    for program in java alda rustc; do
+    for program in java alda fluidsynth rustc; do
         if command -v "$program" >/dev/null 2>&1; then
             echo "[OK] $program: $(command -v "$program")"
         else
@@ -30,6 +30,18 @@ if [[ "${1:-}" == "--check" ]]; then
     done
     if command -v alda >/dev/null 2>&1; then
         alda version || failures=$((failures + 1))
+    fi
+    soundfont_path="${ALDA_AGENT_SOUNDFONT:-}"
+    for candidate in "$soundfont_path" /usr/share/soundfonts/FluidR3_GM.sf2 /usr/share/sounds/sf2/FluidR3_GM.sf2 /usr/share/soundfonts/default.sf2; do
+        if [[ -n "$candidate" && -f "$candidate" ]]; then
+            echo "[OK] GM SoundFont: $candidate"
+            soundfont_path="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$soundfont_path" || ! -f "$soundfont_path" ]]; then
+        echo "[ERR] 未找到 GM SoundFont；可设置 ALDA_AGENT_SOUNDFONT" >&2
+        failures=$((failures + 1))
     fi
     exit "$failures"
 fi
@@ -168,6 +180,39 @@ install_alda() {
     return 1
 }
 
+install_audio_toolchain() {
+    local soundfont_path="${ALDA_AGENT_SOUNDFONT:-}"
+    for candidate in "$soundfont_path" /usr/share/soundfonts/FluidR3_GM.sf2 /usr/share/sounds/sf2/FluidR3_GM.sf2 /usr/share/soundfonts/default.sf2; do
+        if [[ -n "$candidate" && -f "$candidate" ]]; then
+            soundfont_path="$candidate"
+            break
+        fi
+    done
+
+    if command -v fluidsynth &>/dev/null && [[ -n "$soundfont_path" && -f "$soundfont_path" ]]; then
+        ok "音频工具链已安装: $(command -v fluidsynth), ${soundfont_path}"
+        return 0
+    fi
+    if [ "$PKG_MGR" = "unknown" ]; then
+        err "无法自动安装音频工具链；请安装 FluidSynth 和 General MIDI SoundFont。"
+        return 1
+    fi
+
+    local packages=""
+    case "$PKG_MGR" in
+        apt) packages="fluidsynth fluid-soundfont-gm" ;;
+        dnf) packages="fluidsynth fluid-soundfont-gm" ;;
+        pacman) packages="fluidsynth soundfont-fluid" ;;
+        zypper) packages="fluidsynth fluid-soundfont-gm" ;;
+    esac
+    if ! confirm_sudo "安装 ${packages} (MIDI→WAV)"; then
+        err "音频工具链未安装，无法导出 WAV。"
+        return 1
+    fi
+    ${INSTALL_CMD} ${packages}
+    command -v fluidsynth &>/dev/null || return 1
+}
+
 # ──────────────────────────────────────────────
 # 【可选】Rust 工具链
 # ──────────────────────────────────────────────
@@ -208,6 +253,9 @@ main() {
 
     # 安装 Alda
     install_alda || exit 1
+    echo ""
+
+    install_audio_toolchain || exit 1
     echo ""
 
     # 【可选】Rust 工具链

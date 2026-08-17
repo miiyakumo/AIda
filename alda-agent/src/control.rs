@@ -34,6 +34,8 @@ enum ControlAction {
     },
     AldaExport {
         #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
         version: Option<u32>,
         #[serde(default)]
         format: ControlExportFormat,
@@ -82,6 +84,7 @@ enum ControlAction {
 enum ControlExportFormat {
     Alda,
     Midi,
+    Wav,
     #[default]
     All,
 }
@@ -107,11 +110,21 @@ impl ControlAction {
                 };
                 UserAction::Alda(AldaAction::Check(target))
             }
-            Self::AldaExport { version, format } => UserAction::Alda(AldaAction::Export {
-                version: valid_optional_version(version)?,
+            Self::AldaExport {
+                target,
+                version,
+                format,
+            } => UserAction::Alda(AldaAction::Export {
+                target: match (target.as_deref(), valid_optional_version(version)?) {
+                    (Some(_), Some(_)) => bail!("alda_export 的 target 和 version 不能同时设置"),
+                    (Some(target), None) => parse_score_target(Some(target))?,
+                    (None, Some(version)) => ScoreTarget::Version(Some(version)),
+                    (None, None) => ScoreTarget::Version(None),
+                },
                 format: match format {
                     ControlExportFormat::Alda => ExportFormat::Alda,
                     ControlExportFormat::Midi => ExportFormat::Midi,
+                    ControlExportFormat::Wav => ExportFormat::Wav,
                     ControlExportFormat::All => ExportFormat::All,
                 },
             }),
@@ -231,6 +244,8 @@ enum ControlResult<'a> {
         success: bool,
         rounds: usize,
         needs_input: bool,
+        working_score_changed: bool,
+        working_score_status: &'a str,
     },
     Quit,
     None,
@@ -246,11 +261,15 @@ impl<'a> From<&'a ActionResult> for ControlResult<'a> {
                 success,
                 rounds,
                 needs_input,
+                working_score_changed,
+                working_score_status,
             } => Self::AgentCompleted {
                 result_kind: agent_result_kind(*kind),
                 success: *success,
                 rounds: *rounds,
                 needs_input: *needs_input,
+                working_score_changed: *working_score_changed,
+                working_score_status,
             },
             ActionResult::Quit => Self::Quit,
             ActionResult::None => Self::None,
@@ -284,6 +303,16 @@ enum EventBody<'a> {
     RoundStarted {
         round: usize,
         max_rounds: usize,
+    },
+    ToolContinuationStarted {
+        turn: usize,
+    },
+    ToolProtocolRetry {
+        call_count: usize,
+    },
+    ToolCallMissingRetry,
+    ToolArgumentsRetry {
+        tool_name: &'a str,
     },
     ModelText {
         text: &'a str,
@@ -319,6 +348,16 @@ impl<W: Write> AgentReporter for ControlReporter<'_, W> {
                 round: *round,
                 max_rounds: *max_rounds,
             },
+            AgentEvent::ToolContinuationStarted { turn } => {
+                EventBody::ToolContinuationStarted { turn: *turn }
+            }
+            AgentEvent::ToolProtocolRetry { call_count } => EventBody::ToolProtocolRetry {
+                call_count: *call_count,
+            },
+            AgentEvent::ToolCallMissingRetry => EventBody::ToolCallMissingRetry,
+            AgentEvent::ToolArgumentsRetry { tool_name } => {
+                EventBody::ToolArgumentsRetry { tool_name }
+            }
             AgentEvent::ModelText(text) => EventBody::ModelText { text },
             AgentEvent::ValidationStarted { round, max_rounds } => EventBody::ValidationStarted {
                 round: *round,

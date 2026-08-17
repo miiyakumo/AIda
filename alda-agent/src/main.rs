@@ -123,7 +123,7 @@ async fn compose(options: ComposeOptions) -> anyhow::Result<()> {
     use alda_agent::agent::AgentResultKind;
     use alda_agent::alda::CheckStatus;
     use alda_agent::application::{ComposeRequest, compose_once, prepare_compose};
-    use alda_agent::instructions::{CreationMode, ProjectPreferences};
+    use alda_agent::instructions::{CreationMode, DurationConstraint, ProjectPreferences};
     use std::io::Read;
 
     let ComposeOptions {
@@ -155,7 +155,7 @@ async fn compose(options: ComposeOptions) -> anyhow::Result<()> {
 
     let preferences = ProjectPreferences {
         mode: mode.parse::<CreationMode>()?,
-        target_duration_secs: duration,
+        target_duration_secs: duration.map(DurationConstraint::exact),
         included_instruments: include,
         excluded_instruments: exclude,
     }
@@ -211,7 +211,10 @@ async fn compose(options: ComposeOptions) -> anyhow::Result<()> {
         if result.was_truncated {
             println!("\n⚠️  模型输出被截断，作品可能不完整。");
         }
-        anyhow::bail!("作品在 {} 轮校验后仍未通过，未保存有效版本", result.rounds);
+        anyhow::bail!(
+            "作品修正仍未通过（共提交 {} 次），未保存有效版本",
+            result.rounds
+        );
     }
 
     Ok(())

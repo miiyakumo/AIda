@@ -1,3 +1,4 @@
+use crate::instructions::DurationConstraint;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -39,7 +40,7 @@ struct Part {
 // 结构化结果
 // ============================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ScoreInfo {
     /// 估算总时长（毫秒）
     pub duration_ms: f64,
@@ -71,7 +72,7 @@ pub enum CheckStatus {
 
 #[derive(Debug, Clone)]
 pub struct ScoreValidation {
-    target_duration_ms: Option<f64>,
+    target_duration: Option<DurationConstraint>,
     included_instruments: Vec<String>,
     excluded_instruments: Vec<String>,
 }
@@ -79,12 +80,12 @@ pub struct ScoreValidation {
 impl ScoreValidation {
     #[must_use]
     pub fn new(
-        target_duration_secs: Option<f64>,
+        target_duration: Option<DurationConstraint>,
         included_instruments: Vec<String>,
         excluded_instruments: Vec<String>,
     ) -> Self {
         Self {
-            target_duration_ms: target_duration_secs.map(|seconds| seconds * 1000.0),
+            target_duration,
             included_instruments,
             excluded_instruments,
         }
@@ -92,7 +93,7 @@ impl ScoreValidation {
 
     #[must_use]
     pub fn without_duration(mut self) -> Self {
-        self.target_duration_ms = None;
+        self.target_duration = None;
         self
     }
 }
@@ -146,7 +147,9 @@ impl AldaRunner {
     pub fn new(alda_path: PathBuf) -> Self {
         AldaRunner {
             alda_path,
-            timeout: Duration::from_secs(60),
+            // Alda 2.3.3 may start its background player processes even for
+            // `export`; a cold JVM/player startup can exceed one minute.
+            timeout: Duration::from_secs(120),
             max_output_bytes: 10 * 1024 * 1024, // 10MB
             cancellation: CancellationToken::default(),
         }
@@ -251,7 +254,7 @@ impl AldaRunner {
         score_path: &Path,
         included_instruments: &[String],
         excluded_instruments: &[String],
-        target_duration_ms: Option<f64>,
+        target_duration: Option<DurationConstraint>,
         duration_tolerance_pct: f64,
     ) -> Vec<AldaCheck> {
         let mut checks = Vec::new();
@@ -310,8 +313,8 @@ impl AldaRunner {
         }
 
         // 2. 时长检查
-        if let Some(target_ms) = target_duration_ms {
-            if !target_ms.is_finite() || target_ms <= 0.0 {
+        if let Some(target) = target_duration {
+            if target.validate().is_err() {
                 checks.push(AldaCheck {
                     name: "时长",
                     status: CheckStatus::Fail,
@@ -319,28 +322,26 @@ impl AldaRunner {
                 });
                 return checks;
             }
-            let actual_ms = info.duration_ms;
-            let actual_seconds = actual_ms / 1000.0;
-            let target_seconds = target_ms / 1000.0;
-            let deviation = ((actual_ms - target_ms).abs() / target_ms) * 100.0;
-
-            if deviation <= duration_tolerance_pct {
-                checks.push(AldaCheck {
-                    name: "时长",
-                    status: CheckStatus::Pass,
-                    detail: format!(
-                        "约 {actual_seconds:.0}秒（目标 {target_seconds:.0}秒，偏差 {deviation:.0}%）"
-                    ),
-                });
-            } else {
-                checks.push(AldaCheck {
-                    name: "时长",
-                    status: CheckStatus::Fail,
-                    detail: format!(
-                        "约 {actual_seconds:.0}秒（目标 {target_seconds:.0}秒，偏差 {deviation:.0}%，超出容差 {duration_tolerance_pct:.0}%）"
-                    ),
-                });
-            }
+            let actual_seconds = info.duration_ms / 1000.0;
+            let (min_seconds, max_seconds) = target.validation_bounds(duration_tolerance_pct);
+            let passed = (min_seconds..=max_seconds).contains(&actual_seconds);
+            let target_detail = match target {
+                DurationConstraint::Exact(seconds) => {
+                    format!("目标 {seconds:.0}秒，允许偏差 {duration_tolerance_pct:.0}%")
+                }
+                DurationConstraint::Range { min_secs, max_secs } => {
+                    format!("目标 {min_secs:.0}–{max_secs:.0}秒")
+                }
+            };
+            checks.push(AldaCheck {
+                name: "时长",
+                status: if passed {
+                    CheckStatus::Pass
+                } else {
+                    CheckStatus::Fail
+                },
+                detail: format!("约 {actual_seconds:.0}秒（{target_detail}）"),
+            });
         } else {
             checks.push(AldaCheck {
                 name: "时长",
@@ -432,7 +433,7 @@ impl AldaRunner {
                 &score_path,
                 &validation.included_instruments,
                 &validation.excluded_instruments,
-                validation.target_duration_ms,
+                validation.target_duration,
                 10.0,
             )
         })
@@ -750,8 +751,14 @@ fi
     fn test_validate_duration_pass() {
         let (_directory, runner) = runner();
         let info = runner.parse(&fixture("valid_simple.alda")).unwrap();
-        let target = info.duration_ms; // 精确目标
-        let checks = runner.validate(&fixture("valid_simple.alda"), &[], &[], Some(target), 10.0);
+        let target = info.duration_ms / 1000.0; // 精确目标（秒）
+        let checks = runner.validate(
+            &fixture("valid_simple.alda"),
+            &[],
+            &[],
+            Some(DurationConstraint::exact(target)),
+            10.0,
+        );
         let duration_check = checks.iter().find(|c| c.name == "时长").unwrap();
         assert_eq!(duration_check.status, CheckStatus::Pass);
     }
@@ -759,10 +766,53 @@ fi
     #[test]
     fn invalid_duration_target_fails_without_division() {
         let (_directory, runner) = runner();
-        let checks = runner.validate(&fixture("valid_simple.alda"), &[], &[], Some(0.0), 10.0);
+        let checks = runner.validate(
+            &fixture("valid_simple.alda"),
+            &[],
+            &[],
+            Some(DurationConstraint::exact(0.0)),
+            10.0,
+        );
         let duration = checks.iter().find(|check| check.name == "时长").unwrap();
         assert_eq!(duration.status, CheckStatus::Fail);
         assert!(duration.detail.contains("大于 0"));
+    }
+
+    #[test]
+    fn duration_range_uses_hard_bounds() {
+        let (_directory, runner) = runner();
+        let info = runner.parse(&fixture("valid_simple.alda")).unwrap();
+        let actual = info.duration_ms / 1000.0;
+        let inside = runner.validate(
+            &fixture("valid_simple.alda"),
+            &[],
+            &[],
+            Some(DurationConstraint::range(actual * 0.5, actual * 1.5)),
+            10.0,
+        );
+        let outside = runner.validate(
+            &fixture("valid_simple.alda"),
+            &[],
+            &[],
+            Some(DurationConstraint::range(actual * 2.0, actual * 3.0)),
+            10.0,
+        );
+        assert_eq!(
+            inside
+                .iter()
+                .find(|check| check.name == "时长")
+                .unwrap()
+                .status,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            outside
+                .iter()
+                .find(|check| check.name == "时长")
+                .unwrap()
+                .status,
+            CheckStatus::Fail
+        );
     }
 
     #[test]

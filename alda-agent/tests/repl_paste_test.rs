@@ -131,7 +131,8 @@ impl Drop for PtyProcess {
 }
 
 #[test]
-fn bracketed_multiline_paste_waits_for_enter_and_submits_once() {
+fn bracketed_multiline_paste_waits_for_enter_and_submits_once_without_persisting_on_preflight_failure()
+ {
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path().join("paste-project");
     let mut process = PtyProcess::spawn(&project);
@@ -147,23 +148,11 @@ fn bracketed_multiline_paste_waits_for_enter_and_submits_once() {
     );
 
     process.send(b"\r");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let saved = loop {
-        process.pump(Duration::from_millis(50));
-        let project_json: Value =
-            serde_json::from_slice(&std::fs::read(project.join("project.json")).unwrap()).unwrap();
-        if project_json["conversation"]["state"] == "request_pending" {
-            break project_json;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "multiline request was not persisted"
-        );
-    };
-    assert_eq!(
-        saved["conversation"]["messages"],
-        serde_json::json!([{"role": "user", "content": "第一行\n\n第二行"}])
-    );
+    process.wait_for("项目模型配置不完整".as_bytes());
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(project.join("project.json")).unwrap()).unwrap();
+    assert_eq!(saved["conversation"]["messages"], serde_json::json!([]));
+    assert_eq!(process.text().matches("项目模型配置不完整").count(), 1);
 }
 
 #[test]

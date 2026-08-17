@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::error::Error as _;
 use std::time::Duration;
 
@@ -140,6 +141,8 @@ struct ChatRequest<'a> {
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Tool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -201,7 +204,6 @@ struct Delta {
 
 #[derive(Debug, Deserialize)]
 struct ToolCallDelta {
-    #[allow(dead_code)]
     index: Option<i32>,
     id: Option<String>,
     function: Option<FunctionArg>,
@@ -248,11 +250,16 @@ impl std::fmt::Display for ChatError {
 impl std::error::Error for ChatError {}
 
 #[derive(Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
 struct SseParser {
     events: Vec<StreamEvent>,
-    pending_tool_id: Option<String>,
-    pending_tool_name: String,
-    pending_tool_args: String,
+    pending_tool_calls: BTreeMap<i32, PendingToolCall>,
     finish_reason: Option<String>,
 }
 
@@ -280,15 +287,19 @@ impl SseParser {
                 }
                 if let Some(tool_calls) = delta.tool_calls {
                     for tool_call in tool_calls {
+                        let pending = self
+                            .pending_tool_calls
+                            .entry(tool_call.index.unwrap_or(0))
+                            .or_default();
                         if let Some(id) = tool_call.id {
-                            self.pending_tool_id = Some(id);
+                            pending.id = Some(id);
                         }
                         if let Some(function) = tool_call.function {
                             if let Some(name) = function.name {
-                                self.pending_tool_name = name;
+                                pending.name = name;
                             }
                             if let Some(arguments) = function.arguments {
-                                if self.pending_tool_args.len().saturating_add(arguments.len())
+                                if pending.arguments.len().saturating_add(arguments.len())
                                     > MAX_TOOL_ARGUMENT_BYTES
                                 {
                                     bail!(
@@ -296,7 +307,7 @@ impl SseParser {
                                         MAX_TOOL_ARGUMENT_BYTES / 1024
                                     );
                                 }
-                                self.pending_tool_args.push_str(&arguments);
+                                pending.arguments.push_str(&arguments);
                             }
                         }
                     }
@@ -311,11 +322,14 @@ impl SseParser {
     }
 
     fn finish(mut self) -> Vec<StreamEvent> {
-        if !self.pending_tool_name.is_empty() {
+        for (_, pending) in self.pending_tool_calls {
+            if pending.name.is_empty() {
+                continue;
+            }
             self.events.push(StreamEvent::ToolCall {
-                id: self.pending_tool_id,
-                name: self.pending_tool_name,
-                arguments: self.pending_tool_args,
+                id: pending.id,
+                name: pending.name,
+                arguments: pending.arguments,
             });
         }
         self.events.push(StreamEvent::Done {
@@ -375,6 +389,7 @@ impl DeepSeekClient {
     ) -> Result<Vec<StreamEvent>> {
         let url = chat_completions_url(&self.base_url);
 
+        let parallel_tool_calls = tools.as_ref().map(|_| false);
         let request = ChatRequest {
             model: &self.model,
             messages,
@@ -384,6 +399,7 @@ impl DeepSeekClient {
             },
             reasoning_effort: self.thinking.reasoning_effort(),
             tools,
+            parallel_tool_calls,
         };
 
         let response = self
@@ -516,6 +532,40 @@ mod tests {
     }
 
     #[test]
+    fn tool_calls_are_aggregated_independently_by_index() {
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": { "name": "inspect_score", "arguments": "{\"target\":\"work\"}" }
+                        },
+                        {
+                            "index": 1,
+                            "id": "call_2",
+                            "function": { "name": "lookup_alda_docs", "arguments": "{\"topic\":\"aliases\"}" }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let events = parse_sse(&format!("data: {chunk}\n\ndata: [DONE]\n")).unwrap();
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ToolCall { id: Some(id), name, arguments }
+                if id == "call_1" && name == "inspect_score" && arguments.contains("work")
+        ));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::ToolCall { id: Some(id), name, arguments }
+                if id == "call_2" && name == "lookup_alda_docs" && arguments.contains("aliases")
+        ));
+    }
+
+    #[test]
     fn test_truncated_response() {
         let events = parse_sse(include_str!("../tests/fixtures/truncated.txt")).unwrap();
         assert!(matches!(
@@ -588,6 +638,38 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[tokio::test]
+    async fn production_http_path_disables_parallel_tool_calls_when_tools_are_present() {
+        let fixture = include_str!("../tests/fixtures/stream_text.txt");
+        let (base_url, request) = serve(vec![MockResponse::sse(fixture.to_string())]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let tool = Tool {
+            ty: "function".to_string(),
+            function: FunctionDef {
+                name: "submit_result".to_string(),
+                description: "提交结果".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        };
+
+        client
+            .chat_stream(Vec::new(), Some(vec![tool]))
+            .await
+            .unwrap();
+
+        let request = String::from_utf8(request.recv().unwrap()).unwrap();
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["tools"][0]["function"]["name"], "submit_result");
     }
 
     #[tokio::test]

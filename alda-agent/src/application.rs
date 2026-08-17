@@ -1,18 +1,20 @@
 use crate::agent::{
-    Agent, AgentReporter, AgentResultKind, CreationRequest, CreationResult, ProjectPromptRequest,
-    from_provider_messages,
+    Agent, AgentReporter, AgentResultKind, AgentToolContext, CreationRequest, CreationResult,
+    ProjectPromptRequest, from_provider_messages,
 };
 use crate::alda::{AldaCheck, AldaRunner, CancellationToken, CheckStatus, find_alda};
+use crate::audio::AudioRenderer;
 use crate::command::{
     AldaAction, ConfigAction, ExportFormat, ProjectAction, ScoreTarget, UserAction, help,
 };
 use crate::config::ModelConfig;
 use crate::conversation::{ConversationMessage, ConversationRole, ConversationState};
 use crate::deepseek::{ChatError, DeepSeekClient};
-use crate::instructions::{CompiledInstructions, ProjectPreferences};
+use crate::instructions::{CompiledInstructions, DurationConstraint, ProjectPreferences};
 use crate::project::{CheckRecord, Project, WorkingScoreKind};
 use crate::skills::{QualifiedSkillId, SkillCatalog, SkillKind};
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -73,7 +75,7 @@ pub struct ProjectView {
     pub working_score: Option<String>,
     pub versions: Vec<VersionView>,
     pub mode: String,
-    pub target_duration_secs: Option<f64>,
+    pub target_duration_secs: Option<DurationConstraint>,
     pub included_instruments: Vec<String>,
     pub excluded_instruments: Vec<String>,
     pub enabled_advisory_skills: Vec<String>,
@@ -108,6 +110,8 @@ pub enum ActionResult {
         success: bool,
         rounds: usize,
         needs_input: bool,
+        working_score_changed: bool,
+        working_score_status: String,
     },
     Quit,
     None,
@@ -298,21 +302,33 @@ impl Application {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute_agent(
         &mut self,
         prompt: String,
         reporter: &mut impl AgentReporter,
     ) -> Result<ActionResult> {
-        self.project.prepare_user_message(&prompt)?;
+        let config = ModelConfig::load(self.project.root()).and_then(|config| config.resolve())?;
+        let answered_clarification =
+            self.project.conversation().state() == ConversationState::AwaitingInput;
+        let require_candidate =
+            requests_complete_candidate(&prompt) || self.project.conversation().pending_candidate();
+        self.project
+            .prepare_user_message_with_requirement(&prompt, require_candidate)?;
+        if let Some(duration) = explicit_duration_secs(&prompt) {
+            let mut preferences = self.project.preferences().clone();
+            preferences.target_duration_secs = Some(duration);
+            self.project.configure(&preferences)?;
+        }
+        let previous_working_code = self
+            .project
+            .working_score()
+            .map(|_| self.project.working_code())
+            .transpose()?;
         if !self.privacy_shown {
             reporter.report(crate::agent::AgentEvent::PrivacyNotice);
             self.privacy_shown = true;
         }
-        let config =
-            match ModelConfig::load(self.project.root()).and_then(|config| config.resolve()) {
-                Ok(config) => config,
-                Err(error) => return Err(error),
-            };
         let runner = self
             .alda
             .clone()
@@ -333,6 +349,19 @@ impl Application {
                         .transpose()?,
                     compiled_instructions,
                     max_rounds: 3,
+                    tool_context: Some(AgentToolContext {
+                        project_root: self.project.root().to_path_buf(),
+                        current_path: (self.project.current_version() > 0)
+                            .then(|| self.project.current_version_path())
+                            .transpose()?,
+                        working_path: self
+                            .project
+                            .working_score()
+                            .map(|_| self.project.working_path())
+                            .transpose()?,
+                    }),
+                    require_candidate,
+                    forbid_clarification: answered_clarification,
                 },
                 reporter,
             )
@@ -364,6 +393,12 @@ impl Application {
                 &result.checks,
             )?;
         }
+        let working_score_changed = result.success
+            && self.project.working_score().is_some()
+            && previous_working_code.as_deref() != self.project.working_code().ok().as_deref();
+        if let Some(target) = &result.played_target {
+            self.playback = Some(agent_playback_label(target, working_score_changed));
+        }
         let state = if result.needs_input {
             ConversationState::AwaitingInput
         } else if result.success
@@ -381,6 +416,8 @@ impl Application {
             success: result.success,
             rounds: result.rounds,
             needs_input: result.needs_input,
+            working_score_changed,
+            working_score_status: render_working_status(&self.project),
         })
     }
 
@@ -423,10 +460,7 @@ impl Application {
                     .await?;
                 Ok(ActionResult::Checks(checks))
             }
-            AldaAction::Export { version, format } => {
-                self.export(version.unwrap_or(self.require_current()?), format)
-                    .await
-            }
+            AldaAction::Export { target, format } => self.export(target, format).await,
         }
     }
 
@@ -509,14 +543,28 @@ impl Application {
         let mut preferences = self.project.preferences().clone();
         match action {
             ConfigAction::Mode(value) => preferences.mode = value.parse()?,
-            ConfigAction::Duration(value) => preferences.target_duration_secs = value,
+            ConfigAction::Duration(value) => {
+                preferences.target_duration_secs = value.map(DurationConstraint::exact);
+            }
             ConfigAction::Include(value) => preferences.included_instruments = value,
             ConfigAction::Exclude(value) => preferences.excluded_instruments = value,
             ConfigAction::Model(value) => {
                 return self.update_model_config(|config| config.set_model(&value));
             }
+            ConfigAction::PromptModel => {
+                return Ok(ActionResult::Message(
+                    "请输入模型名称；交互终端会立即读取该值，也可使用 /project config model MODEL_NAME"
+                        .to_string(),
+                ));
+            }
             ConfigAction::Url(value) => {
                 return self.update_model_config(|config| config.set_base_url(&value));
+            }
+            ConfigAction::PromptUrl => {
+                return Ok(ActionResult::Message(
+                    "请输入 API Base URL；交互终端会立即读取该值，也可使用 /project config url URL"
+                        .to_string(),
+                ));
             }
             ConfigAction::ApiKey(Some(value)) => {
                 return self.update_model_config(|config| config.set_api_key(&value));
@@ -615,40 +663,82 @@ impl Application {
         Ok(lines.join("\n"))
     }
 
-    async fn export(&self, version: u32, format: ExportFormat) -> Result<ActionResult> {
+    async fn export(&self, target: ScoreTarget, format: ExportFormat) -> Result<ActionResult> {
+        if matches!(target, ScoreTarget::File(_)) {
+            bail!("export 不支持外部文件");
+        }
+        let (source, label, stem) = match target {
+            ScoreTarget::Working => (
+                self.project.working_path()?,
+                "工作乐谱".to_string(),
+                "work".to_string(),
+            ),
+            ScoreTarget::Version(version) => {
+                let version = version.unwrap_or(self.require_current()?);
+                (
+                    self.project.version_path_for(version)?,
+                    format!("v{version}"),
+                    format!("version-{version:04}"),
+                )
+            }
+            ScoreTarget::File(_) => unreachable!(),
+        };
+        let export_dir = self.project.root().join("exports");
+        std::fs::create_dir_all(&export_dir)?;
+        let alda_path = export_dir.join(format!("{stem}.alda"));
+        let midi_path = export_dir.join(format!("{stem}.mid"));
+        let wav_path = export_dir.join(format!("{stem}.wav"));
         let mut paths = Vec::new();
         if matches!(format, ExportFormat::Alda | ExportFormat::All)
             || (format == ExportFormat::Midi && self.alda.is_none())
         {
-            paths.push(
-                self.project
-                    .export_alda_version(version)?
-                    .display()
-                    .to_string(),
-            );
+            std::fs::copy(&source, &alda_path).with_context(|| {
+                format!("无法从 {} 导出到 {}", source.display(), alda_path.display())
+            })?;
+            paths.push(alda_path.display().to_string());
         }
         if matches!(format, ExportFormat::Midi | ExportFormat::All) {
-            let midi = match self.runner() {
-                Ok(runner) => {
-                    runner
-                        .export_midi_async(
-                            self.project.version_path_for(version)?,
-                            self.project.midi_export_path_for(version)?,
-                        )
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            match midi {
-                Ok(path) => paths.push(path.display().to_string()),
-                Err(error) if matches!(format, ExportFormat::All | ExportFormat::Midi) => {
-                    paths.push(format!("MIDI 未导出：{error}"));
-                }
-                Err(error) => return Err(error),
+            if self.alda.is_none() && format == ExportFormat::Midi {
+                paths.push("MIDI 未导出：未找到 alda".to_string());
+                return Ok(ActionResult::Message(format!(
+                    "! 已导出 {label} 的 Alda 源码，但 MIDI 未生成\n  {}",
+                    paths.join("\n  ")
+                )));
             }
+            self.runner()?
+                .export_midi_async(source.clone(), midi_path.clone())
+                .await?;
+            paths.push(midi_path.display().to_string());
+        }
+        if matches!(format, ExportFormat::Wav | ExportFormat::All) {
+            let renderer = AudioRenderer::discover()?;
+            let report = renderer
+                .render_score_async(
+                    self.runner()?.clone(),
+                    source,
+                    midi_path.clone(),
+                    wav_path.clone(),
+                )
+                .await?;
+            if !paths
+                .iter()
+                .any(|path| path == &midi_path.display().to_string())
+                && matches!(format, ExportFormat::All)
+            {
+                paths.push(midi_path.display().to_string());
+            }
+            paths.push(format!(
+                "{}（{:.2} 秒，{} Hz，{} 声道，peak {:.4}，RMS {:.4}）",
+                wav_path.display(),
+                report.wav.duration_secs,
+                report.wav.sample_rate,
+                report.wav.channels,
+                report.wav.peak,
+                report.wav.rms
+            ));
         }
         Ok(ActionResult::Message(format!(
-            "✓ 已导出 v{version}\n  {}",
+            "✓ 已导出 {label}\n  {}",
             paths.join("\n  ")
         )))
     }
@@ -685,6 +775,146 @@ fn summarize(value: &str) -> String {
         summary
     }
 }
+
+fn explicit_duration_secs(prompt: &str) -> Option<DurationConstraint> {
+    let range = Regex::new(
+        r"(?i)(\d+(?:\.\d+)?)\s*(?:-|–|—|~|到|至)\s*(\d+(?:\.\d+)?)\s*(分钟|分|min(?:ute)?s?|秒(?:钟)?|sec(?:ond)?s?|s)\b?",
+    )
+    .expect("duration range regex");
+    let exact =
+        Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*(分钟|分|min(?:ute)?s?|秒钟|秒|sec(?:ond)?s?|s)\b?")
+            .expect("duration regex");
+    let intent_before = Regex::new(
+        r"(?i)(?:时长|总长|长度|目标|预计|控制在|做成|写成|创作(?:一首)?|生成(?:一首)?|希望(?:是|为)?|约|大约|duration|length|about|around|last(?:ing)?)\s*$",
+    )
+    .expect("duration intent prefix regex");
+    let intent_after = Regex::new(
+        r"(?i)^\s*(?:左右|以内|上下|的(?:作品|音乐|曲子|乐曲|器乐|歌曲)|duration|long)\b?",
+    )
+    .expect("duration intent suffix regex");
+    let positional_before =
+        Regex::new(r"(?:第|开头|前|从\s*第?|每)\s*$").expect("duration position prefix regex");
+    let positional_after = Regex::new(r"^\s*(?:后|时|处|开始|进入|加入|只用)")
+        .expect("duration position suffix regex");
+    let only_duration = Regex::new(
+        r"(?i)^\s*(?:约|大约|about|around)?\s*\d+(?:\.\d+)?(?:\s*(?:-|–|—|~|到|至)\s*\d+(?:\.\d+)?)?\s*(?:分钟|分|min(?:ute)?s?|秒钟|秒|sec(?:ond)?s?|s)\s*(?:左右|以内|上下)?\s*[。.!！]?\s*$",
+    )
+    .expect("standalone duration regex");
+
+    let has_duration_intent = |matched: regex::Match<'_>| {
+        let before = &prompt[..matched.start()];
+        let after = &prompt[matched.end()..];
+        if positional_before.is_match(before) || positional_after.is_match(after) {
+            return false;
+        }
+        let before_context = before
+            .char_indices()
+            .rev()
+            .nth(23)
+            .map_or(before, |(index, _)| &before[index..]);
+        let after_context = after
+            .char_indices()
+            .nth(23)
+            .map_or(after, |(index, _)| &after[..index]);
+        only_duration.is_match(prompt)
+            || intent_before.is_match(before_context)
+            || intent_after.is_match(after_context)
+    };
+
+    if let Some(duration) = range.captures_iter(prompt).find_map(|captures| {
+        let matched = captures.get(0)?;
+        if !has_duration_intent(matched) {
+            return None;
+        }
+        let first = captures.get(1)?.as_str().parse::<f64>().ok()?;
+        let second = captures.get(2)?.as_str().parse::<f64>().ok()?;
+        let unit = captures.get(3)?.as_str().to_ascii_lowercase();
+        let multiplier = if unit.starts_with('分') || unit.starts_with("min") {
+            60.0
+        } else {
+            1.0
+        };
+        let duration = DurationConstraint::range(first * multiplier, second * multiplier);
+        duration.validate().ok().map(|()| duration)
+    }) {
+        return Some(duration);
+    }
+
+    exact.captures_iter(prompt).find_map(|captures| {
+        let matched = captures.get(0)?;
+        if !has_duration_intent(matched) {
+            return None;
+        }
+        let value = captures.get(1)?.as_str().parse::<f64>().ok()?;
+        let unit = captures.get(2)?.as_str().to_ascii_lowercase();
+        let seconds = if unit.starts_with("分") || unit.starts_with("min") {
+            value * 60.0
+        } else {
+            value
+        };
+        (seconds.is_finite() && seconds > 0.0).then_some(DurationConstraint::exact(seconds))
+    })
+}
+
+fn requests_complete_candidate(prompt: &str) -> bool {
+    let normalized = prompt.to_lowercase();
+    if [
+        "计划",
+        "方案",
+        "思路",
+        "建议",
+        "怎么编",
+        "如何编",
+        "先讲",
+        "先说",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return false;
+    }
+    [
+        "编写曲目",
+        "开始谱曲",
+        "直接完成",
+        "完成曲目",
+        "完成整首",
+        "生成完整曲目",
+        "编曲",
+        "作曲",
+        "写曲",
+        "开始创作",
+        "写成",
+        "写一首",
+        "创作一首",
+        "write the full piece",
+        "complete the piece",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn render_working_status(project: &Project) -> String {
+    let Some(working) = project.working_score() else {
+        return "当前没有工作乐谱".to_string();
+    };
+    let duration = working
+        .checks
+        .iter()
+        .find(|check| check.name == "时长")
+        .map_or("时长未知", |check| check.detail.as_str());
+    format!("当前工作稿仍为{}，{}", working.kind, duration)
+}
+
+fn agent_playback_label(target: &str, working_score_changed: bool) -> String {
+    match target {
+        "work" if working_score_changed => "修改前工作乐谱".to_string(),
+        "work" => "工作乐谱".to_string(),
+        "current" => "当前版本".to_string(),
+        value => value.to_string(),
+    }
+}
+
 fn render_versions(view: &ProjectView) -> String {
     if view.versions.is_empty() {
         return "尚无有效版本".to_string();
@@ -711,7 +941,7 @@ fn render_config(view: &ProjectView) -> String {
         "模式：{}\n目标时长：{}\n包含乐器：{}\n排除乐器：{}\n内建工作流：builtin:progressive-composition\nAdvisory Skills：{}\n模型名称：{}\nAPI Base URL：{}\n模型密钥：{}",
         view.mode,
         view.target_duration_secs
-            .map_or_else(|| "无".to_string(), |value| format!("{value} 秒")),
+            .map_or_else(|| "无".to_string(), |value| value.to_string()),
         empty(&view.included_instruments),
         empty(&view.excluded_instruments),
         empty(&view.enabled_advisory_skills),
@@ -758,6 +988,116 @@ mod tests {
     struct Silent;
     impl AgentReporter for Silent {
         fn report(&mut self, _event: AgentEvent) {}
+    }
+
+    #[test]
+    fn natural_language_duration_distinguishes_total_ranges_from_timeline_positions() {
+        assert_eq!(
+            explicit_duration_secs("做成 3 分钟左右"),
+            Some(DurationConstraint::exact(180.0))
+        );
+        assert_eq!(
+            explicit_duration_secs("目标 150 秒"),
+            Some(DurationConstraint::exact(150.0))
+        );
+        assert_eq!(
+            explicit_duration_secs("about 2.5 minutes"),
+            Some(DurationConstraint::exact(150.0))
+        );
+        assert_eq!(
+            explicit_duration_secs("3 分钟"),
+            Some(DurationConstraint::exact(180.0))
+        );
+        assert_eq!(
+            explicit_duration_secs("写一首3分钟的作品"),
+            Some(DurationConstraint::exact(180.0))
+        );
+        assert_eq!(explicit_duration_secs("预计时长应为数分钟"), None);
+        assert_eq!(
+            explicit_duration_secs("控制在 3-5 分钟"),
+            Some(DurationConstraint::range(180.0, 300.0))
+        );
+        assert_eq!(
+            explicit_duration_secs("控制在 3到5分钟"),
+            Some(DurationConstraint::range(180.0, 300.0))
+        );
+        assert_eq!(
+            explicit_duration_secs("控制在 3–5 min"),
+            Some(DurationConstraint::range(180.0, 300.0))
+        );
+        assert_eq!(
+            explicit_duration_secs("我想以此为引写一首咏叹调，时长2-3分钟"),
+            Some(DurationConstraint::range(120.0, 180.0))
+        );
+        assert_eq!(explicit_duration_secs("在第 2-3 分钟加入小号"), None);
+        assert_eq!(explicit_duration_secs("开头 2-3 分钟只用弦乐"), None);
+        assert_eq!(explicit_duration_secs("在第 3 分钟加入小号"), None);
+        assert_eq!(explicit_duration_secs("开头 30 秒只用弦乐"), None);
+        assert_eq!(explicit_duration_secs("30 秒后进入副歌"), None);
+        assert_eq!(
+            explicit_duration_secs("目标时长 3 分钟，开头 30 秒只用弦乐"),
+            Some(DurationConstraint::exact(180.0))
+        );
+    }
+
+    #[test]
+    fn explicit_completion_commands_require_a_candidate() {
+        assert!(requests_complete_candidate("编写曲目"));
+        assert!(requests_complete_candidate("现在开始谱曲"));
+        assert!(requests_complete_candidate("不要再停顿，直接完成"));
+        assert!(requests_complete_candidate("编曲"));
+        assert!(requests_complete_candidate("开始作曲"));
+        assert!(requests_complete_candidate("写曲"));
+        assert!(requests_complete_candidate("*写成器乐圣咏"));
+        assert!(requests_complete_candidate(
+            "我想以此为引写一首咏叹调，时长2-3分钟"
+        ));
+        assert!(requests_complete_candidate("write the full piece"));
+        assert!(!requests_complete_candidate("先说明你的创作计划"));
+        assert!(!requests_complete_candidate("先说编曲计划"));
+        assert!(!requests_complete_candidate("你的编曲思路是什么"));
+        assert!(!requests_complete_candidate("我想写一首歌，你有什么建议"));
+        assert!(!requests_complete_candidate("先做二十秒核心草稿"));
+    }
+
+    #[test]
+    fn playback_label_does_not_misidentify_replaced_working_score() {
+        assert_eq!(agent_playback_label("work", false), "工作乐谱");
+        assert_eq!(agent_playback_label("work", true), "修改前工作乐谱");
+        assert_eq!(agent_playback_label("current", true), "当前版本");
+    }
+
+    #[tokio::test]
+    async fn exact_duration_is_not_persisted_when_model_preconditions_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("duration-project");
+        let project = Project::load_or_create(root.clone(), "duration-project", "").unwrap();
+        let mut application = Application::from_project(project, None);
+        let error = application
+            .execute(UserAction::Agent("请做成 3 分钟".to_string()), &mut Silent)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("模型配置不完整"));
+        let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
+        assert_eq!(reloaded.target_duration_secs(), None);
+    }
+
+    #[tokio::test]
+    async fn timeline_positions_are_not_persisted_as_total_duration() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("timeline-project");
+        let project = Project::load_or_create(root.clone(), "timeline-project", "").unwrap();
+        let mut application = Application::from_project(project, None);
+        let error = application
+            .execute(
+                UserAction::Agent("在第 3 分钟加入小号，开头 30 秒只用弦乐".to_string()),
+                &mut Silent,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("模型配置不完整"));
+        let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
+        assert_eq!(reloaded.target_duration_secs(), None);
     }
 
     fn passing_checks() -> Vec<AldaCheck> {
@@ -811,6 +1151,27 @@ mod tests {
 
     fn candidate_response() -> String {
         score_response("candidate")
+    }
+
+    fn text_response(kind: &str, message: &str) -> String {
+        let arguments = serde_json::json!({
+            "kind": kind,
+            "message": message
+        })
+        .to_string();
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": { "name": "submit_result", "arguments": arguments }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!("data: {chunk}\n\ndata: [DONE]\n")
     }
 
     #[test]
@@ -961,7 +1322,7 @@ mod tests {
         let result = application
             .execute(
                 UserAction::Alda(AldaAction::Export {
-                    version: None,
+                    target: ScoreTarget::Version(None),
                     format: ExportFormat::Midi,
                 }),
                 &mut Silent,
@@ -976,7 +1337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_message_is_persisted_before_agent_preconditions() {
+    async fn user_message_is_not_persisted_before_agent_preconditions() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("poem");
         let project = Project::load_or_create(root.clone(), "poem", "").unwrap();
@@ -988,11 +1349,8 @@ mod tests {
         assert!(error.to_string().contains("模型配置不完整"));
         drop(application);
         let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
-        assert_eq!(reloaded.conversation().first_request(), Some("首次请求"));
-        assert_eq!(
-            reloaded.conversation().state(),
-            ConversationState::RequestPending
-        );
+        assert_eq!(reloaded.conversation().first_request(), None);
+        assert_eq!(reloaded.conversation().state(), ConversationState::Ready);
     }
 
     #[tokio::test]
@@ -1002,7 +1360,7 @@ mod tests {
         let mut project = Project::load_or_create(root, "poem", "").unwrap();
         project
             .configure(&ProjectPreferences {
-                target_duration_secs: Some(180.0),
+                target_duration_secs: Some(DurationConstraint::exact(180.0)),
                 ..ProjectPreferences::default()
             })
             .unwrap();
@@ -1047,13 +1405,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_preference_resumes_the_pending_full_composition_without_another_pause() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("aria");
+        let project = Project::load_or_create(root, "aria", "").unwrap();
+        let (_runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project(project, Some(runner));
+        let (base_url, _requests) = serve(vec![
+            MockResponse::sse(text_response("clarification", "你的目标乐器有偏好吗？")),
+            MockResponse::sse(text_response("clarification", "还要再选择一种配器吗？")),
+            MockResponse::sse(candidate_response()),
+        ]);
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application.configure(ConfigAction::Url(base_url)).unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+
+        let first = application
+            .execute(
+                UserAction::Agent("我想以此为引写一首咏叹调，时长2-3分钟".to_string()),
+                &mut Silent,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            ActionResult::AgentCompleted {
+                kind: AgentResultKind::Clarification,
+                needs_input: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            application.conversation_view().state,
+            ConversationState::AwaitingInput
+        );
+
+        let second = application
+            .execute(UserAction::Agent("没有".to_string()), &mut Silent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            second,
+            ActionResult::AgentCompleted {
+                kind: AgentResultKind::Candidate,
+                success: true,
+                rounds: 2,
+                needs_input: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            application.project.target_duration_secs(),
+            Some(DurationConstraint::range(120.0, 180.0))
+        );
+        assert_eq!(
+            application.project_view().working_score.as_deref(),
+            Some("完整候选")
+        );
+        assert!(
+            !application
+                .project
+                .conversation()
+                .messages()
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .any(|content| content.contains("还要再选择一种配器"))
+        );
+    }
+
+    #[tokio::test]
+    async fn clarification_answer_cannot_turn_a_pending_composition_into_a_refusal_loop() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("brand-hymn");
+        let project = Project::load_or_create(root, "brand-hymn", "").unwrap();
+        let (_runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project(project, Some(runner));
+        let refusal = "我不能创作包含具体商业品牌名称的圣咏。如果愿意，可以去掉品牌名称吗？";
+        let (base_url, _requests) = serve(vec![
+            MockResponse::sse(text_response(
+                "clarification",
+                "作品中要出现具体品牌名称吗？",
+            )),
+            MockResponse::sse(text_response("answer", refusal)),
+            MockResponse::sse(candidate_response()),
+        ]);
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application.configure(ConfigAction::Url(base_url)).unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+
+        let first = application
+            .execute(
+                UserAction::Agent("我想以华为口号为引写一首圣咏，时长2-3分钟".to_string()),
+                &mut Silent,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            ActionResult::AgentCompleted {
+                kind: AgentResultKind::Clarification,
+                needs_input: true,
+                ..
+            }
+        ));
+        assert!(application.project.conversation().pending_candidate());
+
+        let second = application
+            .execute(
+                UserAction::Agent("是，出现具体品牌名称".to_string()),
+                &mut Silent,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            second,
+            ActionResult::AgentCompleted {
+                kind: AgentResultKind::Candidate,
+                success: true,
+                rounds: 2,
+                needs_input: false,
+                ..
+            }
+        ));
+        assert!(!application.project.conversation().pending_candidate());
+        assert!(
+            !application
+                .project
+                .conversation()
+                .messages()
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .any(|content| content.contains("我不能创作"))
+        );
+    }
+
+    #[tokio::test]
     async fn draft_generation_and_work_check_ignore_only_duration() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("poem");
         let mut project = Project::load_or_create(root, "poem", "").unwrap();
         project
             .configure(&ProjectPreferences {
-                target_duration_secs: Some(60.0),
+                target_duration_secs: Some(DurationConstraint::exact(60.0)),
                 ..ProjectPreferences::default()
             })
             .unwrap();
@@ -1108,7 +1609,7 @@ mod tests {
         let mut project = Project::load_or_create(root.clone(), "poem", "").unwrap();
         project
             .configure(&ProjectPreferences {
-                target_duration_secs: Some(60.0),
+                target_duration_secs: Some(DurationConstraint::exact(60.0)),
                 ..ProjectPreferences::default()
             })
             .unwrap();

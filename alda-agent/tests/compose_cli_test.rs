@@ -15,6 +15,14 @@ fn tool_response(kind: &str, code: Option<&str>) -> String {
         "kind": kind,
         "message": format!("{kind} result")
     });
+    if kind == "plan" {
+        arguments["plan"] = serde_json::json!({
+            "core_material": "theme",
+            "form": "A-B-A",
+            "orchestration": "piano",
+            "development": "variation"
+        });
+    }
     if let Some(code) = code {
         arguments["alda_code"] = serde_json::Value::String(code.to_string());
     }
@@ -202,7 +210,7 @@ fn compose_non_candidate_results_preserve_failure_contracts() {
     assert!(
         String::from_utf8(run.output.stderr)
             .unwrap()
-            .contains("作品在 3 轮校验后仍未通过，未保存有效版本")
+            .contains("作品修正仍未通过")
     );
     assert!(!run.output_file.exists());
 }
@@ -222,7 +230,9 @@ fn compose_uses_cli_preferences_without_mutating_existing_project_state() {
             project
                 .configure(&ProjectPreferences {
                     mode: CreationMode::Improv,
-                    target_duration_secs: Some(99.0),
+                    target_duration_secs: Some(
+                        alda_agent::instructions::DurationConstraint::exact(99.0),
+                    ),
                     included_instruments: vec!["midi-tuba".to_string()],
                     excluded_instruments: vec!["midi-violin".to_string()],
                 })
@@ -253,7 +263,7 @@ fn compose_uses_cli_preferences_without_mutating_existing_project_state() {
         project.preferences(),
         &ProjectPreferences {
             mode: CreationMode::Improv,
-            target_duration_secs: Some(99.0),
+            target_duration_secs: Some(alda_agent::instructions::DurationConstraint::exact(99.0),),
             included_instruments: vec!["midi-tuba".to_string()],
             excluded_instruments: vec!["midi-violin".to_string()],
         }
