@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Deserialize)]
 struct ParseOutput {
+    #[serde(default)]
+    aliases: HashMap<String, Vec<String>>,
     events: Vec<Event>,
     parts: HashMap<String, Part>,
 }
@@ -34,6 +36,8 @@ struct Event {
 
 #[derive(Debug, Deserialize)]
 struct Part {
+    #[serde(default)]
+    name: Option<String>,
     #[serde(rename = "stock-instrument")]
     stock_instrument: String,
     tempo: f64,
@@ -365,7 +369,7 @@ fn analyze_events(parsed: &ParseOutput) -> Result<(f64, TimelineDiagnostics)> {
             0.0
         };
         parts.push(PartTimeline {
-            part: part.to_owned(),
+            part: readable_part_name(parsed, part),
             first_event_ms,
             last_event_ms,
             event_count,
@@ -422,6 +426,37 @@ fn analyze_events(parsed: &ParseOutput) -> Result<(f64, TimelineDiagnostics)> {
             event_gap_ratio,
         },
     ))
+}
+
+fn readable_part_name(parsed: &ParseOutput, part_id: &str) -> String {
+    let Some(part) = parsed.parts.get(part_id) else {
+        return part_id.to_string();
+    };
+    let alias = parsed
+        .aliases
+        .iter()
+        .filter(|(alias, ids)| !alias.contains('.') && ids.iter().any(|id| id == part_id))
+        .map(|(alias, _)| alias.as_str())
+        .min_by_key(|alias| (alias.len(), *alias));
+    if let Some(alias) = alias {
+        return format!("{alias}（{}）", part.stock_instrument);
+    }
+    if let Some(name) = part.name.as_deref().filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+    if !looks_like_internal_part_id(part_id) {
+        return part_id.to_string();
+    }
+    if !part.stock_instrument.is_empty() {
+        return part.stock_instrument.clone();
+    }
+    format!("内部声部 {part_id}")
+}
+
+fn looks_like_internal_part_id(part_id: &str) -> bool {
+    part_id
+        .strip_prefix("0x")
+        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn merge_intervals(mut intervals: Vec<(f64, f64)>, tolerance_ms: f64) -> Vec<(f64, f64)> {
@@ -1083,6 +1118,7 @@ fi
 
     fn part(stock_instrument: &str) -> Part {
         Part {
+            name: None,
             stock_instrument: stock_instrument.to_string(),
             tempo: 120.0,
         }
@@ -1115,6 +1151,7 @@ fi
     #[test]
     fn timeline_merges_overlapping_unsorted_events() {
         let parsed = ParseOutput {
+            aliases: HashMap::new(),
             events: vec![
                 Event {
                     part: "piano".into(),
@@ -1149,6 +1186,42 @@ fi
         assert!(diagnostics.event_gaps.is_empty());
         assert_approx(diagnostics.total_event_gap_ms, 0.0);
         assert_approx(diagnostics.event_gap_ratio, 0.0);
+    }
+
+    #[test]
+    fn timeline_uses_alias_instead_of_internal_part_id() {
+        let parsed: ParseOutput = serde_json::from_str(
+            r#"{
+                "aliases": {
+                    "violin-a": ["0xc000578000"],
+                    "violin-a.violin": ["0xc000578000"]
+                },
+                "events": [{
+                    "offset": 0,
+                    "audible-duration": 1000,
+                    "part": "0xc000578000"
+                }],
+                "parts": {
+                    "0xc000578000": {
+                        "name": "violin",
+                        "stock-instrument": "midi-tremolo-strings",
+                        "tempo": 120
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let (_, diagnostics) = analyze_events(&parsed).unwrap();
+
+        assert_eq!(
+            diagnostics.ending_parts,
+            ["violin-a（midi-tremolo-strings）"]
+        );
+        assert_eq!(
+            diagnostics.parts[0].part,
+            "violin-a（midi-tremolo-strings）"
+        );
     }
 
     #[test]
@@ -1199,6 +1272,7 @@ fi
             },
         ] {
             let parsed = ParseOutput {
+                aliases: HashMap::new(),
                 events: vec![event],
                 parts: HashMap::from([("piano".into(), part("midi-piano"))]),
             };

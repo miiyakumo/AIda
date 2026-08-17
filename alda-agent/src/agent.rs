@@ -83,19 +83,19 @@ fn inspect_alda_source_tool() -> Tool {
         ty: "function".to_string(),
         function: FunctionDef {
             name: "inspect_alda_source".to_string(),
-            description: "无副作用地真实解析尚未提交的 Alda 临时源码，返回总时长、各声部结束时间和事件数，并分开报告硬失败与诊断。既可检查短材料，也可检查完整临时源码；优先一次检查 4–16 小节。".to_string(),
+            description: "真实解析尚未提交的 Alda 临时源码，返回总时长、各声部结束时间和事件数，并分开报告硬失败与诊断。fragment 只检查局部材料且不保留；candidate 使用项目完整约束并作为故障恢复检查点，但不会保存工作乐谱、渲染或计作正式提交。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "alda_code": {
                         "type": "string",
-                        "description": "尚未提交的 Alda 临时源码，不会写入项目或计作候选提交",
+                        "description": "尚未提交的 Alda 临时源码；candidate 仅可用于完整曲目",
                         "maxLength": MAX_INSPECT_ALDA_SOURCE_BYTES
                     },
                     "scope": {
                         "type": "string",
-                        "enum": ["fragment"],
-                        "description": "当前只支持 fragment；短材料和完整临时源码都使用此范围，不检查项目目标时长或配器约束"
+                        "enum": ["fragment", "candidate"],
+                        "description": "fragment 不检查项目目标时长或配器约束且不保留；candidate 检查完整项目约束并更新故障恢复检查点，但仍需自行调用 submit_result 正式提交"
                     }
                 },
                 "required": ["alda_code", "scope"]
@@ -179,6 +179,8 @@ impl Default for RunPolicy {
 pub struct CreationResult {
     /// 实际提交给宿主的结果次数
     pub rounds: usize,
+    /// 本次生成的真实调用与提交计数。
+    pub stats: GenerationStats,
     /// 是否通过必要检查
     pub success: bool,
     /// 模型提出澄清问题，尚未生成候选
@@ -201,8 +203,85 @@ pub struct CreationResult {
     pub rendered_wav: Option<PathBuf>,
     /// 完整候选自动校验后生成的临时 MIDI/WAV；由调用方持久化。
     pub candidate_artifacts: Option<StagedCandidateArtifacts>,
+    /// 失败结果中的源码恢复点来源。
+    pub recovery_checkpoint: Option<RecoveryCheckpoint>,
     /// 已有失败候选后发生的终止错误；调用方先持久化候选，再返回该错误。
     pub(crate) terminal_error: Option<anyhow::Error>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GenerationStats {
+    pub model_calls: usize,
+    pub tool_turns: usize,
+    pub protocol_recoveries: usize,
+    pub submissions: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryCheckpoint {
+    InspectedCandidate,
+}
+
+#[derive(Debug)]
+struct CandidateCheckpoint {
+    alda_code: String,
+    checks: Vec<AldaCheck>,
+}
+
+#[derive(Debug)]
+struct ModelToolResult {
+    content: String,
+    candidate_checkpoint: Option<CandidateCheckpoint>,
+}
+
+impl ModelToolResult {
+    fn content(content: String) -> Self {
+        Self {
+            content,
+            candidate_checkpoint: None,
+        }
+    }
+}
+
+fn oversized_source_inspection(source: &str, scope: &str, candidate: bool) -> ModelToolResult {
+    let size_detail = if candidate {
+        format!(
+            "源码为 {} 字节，超过 {} 字节上限；请缩减完整候选后再检查",
+            source.len(),
+            MAX_INSPECT_ALDA_SOURCE_BYTES
+        )
+    } else {
+        format!(
+            "源码为 {} 字节，超过 {} 字节上限；请一次检查一个 4–16 小节材料",
+            source.len(),
+            MAX_INSPECT_ALDA_SOURCE_BYTES
+        )
+    };
+    let checks = vec![AldaCheck {
+        name: "源码大小",
+        status: CheckStatus::Fail,
+        detail: size_detail,
+    }];
+    let content = serde_json::json!({
+        "scope": scope,
+        "parse_ok": false,
+        "duration_secs": null,
+        "parts": [],
+        "hard_failures": [{
+            "name": "源码大小",
+            "detail": checks[0].detail
+        }],
+        "diagnostics": []
+    })
+    .to_string();
+    ModelToolResult {
+        content,
+        candidate_checkpoint: candidate.then(|| CandidateCheckpoint {
+            alda_code: source.to_string(),
+            checks,
+        }),
+    }
 }
 
 #[derive(Debug)]
@@ -496,6 +575,7 @@ impl Agent {
         let mut played_target = None;
         let mut rendered_wav = None;
         let mut candidate_artifacts = None;
+        let mut checkpointed_candidate = false;
         let mut terminal_error = None;
         let mut continuing_after_tool = false;
 
@@ -683,7 +763,7 @@ impl Agent {
                         &validation.score,
                     )
                     .await;
-                if outcome.is_ok() {
+                if let Ok(outcome) = &outcome {
                     let parsed = serde_json::from_str::<serde_json::Value>(&tool_args).ok();
                     let target = parsed
                         .as_ref()
@@ -702,11 +782,18 @@ impl Agent {
                                 .join(format!("agent-{target}.wav"))
                         });
                     }
+                    if let Some(checkpoint) = &outcome.candidate_checkpoint {
+                        last_alda_code = Some(checkpoint.alda_code.clone());
+                        last_checks.clone_from(&checkpoint.checks);
+                        last_was_truncated = was_truncated;
+                        interpretation = "完整候选检查点（尚未正式提交）".to_string();
+                        checkpointed_candidate = true;
+                    }
                 }
                 messages.push(Message {
                     role: "tool".to_string(),
                     content: Some(match outcome {
-                        Ok(value) => value,
+                        Ok(outcome) => outcome.content,
                         Err(error) => serde_json::json!({
                             "ok": false,
                             "error": format!("{error:#}")
@@ -835,6 +922,12 @@ impl Agent {
                 });
                 return Ok(CreationResult {
                     rounds: round,
+                    stats: GenerationStats {
+                        model_calls,
+                        tool_turns,
+                        protocol_recoveries,
+                        submissions: round,
+                    },
                     success: false,
                     needs_input: submitted.kind == AgentResultKind::Clarification,
                     kind: submitted.kind,
@@ -846,6 +939,7 @@ impl Agent {
                     played_target,
                     rendered_wav,
                     candidate_artifacts: None,
+                    recovery_checkpoint: None,
                     terminal_error: None,
                 });
             }
@@ -893,6 +987,7 @@ impl Agent {
                 continue;
             }
             score_kind = Some(submitted.kind);
+            checkpointed_candidate = false;
             let alda_code = submitted
                 .alda_code
                 .context("草稿或完整候选缺少 alda_code")?;
@@ -982,6 +1077,12 @@ impl Agent {
             if all_pass {
                 return Ok(CreationResult {
                     rounds: round,
+                    stats: GenerationStats {
+                        model_calls,
+                        tool_turns,
+                        protocol_recoveries,
+                        submissions: round,
+                    },
                     success: true,
                     needs_input: false,
                     kind: submitted.kind,
@@ -993,6 +1094,7 @@ impl Agent {
                     played_target,
                     rendered_wav,
                     candidate_artifacts,
+                    recovery_checkpoint: None,
                     terminal_error: None,
                 });
             }
@@ -1006,9 +1108,19 @@ impl Agent {
         }
         Ok(CreationResult {
             rounds: round,
+            stats: GenerationStats {
+                model_calls,
+                tool_turns,
+                protocol_recoveries,
+                submissions: round,
+            },
             success: false,
             needs_input: false,
-            kind: score_kind.unwrap_or(AgentResultKind::Candidate),
+            kind: if checkpointed_candidate {
+                AgentResultKind::Candidate
+            } else {
+                score_kind.unwrap_or(AgentResultKind::Candidate)
+            },
             checks: last_checks,
             alda_code: last_alda_code,
             interpretation,
@@ -1017,6 +1129,8 @@ impl Agent {
             played_target,
             rendered_wav,
             candidate_artifacts: None,
+            recovery_checkpoint: checkpointed_candidate
+                .then_some(RecoveryCheckpoint::InspectedCandidate),
             terminal_error,
         })
     }
@@ -1027,12 +1141,12 @@ impl Agent {
         arguments: &str,
         context: Option<&AgentToolContext>,
         validation: &ScoreValidation,
-    ) -> Result<String> {
+    ) -> Result<ModelToolResult> {
         if name == "lookup_alda_docs" {
-            return lookup_alda_docs(arguments);
+            return lookup_alda_docs(arguments).map(ModelToolResult::content);
         }
         if name == "inspect_alda_source" {
-            return self.inspect_alda_source(arguments).await;
+            return self.inspect_alda_source(arguments, validation).await;
         }
         let context = context.context("当前调用没有项目乐谱上下文")?;
         let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
@@ -1049,7 +1163,9 @@ impl Agent {
             "inspect_score" => {
                 let info = self.runner.parse(&path)?;
                 let checks = self.runner.validate_async(path, validation.clone()).await?;
-                Ok(serde_json::json!({ "ok": true, "info": info, "checks": checks }).to_string())
+                Ok(ModelToolResult::content(
+                    serde_json::json!({ "ok": true, "info": info, "checks": checks }).to_string(),
+                ))
             }
             "render_score" => {
                 let export_dir = context.project_root.join("exports");
@@ -1066,39 +1182,35 @@ impl Agent {
                         export_dir.join(format!("{stem}.wav")),
                     )
                     .await?;
-                Ok(serde_json::json!({ "ok": true, "artifact": report }).to_string())
+                Ok(ModelToolResult::content(
+                    serde_json::json!({ "ok": true, "artifact": report }).to_string(),
+                ))
             }
             "play_score" => {
                 self.runner.play_async(path).await?;
-                Ok(serde_json::json!({ "ok": true, "played": target }).to_string())
+                Ok(ModelToolResult::content(
+                    serde_json::json!({ "ok": true, "played": target }).to_string(),
+                ))
             }
             _ => bail!("未知模型工具 {name:?}"),
         }
     }
 
-    async fn inspect_alda_source(&self, arguments: &str) -> Result<String> {
+    async fn inspect_alda_source(
+        &self,
+        arguments: &str,
+        validation: &ScoreValidation,
+    ) -> Result<ModelToolResult> {
         let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
         let source = parsed["alda_code"].as_str().context("alda_code 缺失")?;
         let scope = parsed["scope"].as_str().context("scope 缺失")?;
-        if scope != "fragment" {
-            bail!("scope 当前只支持 fragment");
-        }
+        let candidate = match scope {
+            "fragment" => false,
+            "candidate" => true,
+            _ => bail!("scope 必须是 fragment 或 candidate"),
+        };
         if source.len() > MAX_INSPECT_ALDA_SOURCE_BYTES {
-            return Ok(serde_json::json!({
-                "parse_ok": false,
-                "duration_secs": null,
-                "parts": [],
-                "hard_failures": [{
-                    "name": "源码大小",
-                    "detail": format!(
-                        "源码为 {} 字节，超过 {} 字节上限；请一次检查一个 4–16 小节材料",
-                        source.len(),
-                        MAX_INSPECT_ALDA_SOURCE_BYTES
-                    )
-                }],
-                "diagnostics": []
-            })
-            .to_string());
+            return Ok(oversized_source_inspection(source, scope, candidate));
         }
 
         let temporary = tempfile::Builder::new()
@@ -1108,12 +1220,14 @@ impl Agent {
             .context("无法创建 Alda 临时检查文件")?;
         fs::write(temporary.path(), source).context("无法写入 Alda 临时检查文件")?;
         let path = temporary.path().to_path_buf();
+        let score_validation = if candidate {
+            validation.clone()
+        } else {
+            ScoreValidation::new(None, Vec::new(), Vec::new())
+        };
         let checks = self
             .runner
-            .validate_async(
-                path.clone(),
-                ScoreValidation::new(None, Vec::new(), Vec::new()),
-            )
+            .validate_async(path.clone(), score_validation)
             .await?;
         let parse_ok = checks
             .iter()
@@ -1147,14 +1261,22 @@ impl Agent {
             })
             .unwrap_or_default();
 
-        Ok(serde_json::json!({
+        let content = serde_json::json!({
+            "scope": scope,
             "parse_ok": parse_ok,
             "duration_secs": duration_secs,
             "parts": parts,
             "hard_failures": hard_failures,
             "diagnostics": diagnostics
         })
-        .to_string())
+        .to_string();
+        Ok(ModelToolResult {
+            content,
+            candidate_checkpoint: candidate.then(|| CandidateCheckpoint {
+                alda_code: source.to_string(),
+                checks,
+            }),
+        })
     }
 }
 
@@ -2552,6 +2674,15 @@ mod tests {
 
         assert!(!result.success);
         assert_eq!(result.rounds, 0);
+        assert_eq!(
+            result.stats,
+            GenerationStats {
+                model_calls: 2,
+                tool_turns: 2,
+                protocol_recoveries: 2,
+                submissions: 0,
+            }
+        );
         assert!(result.checks.iter().any(|check| {
             check.name == "运行策略" && check.detail.contains("2 次模型调用")
         }));
@@ -2745,7 +2876,7 @@ mod tests {
         );
         assert_eq!(
             tool.function.parameters["properties"]["scope"]["enum"],
-            serde_json::json!(["fragment"])
+            serde_json::json!(["fragment", "candidate"])
         );
         assert_eq!(
             tool.function.parameters["required"],
@@ -2778,7 +2909,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let valid: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        assert!(valid.candidate_checkpoint.is_none());
+        let valid: serde_json::Value = serde_json::from_str(&valid.content).unwrap();
         assert_eq!(valid["parse_ok"], true);
         assert_eq!(valid["duration_secs"], 3.0);
         assert_eq!(valid["parts"][0]["name"], "piano");
@@ -2804,7 +2936,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let invalid: serde_json::Value = serde_json::from_str(&invalid).unwrap();
+        let invalid: serde_json::Value = serde_json::from_str(&invalid.content).unwrap();
         assert_eq!(invalid["parse_ok"], false);
         assert!(invalid["duration_secs"].is_null());
         assert!(
@@ -2827,7 +2959,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let oversized: serde_json::Value = serde_json::from_str(&oversized).unwrap();
+        let oversized: serde_json::Value = serde_json::from_str(&oversized.content).unwrap();
         assert_eq!(oversized["parse_ok"], false);
         assert_eq!(oversized["hard_failures"][0]["name"], "源码大小");
         assert!(
@@ -2841,6 +2973,126 @@ mod tests {
             entries, 1,
             "inspection must not persist source beside the project"
         );
+    }
+
+    #[tokio::test]
+    async fn candidate_source_inspection_uses_project_constraints_but_fragment_does_not() {
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = progress_runner();
+        let agent = Agent::new(client, runner);
+        let validation = ScoreValidation::new(
+            Some(crate::instructions::DurationConstraint::exact(60.0)),
+            vec!["midi-flute".to_string()],
+            Vec::new(),
+        );
+        let arguments = |scope| {
+            serde_json::json!({
+                "alda_code": "midi-acoustic-grand-piano: target",
+                "scope": scope
+            })
+            .to_string()
+        };
+
+        let fragment = agent
+            .execute_model_tool(
+                "inspect_alda_source",
+                &arguments("fragment"),
+                None,
+                &validation,
+            )
+            .await
+            .unwrap();
+        let fragment_json: serde_json::Value = serde_json::from_str(&fragment.content).unwrap();
+        assert!(fragment.candidate_checkpoint.is_none());
+        assert_eq!(fragment_json["hard_failures"], serde_json::json!([]));
+
+        let candidate = agent
+            .execute_model_tool(
+                "inspect_alda_source",
+                &arguments("candidate"),
+                None,
+                &validation,
+            )
+            .await
+            .unwrap();
+        let candidate_json: serde_json::Value = serde_json::from_str(&candidate.content).unwrap();
+        let checkpoint = candidate.candidate_checkpoint.unwrap();
+        assert_eq!(checkpoint.alda_code, "midi-acoustic-grand-piano: target");
+        assert!(
+            checkpoint
+                .checks
+                .iter()
+                .any(|check| { check.name == "时长" && check.status == CheckStatus::Fail })
+        );
+        assert!(
+            candidate_json["hard_failures"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["name"] == "包含乐器"))
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_source_inspection_is_a_checkpoint_not_a_submission_gate() {
+        let source = "midi-acoustic-grand-piano: target";
+        let (base_url, _requests) = serve(vec![MockResponse::sse(host_tool_response(
+            "inspect_alda_source",
+            &serde_json::json!({ "alda_code": source, "scope": "candidate" }),
+        ))]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = progress_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("检查完整候选后继续工作".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(
+                        Some(crate::instructions::DurationConstraint::exact(3.0)),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    run_policy: test_policy(1),
+                    tool_context: None,
+                    require_candidate: true,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.recovery_checkpoint,
+            Some(RecoveryCheckpoint::InspectedCandidate)
+        );
+        assert_eq!(result.alda_code.as_deref(), Some(source));
+        assert_eq!(result.rounds, 0);
+        assert_eq!(
+            result.stats,
+            GenerationStats {
+                model_calls: 1,
+                tool_turns: 1,
+                protocol_recoveries: 0,
+                submissions: 0,
+            }
+        );
+        assert!(result.checks.iter().any(|check| {
+            check.name == "运行策略" && check.detail.contains("1 次模型调用")
+        }));
     }
 
     #[test]
@@ -2927,6 +3179,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.rounds, 1);
+        assert_eq!(
+            result.stats,
+            GenerationStats {
+                model_calls: 6,
+                tool_turns: 5,
+                protocol_recoveries: 0,
+                submissions: 1,
+            }
+        );
         assert_eq!(result.kind, AgentResultKind::Answer);
         assert_eq!(result.played_target.as_deref(), Some("current"));
         assert!(

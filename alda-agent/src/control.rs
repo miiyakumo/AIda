@@ -243,7 +243,9 @@ enum ControlResult<'a> {
         result_kind: &'static str,
         success: bool,
         rounds: usize,
+        stats: crate::agent::GenerationStats,
         needs_input: bool,
+        recovery_checkpoint: Option<crate::agent::RecoveryCheckpoint>,
         working_score_changed: bool,
         working_score_status: &'a str,
     },
@@ -260,14 +262,18 @@ impl<'a> From<&'a ActionResult> for ControlResult<'a> {
                 kind,
                 success,
                 rounds,
+                stats,
                 needs_input,
+                recovery_checkpoint,
                 working_score_changed,
                 working_score_status,
             } => Self::AgentCompleted {
                 result_kind: agent_result_kind(*kind),
                 success: *success,
                 rounds: *rounds,
+                stats: *stats,
                 needs_input: *needs_input,
+                recovery_checkpoint: *recovery_checkpoint,
                 working_score_changed: *working_score_changed,
                 working_score_status,
             },
@@ -500,6 +506,34 @@ fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()
 mod tests {
     use super::*;
     use crate::project::Project;
+
+    #[test]
+    fn agent_completed_json_contains_generation_stats() {
+        let action = ActionResult::AgentCompleted {
+            kind: AgentResultKind::Candidate,
+            success: false,
+            rounds: 0,
+            stats: crate::agent::GenerationStats {
+                model_calls: 24,
+                tool_turns: 19,
+                protocol_recoveries: 5,
+                submissions: 0,
+            },
+            needs_input: false,
+            recovery_checkpoint: Some(crate::agent::RecoveryCheckpoint::InspectedCandidate),
+            working_score_changed: false,
+            working_score_status: "当前没有工作乐谱".to_string(),
+        };
+
+        let json = serde_json::to_value(ControlResult::from(&action)).unwrap();
+
+        assert_eq!(json["kind"], "agent_completed");
+        assert_eq!(json["recovery_checkpoint"], "inspected_candidate");
+        assert_eq!(json["stats"]["model_calls"], 24);
+        assert_eq!(json["stats"]["tool_turns"], 19);
+        assert_eq!(json["stats"]["protocol_recoveries"], 5);
+        assert_eq!(json["stats"]["submissions"], 0);
+    }
 
     #[tokio::test]
     async fn processes_requests_and_continues_after_errors() {

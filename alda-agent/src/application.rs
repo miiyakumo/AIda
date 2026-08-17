@@ -1,6 +1,6 @@
 use crate::agent::{
     Agent, AgentReporter, AgentResultKind, AgentToolContext, CreationRequest, CreationResult,
-    ProjectPromptRequest, RunPolicy,
+    GenerationStats, ProjectPromptRequest, RecoveryCheckpoint, RunPolicy,
 };
 use crate::alda::{AldaCheck, AldaRunner, CancellationToken, CheckStatus, find_alda};
 use crate::audio::AudioRenderer;
@@ -114,7 +114,9 @@ pub enum ActionResult {
         kind: AgentResultKind,
         success: bool,
         rounds: usize,
+        stats: GenerationStats,
         needs_input: bool,
+        recovery_checkpoint: Option<RecoveryCheckpoint>,
         working_score_changed: bool,
         working_score_status: String,
     },
@@ -511,7 +513,9 @@ impl Application {
             kind: result.kind,
             success: result.success,
             rounds: result.rounds,
+            stats: result.stats,
             needs_input: result.needs_input,
+            recovery_checkpoint: result.recovery_checkpoint,
             working_score_changed,
             working_score_status: render_working_status(&self.project),
         })
@@ -1298,6 +1302,25 @@ mod tests {
         score_response("candidate")
     }
 
+    fn host_tool_response(name: &str, arguments: &serde_json::Value) -> String {
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_host",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!("data: {chunk}\n\ndata: [DONE]\n")
+    }
+
     fn text_response(kind: &str, message: &str) -> String {
         let arguments = serde_json::json!({
             "kind": kind,
@@ -1665,6 +1688,100 @@ mod tests {
             "500",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn candidate_inspection_checkpoint_survives_model_limit_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("checkpoint");
+        let mut project = Project::load_or_create(root.clone(), "checkpoint", "").unwrap();
+        project
+            .configure(&ProjectPreferences {
+                target_duration_secs: Some(DurationConstraint::exact(180.0)),
+                ..ProjectPreferences::default()
+            })
+            .unwrap();
+        let (runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project_with_audio_renderer(
+            project,
+            Some(runner),
+            passing_renderer(runner_directory.path()),
+        );
+        let checkpoint_source = "piano: checkpoint";
+        let responses = (0..RunPolicy::default().max_model_calls)
+            .map(|_| {
+                MockResponse::sse(host_tool_response(
+                    "inspect_alda_source",
+                    &serde_json::json!({
+                        "alda_code": checkpoint_source,
+                        "scope": "candidate"
+                    }),
+                ))
+            })
+            .collect();
+        let (base_url, _requests) = serve(responses);
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application.configure(ConfigAction::Url(base_url)).unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+
+        let result = application
+            .execute(UserAction::Agent("完成整首作品".to_string()), &mut Silent)
+            .await
+            .unwrap();
+        let ActionResult::AgentCompleted {
+            success,
+            stats,
+            recovery_checkpoint,
+            ..
+        } = result
+        else {
+            panic!("expected agent result");
+        };
+        assert!(!success);
+        assert_eq!(
+            recovery_checkpoint,
+            Some(RecoveryCheckpoint::InspectedCandidate)
+        );
+        assert_eq!(stats.model_calls, RunPolicy::default().max_model_calls);
+        assert_eq!(stats.tool_turns, RunPolicy::default().max_model_calls);
+        assert_eq!(stats.submissions, 0);
+        assert_eq!(
+            application.project.revision_code().unwrap(),
+            checkpoint_source
+        );
+
+        drop(application);
+        let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
+        assert_eq!(reloaded.revision_code().unwrap(), checkpoint_source);
+        let (runner_directory, runner) = passing_runner();
+        let mut restarted = Application::from_project_with_audio_renderer(
+            reloaded,
+            Some(runner),
+            passing_renderer(runner_directory.path()),
+        );
+        let (base_url, requests) = serve(vec![MockResponse::sse(candidate_response())]);
+        restarted
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        restarted.configure(ConfigAction::Url(base_url)).unwrap();
+        restarted
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+
+        let resumed = restarted
+            .execute(UserAction::Agent("继续修正".to_string()), &mut Silent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resumed,
+            ActionResult::AgentCompleted { success: true, .. }
+        ));
+        let request = String::from_utf8(requests.recv().unwrap()).unwrap();
+        assert!(request.contains(checkpoint_source));
     }
 
     #[tokio::test]

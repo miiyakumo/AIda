@@ -48,4 +48,4 @@ midi-cello: o3 [c2 g2 a2 e2 f2 c2 g1]*2
 - Alda 2.3.3 没有 `time-signature` 或 `time-signature!`。
 - 全局速度写作 `(tempo! 120)`；声部局部速度写作 `(tempo 120)`。
 - 音符、休止、和弦、属性、反复、变量、序列、voices、markers 的详细规则以官方快照对应章节为准。
-- 修改现有作品前应调用 `inspect_score` 了解 work/current；构造新材料时可用 `inspect_alda_source` 检查尚未保存的源码，新候选在 `submit_result` 后仍由宿主自动校验。需要确认已有乐谱的真实声音时调用 `render_score`。不能把“语法通过”说成“已经播放”。
+- 修改现有作品前应调用 `inspect_score` 了解 work/current；构造局部材料时用 `inspect_alda_source(scope=fragment)`，检查大小限制内的完整临时候选时用 `scope=candidate`，后者套用项目约束并留下故障恢复检查点，但不算正式提交，也不要求预检通过后立即提交。正式 `submit_result` 后宿主仍会自动校验。需要确认已有乐谱的真实声音时调用 `render_score`。不能把“语法通过”说成“已经播放”。

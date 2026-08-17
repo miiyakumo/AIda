@@ -312,20 +312,22 @@ fn render_result(result: &ActionResult, writer: &mut impl Write) -> Result<()> {
         ActionResult::AgentCompleted {
             kind: crate::agent::AgentResultKind::Draft,
             success: true,
-            rounds,
+            stats,
             ..
         } => writeln!(
             writer,
-            "✓ 已更新草稿 · {rounds} 轮完成 · 当前有效版本未改变\n  下一步：/alda play work 试听，或继续输入发展要求。"
+            "✓ 已更新草稿 · {} 次提交完成 · 当前有效版本未改变\n  下一步：/alda play work 试听，或继续输入发展要求。",
+            stats.submissions
         )?,
         ActionResult::AgentCompleted {
             kind: crate::agent::AgentResultKind::Candidate,
             success: true,
-            rounds,
+            stats,
             ..
         } => writeln!(
             writer,
-            "✓ 完整候选已就绪 · {rounds} 轮完成 · 尚未创建版本\n  下一步：/alda play work 试听，再 /project accept 或继续修改。"
+            "✓ 完整候选已就绪 · {} 次提交完成 · 尚未创建版本\n  下一步：/alda play work 试听，再 /project accept 或继续修改。",
+            stats.submissions
         )?,
         ActionResult::AgentCompleted {
             needs_input: true, ..
@@ -339,14 +341,28 @@ fn render_result(result: &ActionResult, writer: &mut impl Write) -> Result<()> {
             ..
         } => writeln!(writer, "✓ 已回答 · 当前乐谱和版本未改变")?,
         ActionResult::AgentCompleted {
-            rounds,
+            recovery_checkpoint: Some(crate::agent::RecoveryCheckpoint::InspectedCandidate),
             working_score_status,
             ..
         } => writeln!(
             writer,
-            "! {rounds} 轮后修正仍未完成；新候选未保存，{working_score_status}；当前有效版本未改变。\n  下一步：输入“继续修正”，也可以提出新的要求。"
+            "! 自动修正仍未完成；已保存完整候选检查点为待修正 revision，{working_score_status}；当前有效版本未改变。\n  下一步：输入“继续修正”，也可以提出新的要求。"
+        )?,
+        ActionResult::AgentCompleted {
+            working_score_status,
+            ..
+        } => writeln!(
+            writer,
+            "! 自动修正仍未完成；新候选未保存，{working_score_status}；当前有效版本未改变。\n  下一步：输入“继续修正”，也可以提出新的要求。"
         )?,
         ActionResult::None | ActionResult::Quit => {}
+    }
+    if let ActionResult::AgentCompleted { stats, .. } = result {
+        writeln!(
+            writer,
+            "  运行：模型调用 {} · 工具往返 {} · 协议恢复 {} · 结果提交 {}",
+            stats.model_calls, stats.tool_turns, stats.protocol_recoveries, stats.submissions
+        )?;
     }
     Ok(())
 }
@@ -765,6 +781,36 @@ fn suggestion(value: String, start: usize, end: usize) -> Suggestion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_result_reports_real_stats_and_checkpoint_state() {
+        let result = ActionResult::AgentCompleted {
+            kind: crate::agent::AgentResultKind::Candidate,
+            success: false,
+            rounds: 0,
+            stats: crate::agent::GenerationStats {
+                model_calls: 24,
+                tool_turns: 19,
+                protocol_recoveries: 5,
+                submissions: 0,
+            },
+            needs_input: false,
+            recovery_checkpoint: Some(crate::agent::RecoveryCheckpoint::InspectedCandidate),
+            working_score_changed: false,
+            working_score_status: "当前没有工作乐谱".to_string(),
+        };
+        let mut output = Vec::new();
+
+        render_result(&result, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("已保存完整候选检查点"));
+        assert!(output.contains("模型调用 24"));
+        assert!(output.contains("工具往返 19"));
+        assert!(output.contains("协议恢复 5"));
+        assert!(output.contains("结果提交 0"));
+        assert!(!output.contains("0 轮"));
+    }
 
     fn project_view() -> ProjectView {
         ProjectView {
