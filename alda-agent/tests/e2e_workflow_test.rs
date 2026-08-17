@@ -1,6 +1,7 @@
 use alda_agent::agent::{AgentEvent, AgentReporter};
 use alda_agent::alda::AldaRunner;
 use alda_agent::application::{ActionResult, Application};
+use alda_agent::audio::AudioRenderer;
 use alda_agent::command::{ProjectAction, UserAction};
 use alda_agent::config::ModelConfig;
 use alda_agent::instructions::ProjectPreferences;
@@ -95,6 +96,42 @@ fn fake_alda() -> (tempfile::TempDir, std::path::PathBuf) {
     (directory, executable)
 }
 
+fn fake_renderer(root: &std::path::Path) -> AudioRenderer {
+    let source_wav = root.join("source.wav");
+    let mut writer = hound::WavWriter::create(
+        &source_wav,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    for index in 0..800 {
+        writer
+            .write_sample(if index % 2 == 0 {
+                8_000_i16
+            } else {
+                -8_000_i16
+            })
+            .unwrap();
+    }
+    writer.finalize().unwrap();
+    let executable = root.join("fluidsynth");
+    fs::write(
+        &executable,
+        format!("#!/bin/sh\ncp '{}' \"$4\"\n", source_wav.display()),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&executable, permissions).unwrap();
+    let soundfont = root.join("test.sf2");
+    fs::write(&soundfont, "soundfont").unwrap();
+    AudioRenderer::new(executable, soundfont)
+}
+
 struct TestReporter;
 
 impl AgentReporter for TestReporter {
@@ -128,8 +165,11 @@ async fn progressive_workflow_only_versions_an_accepted_candidate() {
     model.set_base_url(&base_url).unwrap();
     model.set_api_key("secret-test-value").unwrap();
     model.save(&root).unwrap();
-    let mut application =
-        Application::from_project(project, Some(AldaRunner::new(alda_path.clone())));
+    let mut application = Application::from_project_with_audio_renderer(
+        project,
+        Some(AldaRunner::new(alda_path.clone())),
+        fake_renderer(project_directory.path()),
+    );
     let mut reporter = TestReporter;
 
     let plan = application

@@ -40,6 +40,8 @@ pub fn prepare_compose(request: ComposeRequest) -> Result<PreparedCompose> {
     let config = ModelConfig::load(&request.project_root)?.resolve()?;
     let client = DeepSeekClient::new(config.api_key, config.base_url, config.model)?;
     let alda_path = find_alda().ok_or_else(|| anyhow::anyhow!("未找到 alda，请先安装"))?;
+    let audio_renderer =
+        AudioRenderer::discover().context("完整候选需要先配置可用的 FluidSynth 与 SoundFont")?;
     let project = Project::load_or_create(
         request.project_root,
         &request.project_name,
@@ -53,7 +55,7 @@ pub fn prepare_compose(request: ComposeRequest) -> Result<PreparedCompose> {
     let compiled_instructions =
         CompiledInstructions::compile(&catalog, project.instruction_profile(), &preferences)?;
     Ok(PreparedCompose {
-        agent: Agent::new(client, AldaRunner::new(alda_path)),
+        agent: Agent::new(client, AldaRunner::new(alda_path)).with_audio_renderer(audio_renderer),
         request: CreationRequest {
             source_material: request.source_material,
             instructions: String::new(),
@@ -124,6 +126,8 @@ pub struct Application {
     model_request_succeeded: bool,
     playback: Option<String>,
     privacy_shown: bool,
+    audio_renderer: Option<AudioRenderer>,
+    audio_renderer_preflight_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +169,8 @@ impl Application {
             model_request_succeeded: false,
             playback: None,
             privacy_shown: false,
+            audio_renderer: None,
+            audio_renderer_preflight_error: None,
         })
     }
 
@@ -177,7 +183,31 @@ impl Application {
             model_request_succeeded: false,
             playback: None,
             privacy_shown: false,
+            audio_renderer: None,
+            audio_renderer_preflight_error: None,
         }
+    }
+
+    #[must_use]
+    pub fn from_project_with_audio_renderer(
+        project: Project,
+        alda: Option<AldaRunner>,
+        audio_renderer: AudioRenderer,
+    ) -> Self {
+        let mut application = Self::from_project(project, alda);
+        application.audio_renderer = Some(audio_renderer);
+        application
+    }
+
+    #[must_use]
+    pub fn from_project_with_audio_renderer_failure(
+        project: Project,
+        alda: Option<AldaRunner>,
+        error: impl Into<String>,
+    ) -> Self {
+        let mut application = Self::from_project(project, alda);
+        application.audio_renderer_preflight_error = Some(error.into());
+        application
     }
 
     pub fn set_cancellation(&mut self, cancellation: CancellationToken) {
@@ -317,6 +347,21 @@ impl Application {
                 .project
                 .pending_revision()
                 .is_some_and(|revision| revision.kind == WorkingScoreKind::Candidate);
+        let audio_renderer = if let Some(error) = &self.audio_renderer_preflight_error {
+            if require_candidate {
+                bail!("完整候选音频渲染环境不可用：{error}");
+            }
+            None
+        } else if let Some(renderer) = &self.audio_renderer {
+            Some(renderer.clone())
+        } else if require_candidate {
+            Some(
+                AudioRenderer::discover()
+                    .context("完整候选需要先配置可用的 FluidSynth 与 SoundFont")?,
+            )
+        } else {
+            None
+        };
         self.project
             .prepare_user_message_with_requirement(&prompt, require_candidate)?;
         if let Some(duration) = explicit_duration_secs(&prompt) {
@@ -339,7 +384,13 @@ impl Application {
             .ok_or_else(|| anyhow::anyhow!("未找到 alda；Agent 不能绕过校验保存版本"))?;
         let client = DeepSeekClient::new(config.api_key, config.base_url, config.model)?;
         let compiled_instructions = self.compile_instructions()?;
-        let result = Agent::new(client, runner)
+        let agent = Agent::new(client, runner);
+        let agent = if let Some(renderer) = audio_renderer {
+            agent.with_audio_renderer(renderer)
+        } else {
+            agent
+        };
+        let result = agent
             .respond_with_reporter(
                 ProjectPromptRequest {
                     conversation: self.project.conversation().messages().to_vec(),
@@ -392,15 +443,31 @@ impl Application {
                 AgentResultKind::Candidate => WorkingScoreKind::Candidate,
                 _ => bail!("文本结果不能标记为校验成功"),
             };
-            self.project.save_working_score(
-                result
-                    .alda_code
-                    .as_deref()
-                    .context("成功结果缺少 Alda 代码")?,
-                kind,
-                &result.interpretation,
-                &result.checks,
-            )?;
+            let alda_code = result
+                .alda_code
+                .as_deref()
+                .context("成功结果缺少 Alda 代码")?;
+            match kind {
+                WorkingScoreKind::Draft => self.project.save_working_score(
+                    alda_code,
+                    kind,
+                    &result.interpretation,
+                    &result.checks,
+                )?,
+                WorkingScoreKind::Candidate => {
+                    let artifacts = result
+                        .candidate_artifacts
+                        .as_ref()
+                        .context("成功候选缺少已验证的 MIDI/WAV")?;
+                    self.project.save_rendered_candidate(
+                        alda_code,
+                        &result.interpretation,
+                        &result.checks,
+                        artifacts.midi_path(),
+                        artifacts.wav_path(),
+                    )?;
+                }
+            }
         } else if let Some(alda_code) = result.alda_code.as_deref() {
             let kind = match result.kind {
                 AgentResultKind::Draft => WorkingScoreKind::Draft,
@@ -923,7 +990,13 @@ fn render_working_status(project: &Project) -> String {
         .iter()
         .find(|check| check.name == "时长")
         .map_or("时长未知", |check| check.detail.as_str());
-    format!("当前工作稿仍为{}，{}", working.kind, duration)
+    let rendered =
+        if working.kind == WorkingScoreKind::Candidate && project.work_wav_path().is_file() {
+            format!("，已渲染 WAV：{}", project.work_wav_path().display())
+        } else {
+            String::new()
+        };
+    format!("当前工作稿仍为{}，{}{}", working.kind, duration, rendered)
 }
 
 fn agent_playback_label(target: &str, working_score_changed: bool) -> String {
@@ -1137,7 +1210,7 @@ mod tests {
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = parse ]; then printf '%s\\n' '{json}'; else exit 0; fi\n"
+                "#!/bin/sh\ncase \"$1\" in\n  parse) printf '%s\\n' '{json}' ;;\n  export) printf midi > \"$5\" ;;\n  *) exit 0 ;;\nesac\n"
             ),
         )
         .unwrap();
@@ -1145,6 +1218,49 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
         (directory, AldaRunner::new(executable))
+    }
+
+    fn passing_renderer(root: &std::path::Path) -> AudioRenderer {
+        renderer_with_amplitude(root, 8_000)
+    }
+
+    fn renderer_with_amplitude(root: &std::path::Path, amplitude: i16) -> AudioRenderer {
+        use hound::{SampleFormat, WavSpec, WavWriter};
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_wav = root.join("source.wav");
+        let mut writer = WavWriter::create(
+            &source_wav,
+            WavSpec {
+                channels: 1,
+                sample_rate: 8_000,
+                bits_per_sample: 16,
+                sample_format: SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for index in 0..800 {
+            writer
+                .write_sample(if index % 2 == 0 {
+                    amplitude
+                } else {
+                    -amplitude
+                })
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        let fluidsynth = root.join("fluidsynth");
+        std::fs::write(
+            &fluidsynth,
+            format!("#!/bin/sh\ncp '{}' \"$4\"\n", source_wav.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fluidsynth).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fluidsynth, permissions).unwrap();
+        let soundfont = root.join("test.sf2");
+        std::fs::write(&soundfont, "soundfont").unwrap();
+        AudioRenderer::new(fluidsynth, soundfont)
     }
 
     fn score_response(kind: &str) -> String {
@@ -1374,6 +1490,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renderer_preflight_failure_does_not_persist_the_user_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("poem");
+        let project = Project::load_or_create(root.clone(), "poem", "").unwrap();
+        let (_runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project_with_audio_renderer_failure(
+            project,
+            Some(runner),
+            "missing SoundFont",
+        );
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application
+            .configure(ConfigAction::Url("https://api.example.com".to_string()))
+            .unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+        let metadata_before = std::fs::read(root.join("project.json")).unwrap();
+
+        let error = application
+            .execute(UserAction::Agent("完成整首作品".to_string()), &mut Silent)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("missing SoundFont"));
+        assert_eq!(
+            std::fs::read(root.join("project.json")).unwrap(),
+            metadata_before
+        );
+        assert!(application.project.conversation().messages().is_empty());
+    }
+
+    #[tokio::test]
     async fn explicit_accept_is_the_application_version_boundary() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("poem");
@@ -1384,8 +1535,12 @@ mod tests {
                 ..ProjectPreferences::default()
             })
             .unwrap();
-        let (_directory, runner) = passing_runner();
-        let mut application = Application::from_project(project, Some(runner));
+        let (runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project_with_audio_renderer(
+            project,
+            Some(runner),
+            passing_renderer(runner_directory.path()),
+        );
         let (base_url, _requests) = serve(vec![MockResponse::sse(candidate_response())]);
         application
             .configure(ConfigAction::Model("example-model".to_string()))
@@ -1435,8 +1590,12 @@ mod tests {
                 ..ProjectPreferences::default()
             })
             .unwrap();
-        let (_runner_directory, runner) = passing_runner();
-        let mut application = Application::from_project(project, Some(runner));
+        let (runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project_with_audio_renderer(
+            project,
+            Some(runner),
+            passing_renderer(runner_directory.path()),
+        );
         let (base_url, _requests) = serve(vec![MockResponse::sse(candidate_response())]);
         application
             .configure(ConfigAction::Model("example-model".to_string()))
@@ -1446,13 +1605,32 @@ mod tests {
             .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
             .unwrap();
 
-        application
+        let result = application
             .execute(UserAction::Agent("继续修正".to_string()), &mut Silent)
             .await
             .unwrap();
+        let ActionResult::AgentCompleted {
+            working_score_status,
+            ..
+        } = result
+        else {
+            panic!("expected agent result");
+        };
+        assert!(working_score_status.contains("work.wav"));
 
         let working = application.project.working_score().unwrap();
         assert_eq!(working.summary, "工作乐谱");
+        assert!(
+            working
+                .checks
+                .iter()
+                .any(|check| { check.name == "音频渲染" && check.status == CheckStatus::Pass })
+        );
+        assert_eq!(
+            std::fs::read(application.project.work_midi_path()).unwrap(),
+            b"midi"
+        );
+        assert!(application.project.work_wav_path().is_file());
         let messages = application.project.conversation().messages();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content.as_deref(), Some("继续修正"));
@@ -1469,12 +1647,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn silent_candidate_preserves_existing_work_and_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("poem");
+        let mut project = Project::load_or_create(root.clone(), "poem", "").unwrap();
+        project
+            .configure(&ProjectPreferences {
+                target_duration_secs: Some(DurationConstraint::exact(180.0)),
+                ..ProjectPreferences::default()
+            })
+            .unwrap();
+        let old_midi = directory.path().join("old.mid");
+        let old_wav = directory.path().join("old.wav");
+        std::fs::write(&old_midi, "old midi").unwrap();
+        std::fs::write(&old_wav, "old wav").unwrap();
+        project
+            .save_rendered_candidate(
+                "piano: old",
+                "old candidate",
+                &passing_checks(),
+                &old_midi,
+                &old_wav,
+            )
+            .unwrap();
+        let (runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project_with_audio_renderer(
+            project,
+            Some(runner),
+            renderer_with_amplitude(runner_directory.path(), 0),
+        );
+        let (base_url, _requests) = serve(vec![
+            MockResponse::sse(candidate_response()),
+            MockResponse::sse(candidate_response()),
+        ]);
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application.configure(ConfigAction::Url(base_url)).unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+
+        let result = application
+            .execute(UserAction::Agent("完成整首作品".to_string()), &mut Silent)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ActionResult::AgentCompleted {
+                kind: AgentResultKind::Candidate,
+                success: false,
+                ..
+            }
+        ));
+        assert_eq!(application.project.working_code().unwrap(), "piano: old");
+        assert_eq!(
+            std::fs::read(application.project.work_midi_path()).unwrap(),
+            b"old midi"
+        );
+        assert_eq!(
+            std::fs::read(application.project.work_wav_path()).unwrap(),
+            b"old wav"
+        );
+        assert!(application.project.pending_revision().is_some());
+    }
+
+    #[tokio::test]
     async fn no_preference_resumes_the_pending_full_composition_without_another_pause() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("aria");
         let project = Project::load_or_create(root, "aria", "").unwrap();
-        let (_runner_directory, runner) = passing_runner();
-        let mut application = Application::from_project(project, Some(runner));
+        let (runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project_with_audio_renderer(
+            project,
+            Some(runner),
+            passing_renderer(runner_directory.path()),
+        );
         let (base_url, _requests) = serve(vec![
             MockResponse::sse(text_response("clarification", "你的目标乐器有偏好吗？")),
             MockResponse::sse(text_response("clarification", "还要再选择一种配器吗？")),
@@ -1546,8 +1795,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("brand-hymn");
         let project = Project::load_or_create(root, "brand-hymn", "").unwrap();
-        let (_runner_directory, runner) = passing_runner();
-        let mut application = Application::from_project(project, Some(runner));
+        let (runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project_with_audio_renderer(
+            project,
+            Some(runner),
+            passing_renderer(runner_directory.path()),
+        );
         let refusal = "我不能创作包含具体商业品牌名称的圣咏。如果愿意，可以去掉品牌名称吗？";
         let (base_url, _requests) = serve(vec![
             MockResponse::sse(text_response(

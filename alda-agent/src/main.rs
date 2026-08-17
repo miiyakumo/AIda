@@ -199,9 +199,20 @@ async fn compose(options: ComposeOptions) -> anyhow::Result<()> {
         anyhow::bail!("模型需要补充信息；请进入交互模式回答澄清问题");
     } else if result.success && result.kind == AgentResultKind::Candidate {
         if let Some(ref code) = result.alda_code {
-            let output_file = output.join("current.alda");
-            std::fs::write(&output_file, code)?;
-            println!("\n作品已保存到: {}", output_file.display());
+            std::fs::create_dir_all(&output)?;
+            let alda_file = output.join("current.alda");
+            let midi_file = output.join("current.mid");
+            let wav_file = output.join("current.wav");
+            let artifacts = result
+                .candidate_artifacts
+                .as_ref()
+                .context("成功候选缺少已验证的 MIDI/WAV")?;
+            std::fs::write(&alda_file, code)?;
+            std::fs::copy(artifacts.midi_path(), &midi_file)?;
+            std::fs::copy(artifacts.wav_path(), &wav_file)?;
+            println!("\n作品已保存到: {}", alda_file.display());
+            println!("MIDI 已保存到: {}", midi_file.display());
+            println!("WAV 已保存到: {}", wav_file.display());
         }
     } else if matches!(result.kind, AgentResultKind::Answer | AgentResultKind::Plan) {
         anyhow::bail!("模型返回了文字结果；请进入交互模式继续创作");

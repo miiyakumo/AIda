@@ -17,6 +17,8 @@ const PROJECT_FILE: &str = "project.json";
 const CURRENT_FILE: &str = "current.alda";
 const WORK_FILE: &str = "work.alda";
 const REVISION_FILE: &str = "revision.alda";
+const WORK_MIDI_FILE: &str = "work.mid";
+const WORK_WAV_FILE: &str = "work.wav";
 
 mod persisted_check_status {
     use crate::alda::CheckStatus;
@@ -423,6 +425,40 @@ impl Project {
         summary: &str,
         checks: &[AldaCheck],
     ) -> Result<()> {
+        self.save_working_score_inner(alda_code, kind, summary, checks, None)
+    }
+
+    pub fn save_rendered_candidate(
+        &mut self,
+        alda_code: &str,
+        summary: &str,
+        checks: &[AldaCheck],
+        midi_source: &Path,
+        wav_source: &Path,
+    ) -> Result<()> {
+        if !midi_source.is_file() {
+            bail!("候选 MIDI 不存在: {}", midi_source.display());
+        }
+        if !wav_source.is_file() {
+            bail!("候选 WAV 不存在: {}", wav_source.display());
+        }
+        self.save_working_score_inner(
+            alda_code,
+            WorkingScoreKind::Candidate,
+            summary,
+            checks,
+            Some((midi_source, wav_source)),
+        )
+    }
+
+    fn save_working_score_inner(
+        &mut self,
+        alda_code: &str,
+        kind: WorkingScoreKind,
+        summary: &str,
+        checks: &[AldaCheck],
+        artifacts: Option<(&Path, &Path)>,
+    ) -> Result<()> {
         self.validate_settings()?;
         if alda_code.trim().is_empty() {
             bail!("不能保存空工作乐谱");
@@ -430,11 +466,43 @@ impl Project {
         if checks.iter().any(|check| check.status == CheckStatus::Fail) {
             bail!("检查未全部通过，不能保存工作乐谱");
         }
+        if kind == WorkingScoreKind::Draft && artifacts.is_some() {
+            bail!("草稿不能保存渲染产物");
+        }
         let work_path = self.root.join(WORK_FILE);
-        let previous_code = fs::read(&work_path).ok();
+        let midi_path = self.work_midi_path();
+        let wav_path = self.work_wav_path();
+        let targets = [&work_path, &midi_path, &wav_path];
+        let backup = tempfile::tempdir_in(&self.root).context("无法创建工作稿备份目录")?;
+        let backup_paths = [
+            backup.path().join(WORK_FILE),
+            backup.path().join(WORK_MIDI_FILE),
+            backup.path().join(WORK_WAV_FILE),
+        ];
+        let mut backed_up = [false; 3];
+        for (index, (target, saved)) in targets.iter().zip(&backup_paths).enumerate() {
+            if target.exists() {
+                if let Err(error) = fs::rename(target, saved) {
+                    restore_projections(&targets, &backup_paths, backed_up);
+                    return Err(error).with_context(|| format!("无法备份 {}", target.display()));
+                }
+                backed_up[index] = true;
+            }
+        }
         let previous_working = self.working_score.clone();
         let previous_revision = self.pending_revision.clone();
-        write_atomic(&work_path, alda_code.as_bytes())?;
+        let write_result = (|| {
+            write_atomic(&work_path, alda_code.as_bytes())?;
+            if let Some((midi_source, wav_source)) = artifacts {
+                copy_atomic(midi_source, &midi_path)?;
+                copy_atomic(wav_source, &wav_path)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            restore_projections(&targets, &backup_paths, backed_up);
+            return Err(error);
+        }
         self.working_score = Some(WorkingScore {
             kind,
             summary: summary.to_string(),
@@ -444,15 +512,21 @@ impl Project {
         if let Err(error) = self.write_metadata() {
             self.working_score = previous_working;
             self.pending_revision = previous_revision;
-            if let Some(previous_code) = previous_code {
-                let _ = write_atomic(&work_path, &previous_code);
-            } else {
-                let _ = fs::remove_file(&work_path);
-            }
+            restore_projections(&targets, &backup_paths, backed_up);
             return Err(error);
         }
-        self.remove_revision_projection()?;
+        let _ = self.remove_revision_projection();
         Ok(())
+    }
+
+    #[must_use]
+    pub fn work_midi_path(&self) -> PathBuf {
+        self.root.join("exports").join(WORK_MIDI_FILE)
+    }
+
+    #[must_use]
+    pub fn work_wav_path(&self) -> PathBuf {
+        self.root.join("exports").join(WORK_WAV_FILE)
     }
 
     pub fn update_working_checks(&mut self, checks: &[AldaCheck]) -> Result<()> {
@@ -570,9 +644,14 @@ impl Project {
     }
 
     fn remove_work_projection(&self) -> Result<()> {
-        let path = self.root.join(WORK_FILE);
-        if path.exists() {
-            fs::remove_file(&path).with_context(|| format!("无法删除 {}", path.display()))?;
+        for path in [
+            self.root.join(WORK_FILE),
+            self.work_midi_path(),
+            self.work_wav_path(),
+        ] {
+            if path.exists() {
+                fs::remove_file(&path).with_context(|| format!("无法删除 {}", path.display()))?;
+            }
         }
         Ok(())
     }
@@ -827,6 +906,32 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         .with_context(|| format!("无法写入临时文件 {}", temporary.display()))?;
     fs::rename(&temporary, path).with_context(|| format!("无法更新 {}", path.display()))?;
     Ok(())
+}
+
+fn copy_atomic(source: &Path, target: &Path) -> Result<()> {
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("无效文件路径：{}", target.display()))?
+        .to_string_lossy();
+    let temporary = target.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    fs::copy(source, &temporary).with_context(|| {
+        format!(
+            "无法复制 {} 到临时文件 {}",
+            source.display(),
+            temporary.display()
+        )
+    })?;
+    fs::rename(&temporary, target).with_context(|| format!("无法更新 {}", target.display()))?;
+    Ok(())
+}
+
+fn restore_projections(targets: &[&PathBuf; 3], backups: &[PathBuf; 3], existed: [bool; 3]) {
+    for ((target, backup), existed) in targets.iter().zip(backups).zip(existed) {
+        let _ = fs::remove_file(target);
+        if existed {
+            let _ = fs::rename(backup, target);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -87,6 +87,8 @@ struct ComposeRun {
     _directory: tempfile::TempDir,
     output: Output,
     output_file: PathBuf,
+    midi_file: PathBuf,
+    wav_file: PathBuf,
     project: PathBuf,
     project_metadata_before: Option<Vec<u8>>,
 }
@@ -136,12 +138,47 @@ fn run_compose_with(
     };
     fs::write(
         &alda,
-        format!("#!/bin/sh\nprintf '%s\\n' '{parse_output}'\n"),
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  parse) printf '%s\\n' '{parse_output}' ;;\n  export) printf midi > \"$5\" ;;\n  *) exit 0 ;;\nesac\n"
+        ),
     )
     .unwrap();
     let mut permissions = fs::metadata(&alda).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&alda, permissions).unwrap();
+
+    let source_wav = directory.path().join("source.wav");
+    let mut writer = hound::WavWriter::create(
+        &source_wav,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    for index in 0..800 {
+        writer
+            .write_sample(if index % 2 == 0 {
+                8_000_i16
+            } else {
+                -8_000_i16
+            })
+            .unwrap();
+    }
+    writer.finalize().unwrap();
+    let fluidsynth = bin_directory.join("fluidsynth");
+    fs::write(
+        &fluidsynth,
+        format!("#!/bin/sh\ncp '{}' \"$4\"\n", source_wav.display()),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fluidsynth).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fluidsynth, permissions).unwrap();
+    let soundfont = directory.path().join("test.sf2");
+    fs::write(&soundfont, "soundfont").unwrap();
 
     let path = std::env::join_paths(std::iter::once(bin_directory).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -158,6 +195,7 @@ fn run_compose_with(
         .arg(&output_directory)
         .args(extra_args)
         .env("PATH", path)
+        .env("ALDA_AGENT_SOUNDFONT", soundfont)
         .env("HOME", home);
     let output = command.output().unwrap();
 
@@ -165,6 +203,8 @@ fn run_compose_with(
         _directory: directory,
         output,
         output_file: output_directory.join("current.alda"),
+        midi_file: output_directory.join("current.mid"),
+        wav_file: output_directory.join("current.wav"),
         project,
         project_metadata_before,
     }
@@ -182,6 +222,8 @@ fn compose_candidate_preserves_stdout_exit_and_output_contract() {
     assert!(stdout.contains("作品已保存到:"));
     assert!(run.output.stderr.is_empty());
     assert_eq!(fs::read_to_string(run.output_file).unwrap(), "piano: c");
+    assert_eq!(fs::read(run.midi_file).unwrap(), b"midi");
+    assert!(run.wav_file.is_file());
 }
 
 #[test]

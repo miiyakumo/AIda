@@ -1,5 +1,5 @@
 use crate::alda::{AldaCheck, AldaRunner, CheckStatus, ScoreValidation};
-use crate::audio::AudioRenderer;
+use crate::audio::{ArtifactReport, AudioRenderer};
 use crate::conversation::{ConversationMessage, ConversationRole, ConversationToolCall};
 use crate::deepseek::{DeepSeekClient, FunctionDef, Message, StreamEvent, Tool};
 use crate::instructions::CompiledInstructions;
@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 // ============================================================
@@ -149,6 +150,31 @@ pub struct CreationResult {
     pub played_target: Option<String>,
     /// 本轮由模型通过宿主工具实际生成的 WAV。
     pub rendered_wav: Option<PathBuf>,
+    /// 完整候选自动校验后生成的临时 MIDI/WAV；由调用方持久化。
+    pub candidate_artifacts: Option<StagedCandidateArtifacts>,
+}
+
+#[derive(Debug)]
+pub struct StagedCandidateArtifacts {
+    _directory: tempfile::TempDir,
+    report: ArtifactReport,
+}
+
+impl StagedCandidateArtifacts {
+    #[must_use]
+    pub fn report(&self) -> &ArtifactReport {
+        &self.report
+    }
+
+    #[must_use]
+    pub fn midi_path(&self) -> &Path {
+        &self.report.midi_path
+    }
+
+    #[must_use]
+    pub fn wav_path(&self) -> &Path {
+        &self.report.wav_path
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +332,12 @@ impl Agent {
         }
     }
 
+    #[must_use]
+    pub fn with_audio_renderer(mut self, renderer: AudioRenderer) -> Self {
+        self.audio_renderer = Some(renderer);
+        self
+    }
+
     pub async fn create(&self, request: CreationRequest) -> Result<CreationResult> {
         self.create_with_reporter(request, &mut SilentReporter)
             .await
@@ -410,6 +442,7 @@ impl Agent {
         let mut previous_failure_signature = None;
         let mut played_target = None;
         let mut rendered_wav = None;
+        let mut candidate_artifacts = None;
         let mut continuing_after_tool = false;
 
         while round < max_rounds {
@@ -687,6 +720,7 @@ impl Agent {
                     conversation: messages,
                     played_target,
                     rendered_wav,
+                    candidate_artifacts: None,
                 });
             }
             if score_kind.is_some_and(|previous| previous != submitted.kind) {
@@ -707,7 +741,7 @@ impl Agent {
             };
             let mut checks = self
                 .runner
-                .validate_async(tmp_score, score_validation)
+                .validate_async(tmp_score.clone(), score_validation)
                 .await?;
             if was_truncated {
                 checks.push(AldaCheck {
@@ -715,6 +749,51 @@ impl Agent {
                     status: CheckStatus::Fail,
                     detail: "模型输出被截断（达到 token 限制），作品可能不完整".to_string(),
                 });
+            }
+            if submitted.kind == AgentResultKind::Candidate
+                && checks.iter().all(|check| check.status != CheckStatus::Fail)
+            {
+                let renderer = match &self.audio_renderer {
+                    Some(renderer) => renderer.clone(),
+                    None => AudioRenderer::discover()?,
+                };
+                let midi_path = tmp_dir.path().join("candidate.mid");
+                let wav_path = tmp_dir.path().join("candidate.wav");
+                match renderer
+                    .render_score_async(self.runner.clone(), tmp_score, midi_path, wav_path)
+                    .await
+                {
+                    Ok(report) => {
+                        checks.push(AldaCheck {
+                            name: "音频渲染",
+                            status: CheckStatus::Pass,
+                            detail: format!(
+                                "WAV {:.2}秒，{} Hz，{} 声道，peak={:.6}，RMS={:.6}，非静音；局部静音：开头 {:.1}秒，结尾 {:.1}秒，最长内部 {:.1}秒，占比 {:.1}%",
+                                report.wav.duration_secs,
+                                report.wav.sample_rate,
+                                report.wav.channels,
+                                report.wav.peak,
+                                report.wav.rms,
+                                report.wav.silence.leading_silence_ms / 1000.0,
+                                report.wav.silence.trailing_silence_ms / 1000.0,
+                                report.wav.silence.max_internal_silence_ms / 1000.0,
+                                report.wav.silence.silent_ratio * 100.0,
+                            ),
+                        });
+                        candidate_artifacts = Some(StagedCandidateArtifacts {
+                            _directory: tmp_dir,
+                            report,
+                        });
+                    }
+                    Err(error) => {
+                        let temporary_root = tmp_dir.path().display().to_string();
+                        checks.push(AldaCheck {
+                            name: "音频渲染",
+                            status: CheckStatus::Fail,
+                            detail: format!("{error:#}").replace(&temporary_root, "<temporary>"),
+                        });
+                    }
+                }
             }
             let signature = failure_signature(&alda_code, &checks);
             let repeated_failure = checks.iter().any(|check| check.status == CheckStatus::Fail)
@@ -757,6 +836,7 @@ impl Agent {
                     conversation: messages,
                     played_target,
                     rendered_wav,
+                    candidate_artifacts,
                 });
             }
             if repeated_failure {
@@ -784,6 +864,7 @@ impl Agent {
             conversation: messages,
             played_target,
             rendered_wav,
+            candidate_artifacts: None,
         })
     }
 
@@ -1232,6 +1313,28 @@ mod tests {
         format!("data: {chunk}\n\ndata: [DONE]\n")
     }
 
+    fn draft_response(code: &str) -> String {
+        let arguments = serde_json::json!({
+            "kind": "draft",
+            "message": "核心草稿",
+            "alda_code": code
+        })
+        .to_string();
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_draft",
+                        "function": { "name": "submit_result", "arguments": arguments }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!("data: {chunk}\n\ndata: [DONE]\n")
+    }
+
     fn plain_text_response(text: &str) -> String {
         let chunk = serde_json::json!({
             "choices": [{
@@ -1332,6 +1435,10 @@ mod tests {
     }
 
     fn fake_audio_renderer(root: &std::path::Path) -> AudioRenderer {
+        fake_audio_renderer_with_amplitude(root, 8_000)
+    }
+
+    fn fake_audio_renderer_with_amplitude(root: &std::path::Path, amplitude: i16) -> AudioRenderer {
         let source_wav = root.join("render-source.wav");
         let mut writer = WavWriter::create(
             &source_wav,
@@ -1346,9 +1453,9 @@ mod tests {
         for index in 0..800 {
             writer
                 .write_sample(if index % 2 == 0 {
-                    8_000_i16
+                    amplitude
                 } else {
-                    -8_000_i16
+                    -amplitude
                 })
                 .unwrap();
         }
@@ -1458,13 +1565,80 @@ mod tests {
             "example-model".to_string(),
         )
         .unwrap();
-        let (_directory, runner) = fake_runner();
-        let result = Agent::new(client, runner).create(request(2)).await.unwrap();
+        let (directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .with_audio_renderer(fake_audio_renderer(directory.path()))
+            .create(request(2))
+            .await
+            .unwrap();
         assert!(result.success);
         assert_eq!(result.rounds, 2);
         assert!(!result.was_truncated);
         assert!(result.alda_code.is_some());
+        let artifacts = result.candidate_artifacts.as_ref().unwrap();
+        assert!(artifacts.midi_path().is_file());
+        assert!(artifacts.wav_path().is_file());
+        assert!(result.checks.iter().any(|check| {
+            check.name == "音频渲染"
+                && check.status == CheckStatus::Pass
+                && check.detail.contains("非静音")
+        }));
         assert!(result.conversation.len() >= 6);
+    }
+
+    #[tokio::test]
+    async fn silent_candidate_is_check_feedback_and_never_succeeds() {
+        let (base_url, _requests) = serve(vec![
+            MockResponse::sse(tool_response("piano: c", "tool_calls")),
+            MockResponse::sse(tool_response("piano: c", "tool_calls")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .with_audio_renderer(fake_audio_renderer_with_amplitude(directory.path(), 0))
+            .create(request(3))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.rounds, 2);
+        assert!(result.candidate_artifacts.is_none());
+        assert!(result.checks.iter().any(|check| {
+            check.name == "音频渲染"
+                && check.status == CheckStatus::Fail
+                && check.detail.contains("静音")
+        }));
+    }
+
+    #[tokio::test]
+    async fn draft_does_not_render_audio() {
+        let (base_url, _requests) = serve(vec![MockResponse::sse(draft_response("piano: c"))]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = fake_runner();
+        let unavailable = AudioRenderer::new(
+            directory.path().join("missing-fluidsynth"),
+            directory.path().join("missing.sf2"),
+        );
+        let result = Agent::new(client, runner)
+            .with_audio_renderer(unavailable)
+            .create(request(1))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.kind, AgentResultKind::Draft);
+        assert!(result.candidate_artifacts.is_none());
+        assert!(result.checks.iter().all(|check| check.name != "音频渲染"));
     }
 
     #[tokio::test]
@@ -1519,8 +1693,9 @@ mod tests {
             "example-model".to_string(),
         )
         .unwrap();
-        let (_directory, runner) = fake_runner();
+        let (directory, runner) = fake_runner();
         let result = Agent::new(client, runner)
+            .with_audio_renderer(fake_audio_renderer(directory.path()))
             .run_generation(
                 vec![Message {
                     role: "user".to_string(),
@@ -1563,9 +1738,10 @@ mod tests {
             "example-model".to_string(),
         )
         .unwrap();
-        let (_directory, runner) = fake_runner();
+        let (directory, runner) = fake_runner();
         let mut reporter = RecordingReporter::default();
         let result = Agent::new(client, runner)
+            .with_audio_renderer(fake_audio_renderer(directory.path()))
             .run_generation(
                 vec![Message {
                     role: "user".to_string(),
@@ -1613,9 +1789,10 @@ mod tests {
             "example-model".to_string(),
         )
         .unwrap();
-        let (_directory, runner) = fake_runner();
+        let (directory, runner) = fake_runner();
         let mut reporter = RecordingReporter::default();
         let result = Agent::new(client, runner)
+            .with_audio_renderer(fake_audio_renderer(directory.path()))
             .run_generation(
                 vec![Message {
                     role: "user".to_string(),
@@ -1689,9 +1866,10 @@ mod tests {
             "example-model".to_string(),
         )
         .unwrap();
-        let (_directory, runner) = fake_runner();
+        let (directory, runner) = fake_runner();
         let mut reporter = RecordingReporter::default();
         let result = Agent::new(client, runner)
+            .with_audio_renderer(fake_audio_renderer(directory.path()))
             .run_generation(
                 vec![Message {
                     role: "user".to_string(),
@@ -1755,9 +1933,10 @@ mod tests {
             "example-model".to_string(),
         )
         .unwrap();
-        let (_directory, runner) = fake_runner();
+        let (directory, runner) = fake_runner();
         let mut reporter = RecordingReporter::default();
         let result = Agent::new(client, runner)
+            .with_audio_renderer(fake_audio_renderer(directory.path()))
             .create_with_reporter(request(3), &mut reporter)
             .await
             .unwrap();
