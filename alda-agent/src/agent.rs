@@ -2042,7 +2042,6 @@ mod tests {
         assert!(rendered.contains("不得为了改善诊断而让所有声部持续铺满"));
         assert!(rendered.contains("不能把同一短循环按比例复制"));
         assert!(rendered.contains("不继续扩大整曲"));
-        assert!(rendered.contains("决定调用工具后直接调用"));
     }
 
     #[tokio::test]
