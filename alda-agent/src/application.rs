@@ -1657,6 +1657,40 @@ mod tests {
 
     #[tokio::test]
     async fn model_failure_after_a_failed_candidate_persists_the_revision() {
+        assert_failed_candidate_revision_survives(
+            vec![
+                MockResponse::sse(candidate_response()),
+                MockResponse::error("500 Internal Server Error", "service unavailable"),
+            ],
+            "500",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn result_kind_change_after_a_failed_candidate_persists_the_revision() {
+        let mut responses = vec![MockResponse::sse(candidate_response())];
+        responses.extend(
+            (0..=RunPolicy::default().max_protocol_recoveries)
+                .map(|_| MockResponse::sse(score_response("draft"))),
+        );
+        assert_failed_candidate_revision_survives(responses, "协议恢复超过").await;
+    }
+
+    #[tokio::test]
+    async fn missing_score_code_after_a_failed_candidate_persists_the_revision() {
+        let mut responses = vec![MockResponse::sse(candidate_response())];
+        responses.extend(
+            (0..=RunPolicy::default().max_protocol_recoveries)
+                .map(|_| MockResponse::sse(text_response("candidate", "缺少源码"))),
+        );
+        assert_failed_candidate_revision_survives(responses, "协议恢复超过").await;
+    }
+
+    async fn assert_failed_candidate_revision_survives(
+        responses: Vec<MockResponse>,
+        expected_error: &str,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("poem");
         let mut project = Project::load_or_create(root.clone(), "poem", "").unwrap();
@@ -1672,10 +1706,7 @@ mod tests {
             Some(runner),
             passing_renderer(runner_directory.path()),
         );
-        let (base_url, _requests) = serve(vec![
-            MockResponse::sse(candidate_response()),
-            MockResponse::error("500 Internal Server Error", "service unavailable"),
-        ]);
+        let (base_url, _requests) = serve(responses);
         application
             .configure(ConfigAction::Model("example-model".to_string()))
             .unwrap();
@@ -1689,7 +1720,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("500"));
+        assert!(error.to_string().contains(expected_error));
         assert_eq!(
             application.conversation_view().state,
             ConversationState::RevisionAvailable
