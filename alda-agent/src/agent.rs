@@ -865,8 +865,8 @@ impl Agent {
             }
             let signature = failure_signature(&alda_code, &checks);
             let has_failures = checks.iter().any(|check| check.status == CheckStatus::Fail);
-            if has_failures
-                && let Some(check) = observe_progress(
+            if has_failures {
+                if let Some(check) = observe_progress(
                     &checks,
                     &signature,
                     &mut previous_failure_signature,
@@ -874,9 +874,9 @@ impl Agent {
                     &mut best_progress,
                     &mut consecutive_no_progress,
                     max_no_progress,
-                )
-            {
-                checks.push(check);
+                ) {
+                    checks.push(check);
+                }
             }
             reporter.report(AgentEvent::ValidationCompleted(checks.clone()));
             let all_pass = checks.iter().all(|check| check.status != CheckStatus::Fail);
@@ -1103,12 +1103,14 @@ impl GenerationProgress {
         if self.stage != best.stage {
             return self.stage > best.stage;
         }
-        if self.stage == 4
-            && let (Some(current), Some(previous)) =
+        if self.stage == 4 {
+            if let (Some(current), Some(previous)) =
                 (self.duration_distance_secs, best.duration_distance_secs)
-            && current + 0.5 < previous
-        {
-            return true;
+            {
+                if current + 0.5 < previous {
+                    return true;
+                }
+            }
         }
         self.failure_count < best.failure_count
     }
@@ -1858,6 +1860,13 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.rounds, 4);
         assert_eq!(result.alda_code.as_deref(), Some("target"));
+        let artifacts = result.candidate_artifacts.as_ref().unwrap();
+        assert!(artifacts.wav_path().is_file());
+        assert!(result.checks.iter().any(|check| {
+            check.name == "音频渲染"
+                && check.status == CheckStatus::Pass
+                && check.detail.contains("非静音")
+        }));
         assert_eq!(
             reporter
                 .events

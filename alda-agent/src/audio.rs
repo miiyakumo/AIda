@@ -312,13 +312,13 @@ fn build_silence_diagnostics(
 ) -> SilenceDiagnostics {
     let mut merged = Vec::<(u64, u64)>::new();
     for &(start, end) in silent_windows {
-        if let Some((_, previous_end)) = merged.last_mut()
-            && start <= *previous_end
-        {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            merged.push((start, end));
+        if let Some((_, previous_end)) = merged.last_mut() {
+            if start <= *previous_end {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
         }
+        merged.push((start, end));
     }
 
     let leading_frames = merged

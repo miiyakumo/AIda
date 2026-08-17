@@ -390,14 +390,14 @@ fn analyze_events(parsed: &ParseOutput) -> Result<(f64, TimelineDiagnostics)> {
         .map_or(0.0, |second| (duration_ms - second).max(0.0));
     let merged_global = merge_intervals(all_intervals, GLOBAL_EVENT_GAP_TOLERANCE_MS);
     let mut event_gaps = Vec::new();
-    if let Some((first_start, _)) = merged_global.first()
-        && *first_start > GLOBAL_EVENT_GAP_TOLERANCE_MS
-    {
-        event_gaps.push(EventGap {
-            start_ms: 0.0,
-            end_ms: *first_start,
-            duration_ms: *first_start,
-        });
+    if let Some((first_start, _)) = merged_global.first() {
+        if *first_start > GLOBAL_EVENT_GAP_TOLERANCE_MS {
+            event_gaps.push(EventGap {
+                start_ms: 0.0,
+                end_ms: *first_start,
+                duration_ms: *first_start,
+            });
+        }
     }
     event_gaps.extend(merged_global.windows(2).map(|pair| EventGap {
         start_ms: pair[0].1,
