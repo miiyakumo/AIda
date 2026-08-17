@@ -146,6 +146,8 @@ fn workflow_respects_explicit_full_composition_requests() {
     assert!(PROTOCOL.contains("不得形成连续澄清循环"));
     assert!(PROTOCOL.contains("具体商业品牌名称"));
     assert!(PROTOCOL.contains("取消该目标"));
-    assert!(PROTOCOL.contains("参数截断或无效"));
+    assert!(PROTOCOL.contains("若宿主报告参数截断"));
+    assert!(PROTOCOL.contains("不得原样重发"));
+    assert!(PROTOCOL.contains("其他参数错误按宿主指出的字段修正"));
     assert!(PROTOCOL.contains("不得声称未经宿主校验的精确时长"));
 }

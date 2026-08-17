@@ -1567,55 +1567,104 @@ fn build_tool_feedback(checks: &[AldaCheck], _tool_call_id: Option<&str>) -> Str
         .collect();
 
     if failures.is_empty() {
-        return "✅ 所有检查通过；宿主将保存工作乐谱，但尚未播放。需要听到声音必须调用 play_score 或由用户执行 /alda play work；只有用户明确接受完整候选才会创建版本。"
+        return "✅ 所有必要检查通过；未检查项和诊断不影响通过，也不要求归零。宿主将保存工作乐谱，但尚未播放。需要听到声音必须调用 play_score 或由用户执行 /alda play work；只有用户明确接受完整候选才会创建版本。"
             .to_string();
     }
 
     let mut msg = format!(
-        "校验反馈 ({}/{} 项未通过):\n\n",
+        "校验未通过（{}/{} 项硬失败）。只修正【必须修正】；诊断不是失败，不要把它优化成新的创作目标。\n\n【必须修正｜决定能否通过】\n",
         failures.len(),
         checks.len(),
     );
 
-    for c in checks {
-        let icon = match c.status {
-            CheckStatus::Pass => "✅",
-            CheckStatus::Fail => "❌",
-            CheckStatus::Unchecked => "⏭",
-        };
-        let _ = writeln!(msg, "{} {}: {}", icon, c.name, c.detail);
+    for check in &failures {
+        let _ = writeln!(msg, "❌ {}: {}", check.name, check.detail);
     }
 
-    // 过短通常说明内容或结构不足，不能仅靠降低 tempo 拉伸成完整作品。
-    let duration_values = checks
+    let diagnostics = checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Unchecked)
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        msg.push_str("\n【未检查或诊断｜不作为本轮修正目标】\n");
+        for check in diagnostics {
+            let _ = writeln!(msg, "- {}: {}", check.name, check.detail);
+        }
+    }
+
+    let passed = checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Pass)
+        .collect::<Vec<_>>();
+    if !passed.is_empty() {
+        msg.push_str("\n【已通过｜保持】\n");
+        for check in passed {
+            let _ = writeln!(msg, "✅ {}", check.name);
+        }
+    }
+
+    let duration_bounds = checks
         .iter()
         .find(|c| c.name == "时长" && c.status == CheckStatus::Fail)
-        .and_then(|check| parse_duration_values(&check.detail));
-    if let Some((actual, target)) = duration_values.filter(|(actual, _)| *actual > 0.0) {
+        .and_then(|check| parse_duration_bounds(&check.detail));
+    if let Some((actual, min_target, max_target)) =
+        duration_bounds.filter(|(actual, _, _)| *actual > 0.0)
+    {
+        let direction = if actual < min_target {
+            format!("低于目标下限 {min_target:.0} 秒")
+        } else if actual > max_target {
+            format!("高于目标上限 {max_target:.0} 秒")
+        } else {
+            "不在项目允许范围内".to_string()
+        };
         let _ = writeln!(
             msg,
-            "\n**时长修正指南**: 当前作品约 {actual:.0} 秒，目标 {target:.0} 秒。作品过短时补充或发展材料、段落和整体结构；作品过长时优先删减冗余。仅在内容量已经合适且速度明显偏离意图时调整 tempo。"
+            "\n【时长修正策略】当前约 {actual:.0} 秒，{direction}。过短时增加有职责的变奏、对比、发展、再现或尾声；过长时删减冗余循环和无结构作用的材料。不要把短循环按比例复制、持续铺满所有声部或只改 tempo。修改相关材料后先用 inspect_alda_source 读取实际时长。"
         );
     }
 
-    msg.push_str("\n请根据以上反馈修改 Alda 乐谱后重新提交. 注意: 反馈中的具体数值和倍数建议是精确计算得出的, 请严格参考.");
+    msg.push_str("\n请保持已通过部分，只修正硬失败后重新提交。若无法可靠确认循环、片段或声部长度，停止手算并用 inspect_alda_source 检查 4–16 小节材料。");
     msg
 }
 
-/// 从时长检查的 detail 文本中解析实际值和目标值
-/// detail 格式: "约 46秒（目标 180秒，偏差 74%，超出容差 10%）"
-fn parse_duration_values(detail: &str) -> Option<(f64, f64)> {
+/// 从时长检查的 detail 文本中解析实际值与有效目标区间。
+/// 支持“约 46秒（目标 180秒，允许偏差 10%）”和“约 46秒（目标 120–180秒）”。
+fn parse_duration_bounds(detail: &str) -> Option<(f64, f64, f64)> {
     let after_yue = detail.strip_prefix("约 ")?.split('秒').next()?;
     let actual: f64 = after_yue.trim().parse().ok()?;
 
     let target_start = detail.find("目标 ")?.checked_add("目标 ".len())?;
     let target_end = detail[target_start..].find('秒')?;
-    let target: f64 = detail[target_start..target_start + target_end]
+    let target = detail[target_start..target_start + target_end].trim();
+    let mut bounds = target.split('–');
+    let target_start: f64 = bounds.next()?.trim().parse().ok()?;
+    let target_end = bounds
+        .next()
+        .map(str::trim)
+        .map(str::parse)
+        .transpose()
+        .ok()?;
+    if bounds.next().is_some() {
+        return None;
+    }
+
+    if let Some(target_end) = target_end {
+        if target_start > target_end {
+            return None;
+        }
+        return Some((actual, target_start, target_end));
+    }
+
+    let tolerance_start = detail.find("允许偏差 ")?.checked_add("允许偏差 ".len())?;
+    let tolerance_end = detail[tolerance_start..].find('%')?;
+    let tolerance_pct: f64 = detail[tolerance_start..tolerance_start + tolerance_end]
         .trim()
         .parse()
         .ok()?;
-
-    Some((actual, target))
+    (tolerance_pct.is_finite() && tolerance_pct >= 0.0).then(|| {
+        let tolerance = target_start * tolerance_pct / 100.0;
+        (actual, target_start - tolerance, target_start + tolerance)
+    })
 }
 
 #[cfg(test)]
@@ -1926,33 +1975,74 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duration() {
-        let (actual, target) =
-            parse_duration_values("约 46秒（目标 180秒，偏差 74%，超出容差 10%）").unwrap();
+    fn parses_exact_and_range_duration_bounds() {
+        let (actual, min_target, max_target) =
+            parse_duration_bounds("约 46秒（目标 180秒，允许偏差 10%）").unwrap();
         assert!((actual - 46.0).abs() < f64::EPSILON);
-        assert!((target - 180.0).abs() < f64::EPSILON);
+        assert!((min_target - 162.0).abs() < f64::EPSILON);
+        assert!((max_target - 198.0).abs() < f64::EPSILON);
+
+        let (actual, min_target, max_target) =
+            parse_duration_bounds("约 227秒（目标 120–180秒）").unwrap();
+        assert!((actual - 227.0).abs() < f64::EPSILON);
+        assert!((min_target - 120.0).abs() < f64::EPSILON);
+        assert!((max_target - 180.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_parse_duration_no_match() {
-        assert!(parse_duration_values("未检查").is_none());
-        assert!(parse_duration_values("解析成功").is_none());
+        assert!(parse_duration_bounds("未检查").is_none());
+        assert!(parse_duration_bounds("解析成功").is_none());
+        assert!(parse_duration_bounds("约 10秒（目标 180–120秒）").is_none());
+        assert!(parse_duration_bounds("约 10秒（目标 180秒）").is_none());
     }
 
     #[test]
-    fn duration_failure_recommends_developing_material() {
+    fn feedback_separates_hard_failures_diagnostics_and_passes() {
         let feedback = build_tool_feedback(
-            &[AldaCheck {
-                name: "时长",
-                status: CheckStatus::Fail,
-                detail: "约 227秒（目标 180秒，偏差 26%，超出容差 10%）".to_string(),
-            }],
+            &[
+                AldaCheck {
+                    name: "Alda 语法",
+                    status: CheckStatus::Pass,
+                    detail: "解析成功".to_string(),
+                },
+                AldaCheck {
+                    name: "声部时间轴/事件空档",
+                    status: CheckStatus::Unchecked,
+                    detail: "结尾尾差 4.0秒".to_string(),
+                },
+                AldaCheck {
+                    name: "时长",
+                    status: CheckStatus::Fail,
+                    detail: "约 227秒（目标 120–180秒）".to_string(),
+                },
+            ],
             None,
         );
 
-        assert!(feedback.contains("补充或发展材料"));
-        assert!(feedback.contains("删减冗余"));
-        assert!(!feedback.contains("乘以"));
+        let failures = feedback.find("【必须修正").unwrap();
+        let diagnostics = feedback.find("【未检查或诊断").unwrap();
+        let passed = feedback.find("【已通过").unwrap();
+        assert!(failures < diagnostics && diagnostics < passed);
+        assert!(feedback.contains("❌ 时长: 约 227秒"));
+        assert!(feedback.contains("- 声部时间轴/事件空档"));
+        assert!(feedback.contains("诊断不是失败"));
+        assert!(feedback.contains("高于目标上限 180 秒"));
+        assert!(feedback.contains("删减冗余循环"));
+        assert!(feedback.contains("inspect_alda_source"));
+        assert!(!feedback.contains("精确计算得出"));
+    }
+
+    #[test]
+    fn compiled_workflow_prevents_validator_driven_filler() {
+        let compiled = compiled_instructions(&ProjectPreferences::default());
+        let rendered = compiled.rendered();
+
+        assert!(rendered.contains("只把硬失败作为自动修正目标"));
+        assert!(rendered.contains("不得为了改善诊断而让所有声部持续铺满"));
+        assert!(rendered.contains("不能把同一短循环按比例复制"));
+        assert!(rendered.contains("不继续扩大整曲"));
+        assert!(rendered.contains("决定调用工具后直接调用"));
     }
 
     #[tokio::test]
