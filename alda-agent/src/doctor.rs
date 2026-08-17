@@ -14,12 +14,20 @@ fn run_checks(
     exec: impl Fn(&str, &[&str]) -> Option<String>,
     soundfont: impl Fn() -> Option<std::path::PathBuf>,
 ) -> Vec<CheckResult> {
+    let mut results = run_runtime_checks(&exec, &soundfont);
+    results.push(check_rust(&exec));
+    results
+}
+
+fn run_runtime_checks(
+    exec: &impl Fn(&str, &[&str]) -> Option<String>,
+    soundfont: &impl Fn() -> Option<std::path::PathBuf>,
+) -> Vec<CheckResult> {
     let java = check_java(&exec);
     let alda = check_alda(&exec);
     let fluidsynth = check_fluidsynth(&exec);
     let soundfont = check_soundfont(&soundfont);
-    let rust = check_rust(&exec);
-    vec![java, alda, fluidsynth, soundfont, rust]
+    vec![java, alda, fluidsynth, soundfont]
 }
 
 fn check_fluidsynth(exec: &impl Fn(&str, &[&str]) -> Option<String>) -> CheckResult {
@@ -145,23 +153,7 @@ pub async fn run(
     probe: Option<crate::ProbeTarget>,
     project_root: std::path::PathBuf,
 ) -> anyhow::Result<()> {
-    let exec = |program: &str, args: &[&str]| -> Option<String> {
-        let output = std::process::Command::new(program)
-            .args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            Some(format!("{stdout}{stderr}"))
-        } else {
-            None
-        }
-    };
-
-    let results = run_checks(exec, crate::audio::find_soundfont);
+    let results = run_checks(exec_local, crate::audio::find_soundfont);
     print_results(&results);
     let failed = results
         .iter()
@@ -174,6 +166,37 @@ pub async fn run(
         run_probe(probe, &project_root).await?;
     }
     Ok(())
+}
+
+pub fn require_runtime() -> anyhow::Result<()> {
+    let results = run_runtime_checks(&exec_local, &crate::audio::find_soundfont);
+    let missing = results
+        .iter()
+        .filter(|result| matches!(result.status, CheckStatus::Fail))
+        .map(|result| result.name)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "运行环境不完整，未启动 Alda Agent：{}。请先运行 scripts/install-linux.sh 安装依赖，再用 `alda-agent doctor` 验证",
+        missing.join("、")
+    )
+}
+
+fn exec_local(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Some(format!("{stdout}{stderr}"))
 }
 
 async fn run_probe(

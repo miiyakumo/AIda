@@ -16,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
             alda_agent::doctor::run(probe, selected_project_root(project, name)?).await
         }
         Some(Command::Control) => {
+            alda_agent::doctor::require_runtime()?;
             let (project, name) = selected_project(project, name)?;
             alda_agent::control::run(project, name).await
         }
@@ -27,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
             exclude,
             output,
         }) => {
+            alda_agent::doctor::require_runtime()?;
             let (project_root, project_name) = selected_project(project, name)?;
             run_cancelable(compose(ComposeOptions {
                 project_root,
@@ -41,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         None => {
+            alda_agent::doctor::require_runtime()?;
             let (project, name) = selected_project(project, name)?;
             alda_agent::repl::run_repl(project, name).await
         }

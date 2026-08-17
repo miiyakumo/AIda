@@ -1763,10 +1763,10 @@ mod tests {
             Some(runner),
             renderer_with_amplitude(runner_directory.path(), 0),
         );
-        let (base_url, _requests) = serve(vec![
-            MockResponse::sse(candidate_response()),
-            MockResponse::sse(candidate_response()),
-        ]);
+        let responses = (0..RunPolicy::default().max_model_calls)
+            .map(|_| MockResponse::sse(candidate_response()))
+            .collect();
+        let (base_url, _requests) = serve(responses);
         application
             .configure(ConfigAction::Model("example-model".to_string()))
             .unwrap();

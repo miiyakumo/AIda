@@ -1,6 +1,6 @@
 # 当前架构
 
-> 代码基线：语义持久化、乐谱诊断、候选音频门禁与进展驱动重试（2026-08-17）
+> 代码基线：启动环境门禁、模型文本流、乐谱诊断与候选音频门禁（2026-08-17）
 >
 > 本文描述当前源码实际行为。
 
@@ -114,15 +114,18 @@ Project 与进程内能力状态派生，不是新的事实来源。
 
 ## 能力与降级
 
-项目、Alda 和模型能力独立：打开项目不创建模型客户端；自然语言操作才读取项目内 `model.json` 并
-创建客户端。模型名称、OpenAI-compatible API Base URL 和密钥必须全部设置；模型失败不会阻止
-`/project` 或可用的 `/alda` 操作。Alda 缺失时仍可导出版本的 Alda 源码；只请求 MIDI 时会明确报告
-MIDI 未完成。WAV 或 all 还要求 FluidSynth 和 General MIDI SoundFont，找不到时直接返回可操作的安装
-提示，不会伪造成功产物。
+模型客户端按需创建：自然语言操作才读取项目内 `model.json`。模型名称、OpenAI-compatible API Base URL
+和密钥必须全部设置；模型服务失败不会阻止已经启动的 `/project` 或 `/alda` 操作。
 
-Linux 安装脚本同时安装或检查 Java、Alda、FluidSynth 与 GM SoundFont，可用
-`ALDA_AGENT_SOUNDFONT` 指向非标准 SoundFont。`doctor` 本地检查五项依赖；Alda probe 会真实执行
-Alda → MIDI → WAV，并拒绝零帧或静音 WAV。
+Java、Alda、FluidSynth 与 General MIDI SoundFont 是启动 REPL、`control` 或 `compose` 的统一运行时
+前置条件。Shell 在选择或创建项目、读取 compose stdin、进入 UI 之前一次检查全部四项；任一项不可发现
+就拒绝启动，并提示先运行 `scripts/install-linux.sh` 后用 `alda-agent doctor` 验证。`projects` 和
+`doctor` 本身不受门禁限制，缺少依赖时仍可列项目和诊断环境。Rust 只用于从源码构建，不是已编译程序的
+运行时门禁。
+
+Linux 安装脚本在应用启动前安装或检查四项运行时依赖，可用 `ALDA_AGENT_SOUNDFONT` 指向非标准
+SoundFont。`doctor` 还报告源码构建所需的 Rust 工具链；Alda probe 会真实执行 Alda → MIDI → WAV，
+并拒绝零帧或静音 WAV。
 
 模型配置完整性、最近模型服务状态和对话请求状态彼此独立。限流、认证、网络或模型拒绝不会把完整配置
 标成不可用；界面按错误类型分别提示稍后重试、更新密钥或检查 API Base URL。用户消息在请求前以
@@ -168,22 +171,21 @@ Agent 只有交互式 `respond_with_reporter` 和一次性 `create` 两个真实
 `main.rs` 只处理 CLI 输入输出、文件读取写入与退出语义。
 
 Agent 在每次结果提交前报告开始事件，并报告候选校验、完整检查结果和自动修正。模型传输层不写
-stdout/stderr；
-模型自由推演不直接显示，终端统一渲染最终提交消息、宿主阶段事件、Alda、项目结果和错误。
+stdout/stderr；它把 SSE 中的 `content` 与 `submit_result.message` 解码为增量 `ModelText` 语义事件。
+终端在“模型”块中即时追加文本，JSONL 控制面逐增量输出带请求 ID 的 `model_text` 事件；其他工具参数
+（包括 Alda 源码）不回流到 UI。宿主阶段、检查、结果和错误继续由各 UI 适配器统一渲染。
 
 模型请求在提供工具时显式发送 `parallel_tool_calls: false`，每次响应只允许调用一个工具。除 `submit_result`
 外，宿主提供 `lookup_alda_docs`、`inspect_score`、
 `render_score` 和 `play_score`：分别读取固定官方章节、检查已有乐谱、生成 MIDI/WAV 并返回真实音频指标、
 以及真实发起播放。宿主工具往返和协议恢复不计作候选提交。SSE 按 tool-call index 分别聚合；若供应商仍
 返回多个并行调用，宿主拒绝且不执行全部调用，把每个对应错误写回上下文后自动继续。模型只返回普通文本
-或空响应而未调用工具时，宿主同样把协议错误写回并自动继续；原始文本只保留在本次模型上下文中，不会
-作为已完成结果展示。终端将工具往返、协议恢复和候选提交分别显示，不再展示固定提交额度。
+或空响应而未调用工具时，宿主同样把协议错误写回并自动继续；原始文本不作为已完成结果持久化，但会按
+增量显示。终端将工具往返、协议恢复和候选提交分别显示，不再展示固定提交额度。
 
-生成循环没有固定三次限制。默认 `RunPolicy` 允许持续改善的候选继续提交，同时用 15 分钟、24 次模型
-调用、8 次协议恢复和连续两次无进展作为安全熔断。进展依次按结果类型、Alda 语法、标记、其他硬检查、
-距目标时长、音频渲染和 WAV 非静音判断；精确时长和区间时长都计算到合法范围的距离。相同源码与相同
-错误立即停止，回到此前失败签名会按修正循环停止。Alda、FluidSynth 或 SoundFont 等环境错误直接返回，
-不让模型靠重复提交消耗调用。
+生成循环没有固定三次限制，也不再因连续无改善、相同失败或回到既有失败签名而提前停止。失败候选始终
+把检查反馈交还模型继续修正，直到成功、用户取消，或命中默认 15 分钟、24 次模型调用、8 次协议恢复之一。
+运行时依赖已在应用启动前门禁，因此缺少 Alda、FluidSynth 或 SoundFont 不会进入模型生成循环。
 
 模型最后通过 `submit_result` 明确返回普通回答、澄清、创作计划、草稿或完整候选。计划必须结构化携带核心
 材料、曲式、配器和发展方式，宿主将其拼成用户可见正文；带提问意图的回答归类为澄清。文本结果只更新对话；

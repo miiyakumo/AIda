@@ -1,11 +1,10 @@
 use crate::alda::{AldaCheck, AldaRunner, CheckStatus, ScoreValidation};
 use crate::audio::{ArtifactReport, AudioRenderer};
 use crate::conversation::{ConversationMessage, ConversationRole, ConversationToolCall};
-use crate::deepseek::{DeepSeekClient, FunctionDef, Message, StreamEvent, Tool};
+use crate::deepseek::{DeepSeekClient, FunctionDef, Message, StreamDelta, StreamEvent, Tool};
 use crate::instructions::CompiledInstructions;
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -128,7 +127,6 @@ pub struct RunPolicy {
     pub max_elapsed: Duration,
     pub max_model_calls: usize,
     pub max_protocol_recoveries: usize,
-    pub max_consecutive_no_progress: usize,
 }
 
 impl Default for RunPolicy {
@@ -137,7 +135,6 @@ impl Default for RunPolicy {
             max_elapsed: Duration::from_secs(15 * 60),
             max_model_calls: 24,
             max_protocol_recoveries: 8,
-            max_consecutive_no_progress: 2,
         }
     }
 }
@@ -454,7 +451,6 @@ impl Agent {
         let started = Instant::now();
         let max_model_calls = run_policy.max_model_calls.max(1);
         let max_protocol_recoveries = run_policy.max_protocol_recoveries.max(1);
-        let max_no_progress = run_policy.max_consecutive_no_progress.max(1);
         let max_elapsed = run_policy.max_elapsed.max(Duration::from_secs(1));
         let mut round = 0_usize;
         let mut model_calls = 0_usize;
@@ -465,10 +461,6 @@ impl Agent {
         let mut last_checks = Vec::new();
         let mut last_was_truncated = false;
         let mut score_kind = None;
-        let mut previous_failure_signature = None;
-        let mut seen_failure_signatures = HashSet::new();
-        let mut best_progress = None;
-        let mut consecutive_no_progress = 0_usize;
         let mut played_target = None;
         let mut rendered_wav = None;
         let mut candidate_artifacts = None;
@@ -502,12 +494,17 @@ impl Agent {
             } else {
                 reporter.report(AgentEvent::RoundStarted { attempt: round + 1 });
             }
+            let mut streamed_text = StreamingModelText::default();
             let events = match self
                 .client
                 .chat_stream_with(
                     messages.clone(),
                     Some(model_tools(validation.tool_context.is_some())),
-                    |_| {},
+                    |delta| {
+                        if let Some(text) = streamed_text.push(delta) {
+                            reporter.report(AgentEvent::ModelText(text));
+                        }
+                    },
                 )
                 .await
             {
@@ -758,24 +755,11 @@ impl Agent {
                 None
             };
             if let Some(detail) = result_policy_failure {
-                let mut checks = vec![AldaCheck {
+                let checks = vec![AldaCheck {
                     name: "结果类型",
                     status: CheckStatus::Fail,
                     detail: detail.to_string(),
                 }];
-                let signature = failure_signature(&tool_args, &checks);
-                let stop = observe_progress(
-                    &checks,
-                    &signature,
-                    &mut previous_failure_signature,
-                    &mut seen_failure_signatures,
-                    &mut best_progress,
-                    &mut consecutive_no_progress,
-                    max_no_progress,
-                );
-                if let Some(check) = stop {
-                    checks.push(check);
-                }
                 last_checks.clone_from(&checks);
                 last_was_truncated = was_truncated;
                 interpretation.clone_from(&submitted.message);
@@ -792,9 +776,6 @@ impl Agent {
                     tool_call_id: Some(tool_call_id),
                 });
                 reporter.report(AgentEvent::ValidationCompleted(checks.clone()));
-                if checks.iter().any(|check| check.name == "修正进展") {
-                    break;
-                }
                 reporter.report(AgentEvent::RevisionStarted {
                     next_attempt: round + 1,
                     failures: checks
@@ -804,7 +785,6 @@ impl Agent {
                 });
                 continue;
             }
-            reporter.report(AgentEvent::ModelText(submitted.message.clone()));
             if matches!(
                 submitted.kind,
                 AgentResultKind::Answer | AgentResultKind::Clarification | AgentResultKind::Plan
@@ -949,21 +929,6 @@ impl Agent {
                     }
                 }
             }
-            let signature = failure_signature(&alda_code, &checks);
-            let has_failures = checks.iter().any(|check| check.status == CheckStatus::Fail);
-            if has_failures {
-                if let Some(check) = observe_progress(
-                    &checks,
-                    &signature,
-                    &mut previous_failure_signature,
-                    &mut seen_failure_signatures,
-                    &mut best_progress,
-                    &mut consecutive_no_progress,
-                    max_no_progress,
-                ) {
-                    checks.push(check);
-                }
-            }
             reporter.report(AgentEvent::ValidationCompleted(checks.clone()));
             let all_pass = checks.iter().all(|check| check.status != CheckStatus::Fail);
             last_alda_code = Some(alda_code.clone());
@@ -998,9 +963,6 @@ impl Agent {
                     candidate_artifacts,
                     terminal_error: None,
                 });
-            }
-            if checks.iter().any(|check| check.name == "修正进展") {
-                break;
             }
             reporter.report(AgentEvent::RevisionStarted {
                 next_attempt: round + 1,
@@ -1121,153 +1083,129 @@ fn tool_calls_message(calls: &[(String, String, String)], content: String) -> Me
     }
 }
 
-fn failure_signature(code: &str, checks: &[AldaCheck]) -> String {
-    let mut hash = Sha256::new();
-    hash.update(code.as_bytes());
-    for check in checks
-        .iter()
-        .filter(|check| check.status == CheckStatus::Fail)
-    {
-        hash.update(check.name.as_bytes());
-        hash.update(check.detail.as_bytes());
-    }
-    format!("{:x}", hash.finalize())
+#[derive(Default)]
+struct StreamingModelText {
+    tool_calls: BTreeMap<i32, StreamingToolCall>,
+    emitted_any: bool,
+    last_source: Option<ModelTextSource>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct GenerationProgress {
-    stage: u8,
-    duration_distance_secs: Option<f64>,
-    failure_count: usize,
+#[derive(Default)]
+struct StreamingToolCall {
+    name: String,
+    arguments: String,
+    emitted_message: String,
 }
 
-impl GenerationProgress {
-    fn from_checks(checks: &[AldaCheck]) -> Self {
-        let failures = checks
-            .iter()
-            .filter(|check| check.status == CheckStatus::Fail)
-            .collect::<Vec<_>>();
-        let failed = |name: &str| failures.iter().any(|check| check.name == name);
-        let audio_failure = failures.iter().find(|check| check.name == "音频渲染");
-        let duration_distance_secs = failures
-            .iter()
-            .find(|check| check.name == "时长")
-            .and_then(|check| parse_duration_distance(&check.detail));
-        let stage = if failed("结果类型") {
-            0
-        } else if failed("Alda 语法") || !checks.iter().any(|check| check.name == "Alda 语法") {
-            1
-        } else if failed("标记") {
-            2
-        } else if failures
-            .iter()
-            .any(|check| !matches!(check.name, "时长" | "音频渲染"))
-        {
-            3
-        } else if failed("时长") {
-            4
-        } else if let Some(audio) = audio_failure {
-            if audio.detail.contains("静音") {
-                6
-            } else {
-                5
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelTextSource {
+    Content,
+    SubmittedMessage,
+}
+
+impl StreamingModelText {
+    fn push(&mut self, delta: StreamDelta) -> Option<String> {
+        match delta {
+            StreamDelta::Text(text) => self.visible_chunk(ModelTextSource::Content, text),
+            StreamDelta::ToolCall {
+                index,
+                name,
+                arguments,
+            } => {
+                let call = self.tool_calls.entry(index).or_default();
+                if let Some(name) = name {
+                    call.name = name;
+                }
+                call.arguments.push_str(&arguments);
+                if call.name != "submit_result" {
+                    return None;
+                }
+                let message = json_string_field_prefix(&call.arguments, "message")?;
+                let addition = message.strip_prefix(&call.emitted_message)?.to_string();
+                call.emitted_message = message;
+                self.visible_chunk(ModelTextSource::SubmittedMessage, addition)
             }
-        } else if checks
-            .iter()
-            .any(|check| check.name == "音频渲染" && check.status == CheckStatus::Pass)
-        {
-            7
-        } else {
-            4
-        };
-        Self {
-            stage,
-            duration_distance_secs,
-            failure_count: failures.len(),
         }
     }
 
-    fn improves(self, best: Self) -> bool {
-        if self.stage != best.stage {
-            return self.stage > best.stage;
+    fn visible_chunk(&mut self, source: ModelTextSource, text: String) -> Option<String> {
+        if text.is_empty() {
+            return None;
         }
-        if self.stage == 4 {
-            if let (Some(current), Some(previous)) =
-                (self.duration_distance_secs, best.duration_distance_secs)
-            {
-                if current + 0.5 < previous {
-                    return true;
+        let separator = self.emitted_any && self.last_source != Some(source);
+        self.emitted_any = true;
+        self.last_source = Some(source);
+        Some(if separator { format!("\n{text}") } else { text })
+    }
+}
+
+fn json_string_field_prefix(input: &str, field: &str) -> Option<String> {
+    let marker = format!("\"{field}\"");
+    let mut value = input
+        .get(input.find(&marker)? + marker.len()..)?
+        .trim_start();
+    value = value.strip_prefix(':')?.trim_start();
+    Some(decode_json_string_prefix(value.strip_prefix('"')?))
+}
+
+fn decode_json_string_prefix(input: &str) -> String {
+    let mut chars = input.chars();
+    let mut output = String::new();
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => break,
+            '\\' => {
+                let Some(escape) = chars.next() else {
+                    break;
+                };
+                match escape {
+                    '"' | '\\' | '/' => output.push(escape),
+                    'b' => output.push('\u{0008}'),
+                    'f' => output.push('\u{000c}'),
+                    'n' => output.push('\n'),
+                    'r' => output.push('\r'),
+                    't' => output.push('\t'),
+                    'u' => {
+                        let Some(high) = read_hex_unit(&mut chars) else {
+                            break;
+                        };
+                        let codepoint = if (0xD800..=0xDBFF).contains(&high) {
+                            let mut lookahead = chars.clone();
+                            if lookahead.next() != Some('\\') || lookahead.next() != Some('u') {
+                                break;
+                            }
+                            let Some(low) = read_hex_unit(&mut lookahead) else {
+                                break;
+                            };
+                            if !(0xDC00..=0xDFFF).contains(&low) {
+                                break;
+                            }
+                            chars = lookahead;
+                            0x1_0000
+                                + ((u32::from(high) - 0xD800) << 10)
+                                + (u32::from(low) - 0xDC00)
+                        } else {
+                            u32::from(high)
+                        };
+                        let Some(character) = char::from_u32(codepoint) else {
+                            break;
+                        };
+                        output.push(character);
+                    }
+                    _ => break,
                 }
             }
+            character => output.push(character),
         }
-        self.failure_count < best.failure_count
     }
+    output
 }
 
-#[allow(clippy::too_many_arguments)]
-fn observe_progress(
-    checks: &[AldaCheck],
-    signature: &str,
-    previous_signature: &mut Option<String>,
-    seen_signatures: &mut HashSet<String>,
-    best_progress: &mut Option<GenerationProgress>,
-    consecutive_no_progress: &mut usize,
-    max_consecutive_no_progress: usize,
-) -> Option<AldaCheck> {
-    let repeated = previous_signature.as_deref() == Some(signature);
-    let cycle = !repeated && seen_signatures.contains(signature);
-    if repeated || cycle {
-        return Some(AldaCheck {
-            name: "修正进展",
-            status: CheckStatus::Fail,
-            detail: if repeated {
-                "模型重复提交了相同源码和相同错误；宿主停止无进展重试".to_string()
-            } else {
-                "模型回到了此前失败的源码与错误（检测到修正循环）；宿主停止重试".to_string()
-            },
-        });
-    }
-    seen_signatures.insert(signature.to_string());
-    previous_signature.replace(signature.to_string());
-
-    let current = GenerationProgress::from_checks(checks);
-    if best_progress.is_none_or(|best| current.improves(best)) {
-        *best_progress = Some(current);
-        *consecutive_no_progress = 0;
-        return None;
-    }
-    *consecutive_no_progress += 1;
-    if *consecutive_no_progress < max_consecutive_no_progress {
-        return None;
-    }
-    Some(AldaCheck {
-        name: "修正进展",
-        status: CheckStatus::Fail,
-        detail: format!(
-            "连续 {} 次提交未改善语法、标记、硬约束、时长距离或音频结果；宿主停止重试",
-            *consecutive_no_progress
-        ),
-    })
-}
-
-fn parse_duration_distance(detail: &str) -> Option<f64> {
-    let actual = detail.strip_prefix("约 ")?.split('秒').next()?;
-    let actual = actual.trim().parse::<f64>().ok()?;
-    let target_start = detail.find("目标 ")?.checked_add("目标 ".len())?;
-    let target_end = detail[target_start..].find('秒')?;
-    let target = detail[target_start..target_start + target_end].trim();
-    let mut bounds = target.split(['–', '-', '—']);
-    let minimum = bounds.next()?.trim().parse::<f64>().ok()?;
-    let maximum = bounds
-        .next()
-        .map_or(Some(minimum), |value| value.trim().parse::<f64>().ok())?;
-    Some(if actual < minimum {
-        minimum - actual
-    } else if actual > maximum {
-        actual - maximum
-    } else {
-        0.0
-    })
+fn read_hex_unit(chars: &mut std::str::Chars<'_>) -> Option<u16> {
+    let digits = chars.take(4).collect::<String>();
+    (digits.len() == 4)
+        .then(|| u16::from_str_radix(&digits, 16).ok())
+        .flatten()
 }
 
 fn lookup_alda_docs(arguments: &str) -> Result<String> {
@@ -1610,6 +1548,32 @@ mod tests {
             }]
         });
         format!("data: {chunk}\n\ndata: [DONE]\n")
+    }
+
+    fn split_text_response() -> String {
+        let fragments = [
+            (Some("submit_result"), r#"{"kind":"answer","message":"正在"#),
+            (None, r"流式\n返"),
+            (None, r#"回"}"#),
+        ];
+        let mut body = String::new();
+        for (index, (name, arguments)) in fragments.into_iter().enumerate() {
+            let chunk = serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": (index == 0).then_some("call_1"),
+                            "function": { "name": name, "arguments": arguments }
+                        }]
+                    },
+                    "finish_reason": (index == 2).then_some("tool_calls")
+                }]
+            });
+            writeln!(body, "data: {chunk}\n").unwrap();
+        }
+        body.push_str("data: [DONE]\n");
+        body
     }
 
     fn draft_response(code: &str) -> String {
@@ -1969,71 +1933,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn progress_tracker_detects_cycles_and_duration_improvement() {
-        let duration = |actual: f64| {
-            vec![
-                AldaCheck {
-                    name: "Alda 语法",
-                    status: CheckStatus::Pass,
-                    detail: "解析成功".to_string(),
-                },
-                AldaCheck {
-                    name: "标记",
-                    status: CheckStatus::Pass,
-                    detail: "0 个定义".to_string(),
-                },
-                AldaCheck {
-                    name: "时长",
-                    status: CheckStatus::Fail,
-                    detail: format!("约 {actual:.0}秒（目标 300–420秒）"),
-                },
-            ]
-        };
-        let mut previous = None;
-        let mut seen = HashSet::new();
-        let mut best = None;
-        let mut no_progress = 0;
-        assert!(
-            observe_progress(
-                &duration(100.0),
-                "a",
-                &mut previous,
-                &mut seen,
-                &mut best,
-                &mut no_progress,
-                2,
-            )
-            .is_none()
-        );
-        assert!(
-            observe_progress(
-                &duration(200.0),
-                "b",
-                &mut previous,
-                &mut seen,
-                &mut best,
-                &mut no_progress,
-                2,
-            )
-            .is_none()
-        );
-        let cycle = observe_progress(
-            &duration(100.0),
-            "a",
-            &mut previous,
-            &mut seen,
-            &mut best,
-            &mut no_progress,
-            2,
-        )
-        .unwrap();
-        assert!(cycle.detail.contains("修正循环"));
-    }
-
     #[tokio::test]
     async fn silent_candidate_is_check_feedback_and_never_succeeds() {
         let (base_url, _requests) = serve(vec![
+            MockResponse::sse(tool_response("piano: c", "tool_calls")),
             MockResponse::sse(tool_response("piano: c", "tool_calls")),
             MockResponse::sse(tool_response("piano: c", "tool_calls")),
         ]);
@@ -2051,7 +1954,7 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert_eq!(result.rounds, 2);
+        assert_eq!(result.rounds, 3);
         assert!(result.candidate_artifacts.is_none());
         assert!(result.checks.iter().any(|check| {
             check.name == "音频渲染"
@@ -2124,6 +2027,49 @@ mod tests {
         assert!(result.needs_input);
         assert!(result.interpretation.contains("哪一个段落"));
         assert!(result.checks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submitted_message_is_reported_as_streaming_text_deltas() {
+        let (base_url, _requests) = serve(vec![MockResponse::sse(split_text_response())]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let mut reporter = RecordingReporter::default();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("说明当前构思".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(1),
+                    tool_context: None,
+                    require_candidate: false,
+                    forbid_clarification: false,
+                },
+                &mut reporter,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.kind, AgentResultKind::Answer);
+        let streamed = reporter
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ModelText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(streamed, "正在流式\n返回");
     }
 
     #[tokio::test]
@@ -2217,7 +2163,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|content| content.contains("用户已明确表示没有额外约束"))
         }));
-        assert!(!reporter.events.iter().any(|event| {
+        assert!(reporter.events.iter().any(|event| {
             matches!(event, AgentEvent::ModelText(text) if text.contains("选择哪一种配器"))
         }));
     }
@@ -2356,7 +2302,7 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::ToolContinuationStarted { turn: 1 }))
         );
-        assert!(!reporter.events.iter().any(|event| {
+        assert!(reporter.events.iter().any(|event| {
             matches!(event, AgentEvent::ModelText(text) if text.contains("普通回答"))
         }));
 
@@ -2679,8 +2625,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_identical_failure_stops_immediately() {
+    async fn repeated_identical_failure_continues_until_the_model_call_guard() {
         let (base_url, _requests) = serve(vec![
+            MockResponse::sse(tool_response("", "tool_calls")),
             MockResponse::sse(tool_response("", "tool_calls")),
             MockResponse::sse(tool_response("", "tool_calls")),
         ]);
@@ -2693,8 +2640,11 @@ mod tests {
         let (_directory, runner) = fake_runner();
         let result = Agent::new(client, runner).create(request(3)).await.unwrap();
 
-        assert_eq!(result.rounds, 2);
+        assert_eq!(result.rounds, 3);
         assert!(!result.success);
-        assert!(result.checks.iter().any(|check| check.name == "修正进展"));
+        assert!(!result.checks.iter().any(|check| check.name == "修正进展"));
+        assert!(result.checks.iter().any(|check| {
+            check.name == "运行策略" && check.detail.contains("3 次模型调用")
+        }));
     }
 }

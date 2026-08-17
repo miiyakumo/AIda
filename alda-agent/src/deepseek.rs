@@ -228,6 +228,16 @@ pub enum StreamEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDelta {
+    Text(String),
+    ToolCall {
+        index: i32,
+        name: Option<String>,
+        arguments: String,
+    },
+}
+
 #[derive(Debug)]
 pub enum ChatError {
     Auth(String),
@@ -264,7 +274,7 @@ struct SseParser {
 }
 
 impl SseParser {
-    fn push_line(&mut self, line: &str) -> Result<Vec<String>> {
+    fn push_line(&mut self, line: &str) -> Result<Vec<StreamDelta>> {
         let line = line.trim();
         if line.is_empty() || line.starts_with(':') || line == "data: [DONE]" {
             return Ok(Vec::new());
@@ -275,30 +285,30 @@ impl SseParser {
         };
         let chunk: ChatChunk =
             serde_json::from_str(data.trim()).context("无法解析模型服务返回的 SSE 数据")?;
-        let mut text_chunks = Vec::new();
+        let mut deltas = Vec::new();
 
         for choice in chunk.choices {
             if let Some(delta) = choice.delta {
                 if let Some(content) = delta.content {
                     if !content.is_empty() {
-                        text_chunks.push(content.clone());
+                        deltas.push(StreamDelta::Text(content.clone()));
                         self.events.push(StreamEvent::Text(content));
                     }
                 }
                 if let Some(tool_calls) = delta.tool_calls {
                     for tool_call in tool_calls {
-                        let pending = self
-                            .pending_tool_calls
-                            .entry(tool_call.index.unwrap_or(0))
-                            .or_default();
+                        let index = tool_call.index.unwrap_or(0);
+                        let pending = self.pending_tool_calls.entry(index).or_default();
                         if let Some(id) = tool_call.id {
                             pending.id = Some(id);
                         }
                         if let Some(function) = tool_call.function {
-                            if let Some(name) = function.name {
-                                pending.name = name;
+                            let name = function.name;
+                            if let Some(name) = &name {
+                                pending.name.clone_from(name);
                             }
-                            if let Some(arguments) = function.arguments {
+                            let arguments = function.arguments.unwrap_or_default();
+                            if !arguments.is_empty() {
                                 if pending.arguments.len().saturating_add(arguments.len())
                                     > MAX_TOOL_ARGUMENT_BYTES
                                 {
@@ -309,6 +319,13 @@ impl SseParser {
                                 }
                                 pending.arguments.push_str(&arguments);
                             }
+                            if name.is_some() || !arguments.is_empty() {
+                                deltas.push(StreamDelta::ToolCall {
+                                    index,
+                                    name,
+                                    arguments,
+                                });
+                            }
                         }
                     }
                 }
@@ -318,7 +335,7 @@ impl SseParser {
             }
         }
 
-        Ok(text_chunks)
+        Ok(deltas)
     }
 
     fn finish(mut self) -> Vec<StreamEvent> {
@@ -385,7 +402,7 @@ impl DeepSeekClient {
         &self,
         messages: Vec<Message>,
         tools: Option<Vec<Tool>>,
-        mut on_text: impl FnMut(&str),
+        mut on_delta: impl FnMut(StreamDelta),
     ) -> Result<Vec<StreamEvent>> {
         let url = chat_completions_url(&self.base_url);
 
@@ -455,15 +472,15 @@ impl DeepSeekClient {
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].to_string();
                 buffer = buffer[line_end + 1..].to_string();
-                for text in parser.push_line(&line)? {
-                    on_text(&text);
+                for delta in parser.push_line(&line)? {
+                    on_delta(delta);
                 }
             }
         }
 
         if !buffer.trim().is_empty() {
-            for text in parser.push_line(&buffer)? {
-                on_text(&text);
+            for delta in parser.push_line(&buffer)? {
+                on_delta(delta);
             }
         }
 

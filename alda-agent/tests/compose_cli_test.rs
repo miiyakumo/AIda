@@ -1,3 +1,4 @@
+use alda_agent::agent::RunPolicy;
 use alda_agent::alda::{AldaCheck, CheckStatus};
 use alda_agent::config::ModelConfig;
 use alda_agent::instructions::{CreationMode, ProjectPreferences};
@@ -119,7 +120,7 @@ fn run_compose_with(
 
     let code = matches!(kind, "draft" | "candidate").then_some("piano: c");
     let requests = if kind == "candidate" && !valid_score {
-        3
+        RunPolicy::default().max_model_calls
     } else {
         1
     };
