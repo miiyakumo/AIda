@@ -119,7 +119,8 @@ Project 与进程内能力状态派生，不是新的事实来源。
 
 Java、Alda、FluidSynth 与 General MIDI SoundFont 是启动 REPL、`control` 或 `compose` 的统一运行时
 前置条件。Shell 在选择或创建项目、读取 compose stdin、进入 UI 之前一次检查全部四项；任一项不可发现
-就拒绝启动，并提示先运行 `scripts/install-linux.sh` 后用 `alda-agent doctor` 验证。`projects` 和
+就拒绝启动，并提示先运行 `scripts/install-linux.sh` 后用 `alda-agent doctor` 验证。外部探测命令各自
+限制为 3 秒，命令阻塞或超时按依赖不可用处理，不会卡住启动过程。`projects` 和
 `doctor` 本身不受门禁限制，缺少依赖时仍可列项目和诊断环境。Rust 只用于从源码构建，不是已编译程序的
 运行时门禁。
 

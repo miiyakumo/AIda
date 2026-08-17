@@ -1,3 +1,7 @@
+use std::time::{Duration, Instant};
+
+const LOCAL_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
 struct CheckResult {
     name: &'static str,
     status: CheckStatus,
@@ -185,12 +189,31 @@ pub fn require_runtime() -> anyhow::Result<()> {
 }
 
 fn exec_local(program: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program)
+    exec_local_with_timeout(program, args, LOCAL_CHECK_TIMEOUT)
+}
+
+fn exec_local_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = std::process::Command::new(program)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .spawn()
         .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -369,5 +392,15 @@ mod tests {
         ];
         // 调用 print_results 确保不会 panic
         print_results(&results);
+    }
+
+    #[test]
+    fn local_check_times_out_a_blocking_command() {
+        let started = Instant::now();
+        let output =
+            exec_local_with_timeout("sh", &["-c", "exec sleep 5"], Duration::from_millis(50));
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
