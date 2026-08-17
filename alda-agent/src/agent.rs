@@ -76,6 +76,34 @@ fn score_tool(name: &str, description: &str) -> Tool {
     }
 }
 
+const MAX_INSPECT_ALDA_SOURCE_BYTES: usize = 32 * 1024;
+
+fn inspect_alda_source_tool() -> Tool {
+    Tool {
+        ty: "function".to_string(),
+        function: FunctionDef {
+            name: "inspect_alda_source".to_string(),
+            description: "无副作用地真实解析尚未提交的 Alda 临时源码，返回总时长、各声部结束时间和事件数，并分开报告硬失败与诊断。既可检查短材料，也可检查完整临时源码；优先一次检查 4–16 小节。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "alda_code": {
+                        "type": "string",
+                        "description": "尚未提交的 Alda 临时源码，不会写入项目或计作候选提交",
+                        "maxLength": MAX_INSPECT_ALDA_SOURCE_BYTES
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["fragment"],
+                        "description": "当前只支持 fragment；短材料和完整临时源码都使用此范围，不检查项目目标时长或配器约束"
+                    }
+                },
+                "required": ["alda_code", "scope"]
+            }),
+        },
+    }
+}
+
 fn lookup_docs_tool() -> Tool {
     Tool {
         ty: "function".to_string(),
@@ -97,7 +125,11 @@ fn lookup_docs_tool() -> Tool {
 }
 
 fn model_tools(host_tools: bool) -> Vec<Tool> {
-    let mut tools = vec![submit_result_tool(), lookup_docs_tool()];
+    let mut tools = vec![
+        submit_result_tool(),
+        lookup_docs_tool(),
+        inspect_alda_source_tool(),
+    ];
     if host_tools {
         tools.extend([
             score_tool("inspect_score", "真实解析并检查当前或工作乐谱，返回时长、声部、事件、乐器和约束检查。"),
@@ -999,6 +1031,9 @@ impl Agent {
         if name == "lookup_alda_docs" {
             return lookup_alda_docs(arguments);
         }
+        if name == "inspect_alda_source" {
+            return self.inspect_alda_source(arguments).await;
+        }
         let context = context.context("当前调用没有项目乐谱上下文")?;
         let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
         let target = parsed["target"].as_str().context("target 缺失")?;
@@ -1039,6 +1074,87 @@ impl Agent {
             }
             _ => bail!("未知模型工具 {name:?}"),
         }
+    }
+
+    async fn inspect_alda_source(&self, arguments: &str) -> Result<String> {
+        let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
+        let source = parsed["alda_code"].as_str().context("alda_code 缺失")?;
+        let scope = parsed["scope"].as_str().context("scope 缺失")?;
+        if scope != "fragment" {
+            bail!("scope 当前只支持 fragment");
+        }
+        if source.len() > MAX_INSPECT_ALDA_SOURCE_BYTES {
+            return Ok(serde_json::json!({
+                "parse_ok": false,
+                "duration_secs": null,
+                "parts": [],
+                "hard_failures": [{
+                    "name": "源码大小",
+                    "detail": format!(
+                        "源码为 {} 字节，超过 {} 字节上限；请一次检查一个 4–16 小节材料",
+                        source.len(),
+                        MAX_INSPECT_ALDA_SOURCE_BYTES
+                    )
+                }],
+                "diagnostics": []
+            })
+            .to_string());
+        }
+
+        let temporary = tempfile::Builder::new()
+            .prefix("alda-agent-inspect-")
+            .suffix(".alda")
+            .tempfile()
+            .context("无法创建 Alda 临时检查文件")?;
+        fs::write(temporary.path(), source).context("无法写入 Alda 临时检查文件")?;
+        let path = temporary.path().to_path_buf();
+        let checks = self
+            .runner
+            .validate_async(
+                path.clone(),
+                ScoreValidation::new(None, Vec::new(), Vec::new()),
+            )
+            .await?;
+        let parse_ok = checks
+            .iter()
+            .any(|check| check.name == "Alda 语法" && check.status == CheckStatus::Pass);
+        let hard_failures = checks
+            .iter()
+            .filter(|check| check.status == CheckStatus::Fail)
+            .map(|check| serde_json::json!({ "name": check.name, "detail": check.detail }))
+            .collect::<Vec<_>>();
+        let diagnostics = checks
+            .iter()
+            .filter(|check| check.status == CheckStatus::Unchecked)
+            .map(|check| serde_json::json!({ "name": check.name, "detail": check.detail }))
+            .collect::<Vec<_>>();
+        let info = parse_ok.then(|| self.runner.parse(&path)).transpose()?;
+        let duration_secs = info.as_ref().map(|info| info.duration_ms / 1000.0);
+        let parts = info
+            .as_ref()
+            .map(|info| {
+                info.timeline
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        serde_json::json!({
+                            "name": part.part,
+                            "end_secs": part.last_event_ms / 1000.0,
+                            "event_count": part.event_count
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        Ok(serde_json::json!({
+            "parse_ok": parse_ok,
+            "duration_secs": duration_secs,
+            "parts": parts,
+            "hard_failures": hard_failures,
+            "diagnostics": diagnostics
+        })
+        .to_string())
     }
 }
 
@@ -2527,6 +2643,118 @@ mod tests {
     }
 
     #[test]
+    fn inspect_alda_source_tool_is_always_available_and_bounded() {
+        let tools = model_tools(false);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.function.name == "inspect_alda_source")
+            .expect("temporary source inspection should not require project context");
+
+        assert_eq!(
+            tool.function.parameters["properties"]["alda_code"]["maxLength"],
+            MAX_INSPECT_ALDA_SOURCE_BYTES
+        );
+        assert_eq!(
+            tool.function.parameters["properties"]["scope"]["enum"],
+            serde_json::json!(["fragment"])
+        );
+        assert_eq!(
+            tool.function.parameters["required"],
+            serde_json::json!(["alda_code", "scope"])
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_alda_source_reports_real_timing_failures_and_size_limit() {
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = progress_runner();
+        let agent = Agent::new(client, runner);
+        let validation = ScoreValidation::new(None, Vec::new(), Vec::new());
+
+        let valid = agent
+            .execute_model_tool(
+                "inspect_alda_source",
+                &serde_json::json!({
+                    "alda_code": "midi-acoustic-grand-piano: target",
+                    "scope": "fragment"
+                })
+                .to_string(),
+                None,
+                &validation,
+            )
+            .await
+            .unwrap();
+        let valid: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        assert_eq!(valid["parse_ok"], true);
+        assert_eq!(valid["duration_secs"], 3.0);
+        assert_eq!(valid["parts"][0]["name"], "piano");
+        assert_eq!(valid["parts"][0]["end_secs"], 3.0);
+        assert_eq!(valid["parts"][0]["event_count"], 1);
+        assert_eq!(valid["hard_failures"], serde_json::json!([]));
+        assert!(valid["diagnostics"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["name"] == "声部时间轴/事件空档")
+        }));
+
+        let invalid = agent
+            .execute_model_tool(
+                "inspect_alda_source",
+                &serde_json::json!({
+                    "alda_code": "midi-piano: syntax_bad",
+                    "scope": "fragment"
+                })
+                .to_string(),
+                None,
+                &validation,
+            )
+            .await
+            .unwrap();
+        let invalid: serde_json::Value = serde_json::from_str(&invalid).unwrap();
+        assert_eq!(invalid["parse_ok"], false);
+        assert!(invalid["duration_secs"].is_null());
+        assert!(
+            invalid["hard_failures"]
+                .as_array()
+                .is_some_and(|items| { items.iter().any(|item| item["name"] == "Alda 语法") })
+        );
+
+        let oversized_source = "c".repeat(MAX_INSPECT_ALDA_SOURCE_BYTES + 1);
+        let oversized = agent
+            .execute_model_tool(
+                "inspect_alda_source",
+                &serde_json::json!({
+                    "alda_code": oversized_source,
+                    "scope": "fragment"
+                })
+                .to_string(),
+                None,
+                &validation,
+            )
+            .await
+            .unwrap();
+        let oversized: serde_json::Value = serde_json::from_str(&oversized).unwrap();
+        assert_eq!(oversized["parse_ok"], false);
+        assert_eq!(oversized["hard_failures"][0]["name"], "源码大小");
+        assert!(
+            oversized["hard_failures"][0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("4–16 小节"))
+        );
+
+        let entries = fs::read_dir(directory.path()).unwrap().count();
+        assert_eq!(
+            entries, 1,
+            "inspection must not persist source beside the project"
+        );
+    }
+
+    #[test]
     fn answer_that_requests_input_becomes_clarification() {
         let submitted = parse_submitted_result(
             &serde_json::json!({
@@ -2545,6 +2773,13 @@ mod tests {
             MockResponse::sse(host_tool_response(
                 "lookup_alda_docs",
                 &serde_json::json!({ "topic": "aliases" }),
+            )),
+            MockResponse::sse(host_tool_response(
+                "inspect_alda_source",
+                &serde_json::json!({
+                    "alda_code": "piano: c d e f",
+                    "scope": "fragment"
+                }),
             )),
             MockResponse::sse(host_tool_response(
                 "inspect_score",
@@ -2585,7 +2820,7 @@ mod tests {
                 ValidationRequest {
                     score: ScoreValidation::new(None, Vec::new(), Vec::new()),
                     run_policy: RunPolicy {
-                        max_model_calls: 5,
+                        max_model_calls: 6,
                         max_protocol_recoveries: 1,
                         ..RunPolicy::default()
                     },
@@ -2619,6 +2854,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(tool_results.contains("Alda official release-2.4.3"));
+        assert!(tool_results.contains("\"duration_secs\":0.45"));
         assert!(tool_results.contains("event_count"));
         assert!(tool_results.contains("\"silent\":false"));
         assert!(tool_results.contains("\"played\":\"current\""));

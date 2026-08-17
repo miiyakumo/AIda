@@ -1,6 +1,6 @@
 # Alda Agent 精简参考
 
-权威来源是随项目保存的 Alda 官方文档快照 `vendor/alda-docs/2.4.3/`。当前运行时兼容目标为 Alda 2.3.3；遇到不确定语法时先调用 `lookup_alda_docs`，再用 `inspect_score` 实际解析，不能靠猜测反复提交。
+权威来源是随项目保存的 Alda 官方文档快照 `vendor/alda-docs/2.4.3/`。当前运行时兼容目标为 Alda 2.3.3；遇到不确定语法时先调用 `lookup_alda_docs`，已有乐谱用 `inspect_score` 实际解析，尚未提交的源码用 `inspect_alda_source` 实际解析，不能靠猜测反复提交。
 
 ## 时间轴是按声部独立的
 
@@ -34,7 +34,7 @@ violin-2: b4 > c d e
 
 ## 可靠复用
 
-变量保存事件序列，适合段落发展和紧凑源码。复杂连音优先在声部中用单个长时值表达；任何写法都必须以 `inspect_score` 的真实解析结果为准。
+变量保存事件序列，适合段落发展和紧凑源码。复杂连音优先在声部中用单个长时值表达；临时写法以 `inspect_alda_source`、已保存乐谱以 `inspect_score` 的真实解析结果为准。
 
 ```alda
 theme = [c8 d e f g a b > c]
@@ -48,4 +48,4 @@ midi-cello: o3 [c2 g2 a2 e2 f2 c2 g1]*2
 - Alda 2.3.3 没有 `time-signature` 或 `time-signature!`。
 - 全局速度写作 `(tempo! 120)`；声部局部速度写作 `(tempo 120)`。
 - 音符、休止、和弦、属性、反复、变量、序列、voices、markers 的详细规则以官方快照对应章节为准。
-- 修改现有作品前应调用 `inspect_score` 了解 work/current；新候选在 `submit_result` 后由宿主自动校验。需要确认已有乐谱的真实声音时调用 `render_score`。不能把“语法通过”说成“已经播放”。
+- 修改现有作品前应调用 `inspect_score` 了解 work/current；构造新材料时可用 `inspect_alda_source` 检查尚未保存的源码，新候选在 `submit_result` 后仍由宿主自动校验。需要确认已有乐谱的真实声音时调用 `render_score`。不能把“语法通过”说成“已经播放”。
