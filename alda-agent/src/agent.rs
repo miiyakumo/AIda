@@ -172,6 +172,8 @@ pub struct CreationResult {
     pub rendered_wav: Option<PathBuf>,
     /// 完整候选自动校验后生成的临时 MIDI/WAV；由调用方持久化。
     pub candidate_artifacts: Option<StagedCandidateArtifacts>,
+    /// 已有失败候选后发生的终止错误；调用方先持久化候选，再返回该错误。
+    pub(crate) terminal_error: Option<anyhow::Error>,
 }
 
 #[derive(Debug)]
@@ -470,6 +472,7 @@ impl Agent {
         let mut played_target = None;
         let mut rendered_wav = None;
         let mut candidate_artifacts = None;
+        let mut terminal_error = None;
         let mut continuing_after_tool = false;
 
         loop {
@@ -499,14 +502,27 @@ impl Agent {
             } else {
                 reporter.report(AgentEvent::RoundStarted { attempt: round + 1 });
             }
-            let events = self
+            let events = match self
                 .client
                 .chat_stream_with(
                     messages.clone(),
                     Some(model_tools(validation.tool_context.is_some())),
                     |_| {},
                 )
-                .await?;
+                .await
+            {
+                Ok(events) => events,
+                Err(error) if last_alda_code.is_some() => {
+                    last_checks.push(AldaCheck {
+                        name: "模型服务",
+                        status: CheckStatus::Fail,
+                        detail: format!("修正期间模型请求失败：{error:#}"),
+                    });
+                    terminal_error = Some(error);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             let mut calls = Vec::new();
             let mut round_text = String::new();
             let mut was_truncated = false;
@@ -529,9 +545,19 @@ impl Agent {
                 tool_turns += 1;
                 protocol_recoveries += 1;
                 if protocol_recoveries > max_protocol_recoveries {
-                    bail!(
+                    let error = anyhow::anyhow!(
                         "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
                     );
+                    if last_alda_code.is_none() {
+                        return Err(error);
+                    }
+                    last_checks.push(AldaCheck {
+                        name: "运行策略",
+                        status: CheckStatus::Fail,
+                        detail: error.to_string(),
+                    });
+                    terminal_error = Some(error);
+                    break;
                 }
                 reporter.report(AgentEvent::ToolProtocolRetry {
                     call_count: calls.len(),
@@ -569,9 +595,19 @@ impl Agent {
                 tool_turns += 1;
                 protocol_recoveries += 1;
                 if protocol_recoveries > max_protocol_recoveries {
-                    bail!(
+                    let error = anyhow::anyhow!(
                         "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
                     );
+                    if last_alda_code.is_none() {
+                        return Err(error);
+                    }
+                    last_checks.push(AldaCheck {
+                        name: "运行策略",
+                        status: CheckStatus::Fail,
+                        detail: error.to_string(),
+                    });
+                    terminal_error = Some(error);
+                    break;
                 }
                 reporter.report(AgentEvent::ToolCallMissingRetry);
                 messages.push(Message {
@@ -661,9 +697,19 @@ impl Agent {
                     tool_turns += 1;
                     protocol_recoveries += 1;
                     if protocol_recoveries > max_protocol_recoveries {
-                        bail!(
+                        let error = anyhow::anyhow!(
                             "宿主工具协议恢复超过 {max_protocol_recoveries} 次，已停止以避免无进展循环"
                         );
+                        if last_alda_code.is_none() {
+                            return Err(error);
+                        }
+                        last_checks.push(AldaCheck {
+                            name: "运行策略",
+                            status: CheckStatus::Fail,
+                            detail: error.to_string(),
+                        });
+                        terminal_error = Some(error);
+                        break;
                     }
                     reporter.report(AgentEvent::ToolArgumentsRetry {
                         tool_name: tool_name.clone(),
@@ -788,6 +834,7 @@ impl Agent {
                     played_target,
                     rendered_wav,
                     candidate_artifacts: None,
+                    terminal_error: None,
                 });
             }
             if score_kind.is_some_and(|previous| previous != submitted.kind) {
@@ -909,6 +956,7 @@ impl Agent {
                     played_target,
                     rendered_wav,
                     candidate_artifacts,
+                    terminal_error: None,
                 });
             }
             if checks.iter().any(|check| check.name == "修正进展") {
@@ -935,6 +983,7 @@ impl Agent {
             played_target,
             rendered_wav,
             candidate_artifacts: None,
+            terminal_error,
         })
     }
 
@@ -2310,6 +2359,56 @@ mod tests {
         assert_eq!(result.rounds, 0);
         assert!(result.checks.iter().any(|check| {
             check.name == "运行策略" && check.detail.contains("2 次模型调用")
+        }));
+    }
+
+    #[tokio::test]
+    async fn protocol_guard_returns_the_last_failed_candidate() {
+        let (base_url, _requests) = serve(vec![
+            MockResponse::sse(tool_response("short", "tool_calls")),
+            MockResponse::sse(plain_text_response("未调用工具")),
+            MockResponse::sse(plain_text_response("仍未调用工具")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = progress_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("完成三秒作品".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(
+                        Some(crate::instructions::DurationConstraint::exact(3.0)),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    run_policy: RunPolicy {
+                        max_model_calls: 4,
+                        max_protocol_recoveries: 1,
+                        ..RunPolicy::default()
+                    },
+                    tool_context: None,
+                    require_candidate: true,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.alda_code.as_deref(), Some("short"));
+        assert!(result.terminal_error.is_some());
+        assert!(result.checks.iter().any(|check| {
+            check.name == "运行策略" && check.detail.contains("协议恢复超过 1 次")
         }));
     }
 

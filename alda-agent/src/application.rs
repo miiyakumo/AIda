@@ -65,7 +65,11 @@ pub fn prepare_compose(request: ComposeRequest) -> Result<PreparedCompose> {
 }
 
 pub async fn compose_once(prepared: PreparedCompose) -> Result<CreationResult> {
-    prepared.agent.create(prepared.request).await
+    let mut result = prepared.agent.create(prepared.request).await?;
+    if let Some(error) = result.terminal_error.take() {
+        return Err(error);
+    }
+    Ok(result)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -425,17 +429,20 @@ impl Application {
                 reporter,
             )
             .await;
-        let result = match result {
-            Ok(result) => {
-                self.last_model_failure = None;
-                self.model_request_succeeded = true;
-                result
-            }
+        let mut result = match result {
+            Ok(result) => result,
             Err(error) => {
                 self.last_model_failure = ModelFailure::from_error(&error);
                 return Err(error);
             }
         };
+        let terminal_error = result.terminal_error.take();
+        if let Some(error) = terminal_error.as_ref() {
+            self.last_model_failure = ModelFailure::from_error(error);
+        } else {
+            self.last_model_failure = None;
+            self.model_request_succeeded = true;
+        }
         if result.success {
             let kind = match result.kind {
                 AgentResultKind::Draft => WorkingScoreKind::Draft,
@@ -497,6 +504,9 @@ impl Application {
         };
         self.project
             .finish_agent_turn(result.interpretation.clone(), state)?;
+        if let Some(error) = terminal_error {
+            return Err(error);
+        }
         Ok(ActionResult::AgentCompleted {
             kind: result.kind,
             success: result.success,
@@ -1643,6 +1653,53 @@ mod tests {
         let metadata = std::fs::read_to_string(root.join("project.json")).unwrap();
         assert!(!metadata.contains("tool_calls"));
         assert!(!metadata.contains("piano: c"));
+    }
+
+    #[tokio::test]
+    async fn model_failure_after_a_failed_candidate_persists_the_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("poem");
+        let mut project = Project::load_or_create(root.clone(), "poem", "").unwrap();
+        project
+            .configure(&ProjectPreferences {
+                target_duration_secs: Some(DurationConstraint::exact(300.0)),
+                ..ProjectPreferences::default()
+            })
+            .unwrap();
+        let (runner_directory, runner) = passing_runner();
+        let mut application = Application::from_project_with_audio_renderer(
+            project,
+            Some(runner),
+            passing_renderer(runner_directory.path()),
+        );
+        let (base_url, _requests) = serve(vec![
+            MockResponse::sse(candidate_response()),
+            MockResponse::error("500 Internal Server Error", "service unavailable"),
+        ]);
+        application
+            .configure(ConfigAction::Model("example-model".to_string()))
+            .unwrap();
+        application.configure(ConfigAction::Url(base_url)).unwrap();
+        application
+            .configure(ConfigAction::ApiKey(Some("test-key".to_string())))
+            .unwrap();
+
+        let error = application
+            .execute(UserAction::Agent("继续修正".to_string()), &mut Silent)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("500"));
+        assert_eq!(
+            application.conversation_view().state,
+            ConversationState::RevisionAvailable
+        );
+        assert_eq!(application.project.revision_code().unwrap(), "piano: c");
+        let metadata = std::fs::read_to_string(root.join("project.json")).unwrap();
+        assert!(metadata.contains("pending_revision"));
+        assert!(!metadata.contains("piano: c"));
+        let reloaded = Project::load_or_create(root, "ignored", "").unwrap();
+        assert_eq!(reloaded.revision_code().unwrap(), "piano: c");
     }
 
     #[tokio::test]
