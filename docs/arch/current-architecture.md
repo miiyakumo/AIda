@@ -171,6 +171,19 @@ Skill 内容只影响模型输入。Alda 校验、工作乐谱写入、候选接
 
 ## 生成与输出边界
 
+`composition.rs` 是尚未接入正式运行时的段落组装纵切：它接收声明式段落契约和按声部拆分的 Alda 片段，
+生成临时探针源码与正式源码，并用真实解析结果核对声部段界和音乐入口。独立的 `composition-ab` 实验二进制
+在此底座上运行单 Agent 与 Composer–Worker–Reviewer 同题 A/B；它不经过正式 CLI、`Application` 或
+`Project`，也不会创建正式工作乐谱或版本。
+
+实验已改为 Composer 声明相对比例、Harness 确定性编译只读预算、两个段落家族 Worker 提交受限原生 Alda、
+只读 Reviewer 审查最终结果。一次真实配对运行已让 baseline 与 roles 都生成 Alda、MIDI 和完整非静音 WAV，
+证明该路径可端到端执行；这不证明音乐质量或稳定收益，因此正式候选流程仍不调用该模块。Harness 不会扩展成
+Alda 之上的片段语言：Alda 继续负责变量、序列、反复、声部和时间线执行，宿主只保留预算量化、固定模板、
+安全边界和真实解析验收。机制、实验结果与后续设计分别见
+[段落组装与时间线机制验证](../iter/section-assembly-mechanism/README.md)和
+[Composer–Worker–Reviewer 真实 A/B](../iter/composer-worker-reviewer-ab/README.md)中的设计索引。
+
 Agent 只有交互式 `respond_with_reporter` 和一次性 `create` 两个真实生成入口，两者共享同一个内部
 `run_generation` 循环。`Application::execute` 驱动交互入口；`application::prepare_compose` 与
 `application::compose_once` 负责一次性 compose 所需的 Project、模型配置、Skill、指示和 Alda 编排，

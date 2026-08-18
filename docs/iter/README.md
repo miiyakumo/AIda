@@ -23,3 +23,9 @@ description：补齐 Alda 到 WAV 的真实产物链、官方手册快照、宿�
 
 [长篇叙事作曲 Agent 困境分析](long-form-composition-agent-diagnosis/README.md)
 description：对比两次五分钟运行、结构机制效果、剩余作曲问题与任务专用角色拆分的触发证据。
+
+[段落组装与时间线机制验证](section-assembly-mechanism/README.md)
+description：验证声明式段落、Worker Alda 片段、无回跳组装和真实解析时间探针的首个纵切原型。
+
+[Composer–Worker–Reviewer 真实 A/B](composer-worker-reviewer-ab/README.md)
+description：保存任务专用角色需求、失败演进、成功配对事实和以原生 Alda 加薄 Harness 为核心的最终设计。

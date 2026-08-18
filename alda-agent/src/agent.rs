@@ -616,6 +616,14 @@ impl Agent {
             .await
     }
 
+    /// Run a one-shot creation request that may only finish with a complete
+    /// candidate. Text answers, plans, and drafts are returned to the model as
+    /// validation failures instead of ending the run.
+    pub async fn create_candidate(&self, request: CreationRequest) -> Result<CreationResult> {
+        self.create_with_result_policy(request, true, true, &mut SilentReporter)
+            .await
+    }
+
     pub async fn respond_with_reporter(
         &self,
         request: ProjectPromptRequest,
@@ -660,6 +668,17 @@ impl Agent {
         request: CreationRequest,
         reporter: &mut impl AgentReporter,
     ) -> Result<CreationResult> {
+        self.create_with_result_policy(request, false, false, reporter)
+            .await
+    }
+
+    async fn create_with_result_policy(
+        &self,
+        request: CreationRequest,
+        require_candidate: bool,
+        forbid_clarification: bool,
+        reporter: &mut impl AgentReporter,
+    ) -> Result<CreationResult> {
         if request.source_material.trim().is_empty() && request.instructions.trim().is_empty() {
             bail!("创作素材与要求不能同时为空");
         }
@@ -688,8 +707,8 @@ impl Agent {
                 score: validation,
                 run_policy: request.run_policy,
                 tool_context: None,
-                require_candidate: false,
-                forbid_clarification: false,
+                require_candidate,
+                forbid_clarification,
             },
             reporter,
         )

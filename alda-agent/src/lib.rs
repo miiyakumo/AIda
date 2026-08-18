@@ -3,6 +3,7 @@ pub mod alda;
 pub mod application;
 pub mod audio;
 pub mod command;
+pub mod composition;
 pub mod config;
 pub mod control;
 pub mod conversation;

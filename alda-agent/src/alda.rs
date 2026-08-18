@@ -494,7 +494,10 @@ fn analyze_events(parsed: &ParseOutput) -> Result<(f64, TimelineDiagnostics)> {
                 index + 1
             );
         }
-        if !parsed.parts.contains_key(&event.part) {
+        // Alda voices emit events under an internal voice ID that is not
+        // repeated in the top-level `parts` map. Accept those opaque IDs;
+        // non-internal references still indicate malformed parser output.
+        if !parsed.parts.contains_key(&event.part) && !looks_like_internal_part_id(&event.part) {
             bail!("事件 {} 引用了不存在的声部 {:?}", index + 1, event.part);
         }
         let end = event.offset + event.audible_duration;
