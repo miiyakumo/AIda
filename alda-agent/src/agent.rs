@@ -5,6 +5,7 @@ use crate::deepseek::{DeepSeekClient, FunctionDef, Message, StreamDelta, StreamE
 use crate::instructions::{CompiledInstructions, DurationConstraint};
 use crate::project::FormPlan;
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -64,6 +65,47 @@ fn edit_scope_schema() -> serde_json::Value {
     })
 }
 
+fn diagnostic_claim_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "同类硬失败达到两次后必填，用于证明本次最小复现没有悄悄改变关键条件",
+        "properties": {
+            "baseline_source_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "diagnostic_state 中的失败基线哈希"
+            },
+            "hypothesis": {
+                "type": "string",
+                "minLength": 1,
+                "description": "本次只检验的单一主假设"
+            },
+            "preserved_conditions": {
+                "type": "string",
+                "minLength": 1,
+                "description": "保留的重复次数、起始状态、声部实例和相关源码"
+            },
+            "changed_conditions": {
+                "type": "string",
+                "minLength": 1,
+                "description": "相对失败基线改变的条件；完全相同时写 none"
+            },
+            "equivalence_reason": {
+                "type": "string",
+                "minLength": 1,
+                "description": "为何上述改变不影响当前假设；无法证明时应改用原条件"
+            }
+        },
+        "required": [
+            "baseline_source_hash",
+            "hypothesis",
+            "preserved_conditions",
+            "changed_conditions",
+            "equivalence_reason"
+        ]
+    })
+}
+
 fn submit_result_tool() -> Tool {
     Tool {
         ty: "function".to_string(),
@@ -88,7 +130,7 @@ fn submit_result_tool() -> Tool {
                     },
                     "candidate_ref": {
                         "type": "object",
-                        "description": "kind=candidate 时可引用最近一次通过 inspect_alda_source(scope=candidate) 的检查点，避免重复完整源码",
+                        "description": "kind=candidate 时可引用最近一次通过全部硬检查的 candidate 检查点；失败检查点只能用于诊断和 patch",
                         "properties": {
                             "source_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
                         },
@@ -167,7 +209,7 @@ fn inspect_alda_source_tool() -> Tool {
         ty: "function".to_string(),
         function: FunctionDef {
             name: "inspect_alda_source".to_string(),
-            description: "真实解析尚未提交的 Alda 临时源码，返回总时长、Marker 划分的段落边界/事件/声部覆盖、各声部结束时间，并分开报告硬失败与诊断。fragment 只检查局部材料且不保留；candidate 使用项目完整约束并作为故障恢复检查点，但不会保存工作乐谱、渲染或计作正式提交。".to_string(),
+            description: "真实解析尚未提交的 Alda 源码；不得手算时长。fragment 检查 4–16 小节局部材料；candidate 使用完整项目约束，并无论通过与否都建立可诊断、可 patch 的检查点。只有通过全部硬检查的 candidate 才能用 candidate_ref 提交。同类失败两次后必须携带 diagnostic 等价性声明。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -181,8 +223,9 @@ fn inspect_alda_source_tool() -> Tool {
                         "enum": ["fragment", "candidate"],
                         "description": "fragment 不检查项目目标时长或配器约束且不保留；candidate 检查完整项目约束并更新故障恢复检查点，但仍需自行调用 submit_result 正式提交"
                     },
-                    "form_plan": form_plan_schema()
-                    ,"edit_scope": edit_scope_schema()
+                    "form_plan": form_plan_schema(),
+                    "edit_scope": edit_scope_schema(),
+                    "diagnostic": diagnostic_claim_schema()
                 },
                 "required": ["alda_code", "scope"]
             }),
@@ -216,19 +259,29 @@ fn inspect_alda_fragment_tool() -> Tool {
     }
 }
 
-fn inspect_alda_patch_tool() -> Tool {
+fn inspect_alda_patch_tool(project_context: bool) -> Tool {
+    let base_kinds = if project_context {
+        serde_json::json!(["work", "current", "diagnostic"])
+    } else {
+        serde_json::json!(["diagnostic"])
+    };
     Tool {
         ty: "function".to_string(),
         function: FunctionDef {
             name: "inspect_alda_patch".to_string(),
-            description: "对 work/current 基线执行 1–8 个唯一文本替换，在内存中生成候选并运行完整候选、form_plan 与 edit_scope 检查；不会修改项目文件。".to_string(),
+            description: if project_context {
+                "对 work/current/diagnostic 最新基线执行 1–8 个唯一文本替换，在内存中生成候选并运行完整检查；不会修改项目文件。存在运行中失败检查点时必须使用 diagnostic。同类失败两次后必须携带 diagnostic 等价性声明。"
+            } else {
+                "对本轮失败 candidate 的 diagnostic 内存基线执行 1–8 个唯一文本替换并重新检查；不会修改或保存项目文件。同类失败两次后必须携带 diagnostic 等价性声明。"
+            }
+            .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "base": {
                         "type": "object",
                         "properties": {
-                            "kind": { "type": "string", "enum": ["work", "current"] },
+                            "kind": { "type": "string", "enum": base_kinds },
                             "source_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
                         },
                         "required": ["kind", "source_hash"]
@@ -245,9 +298,10 @@ fn inspect_alda_patch_tool() -> Tool {
                         }
                     },
                     "form_plan": form_plan_schema(),
-                    "edit_scope": edit_scope_schema()
+                    "edit_scope": edit_scope_schema(),
+                    "diagnostic": diagnostic_claim_schema()
                 },
-                "required": ["base", "replacements", "form_plan", "edit_scope"]
+                "required": ["base", "replacements"]
             }),
         },
     }
@@ -258,7 +312,7 @@ fn lookup_docs_tool() -> Tool {
         ty: "function".to_string(),
         function: FunctionDef {
             name: "lookup_alda_docs".to_string(),
-            description: "查询随应用固定版本保存的 Alda 官方手册章节。".to_string(),
+            description: "查询随应用固定版本保存的 Alda 官方手册章节。遇到语法、变量、别名、Marker、时值、反复或乐器名称事实时先查对应章节，不要靠猜测重写。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -278,7 +332,7 @@ fn delegate_tool() -> Tool {
         ty: "function".to_string(),
         function: FunctionDef {
             name: "delegate".to_string(),
-            description: "把一个边界清晰的音乐设计、Alda 实现或只读复核任务交给独立 subagent，并取得其文本结果。subagent 不继承当前对话；请在 context 中提供完成任务所需的信息。它可查询 Alda 文档、检查临时片段，并在项目会话中只读检查 work/current；结果不会修改项目，由你判断、整合并通过现有完整检查。".to_string(),
+            description: "把一个边界清晰的音乐设计、Alda 实现或只读复核任务交给独立 subagent。subagent 不继承当前对话。宿主触发 diagnose_only 时，本工具自动附带原失败源码和检查状态，并把 subagent 收窄为只诊断 Reviewer；未等价复现时不得排除根因。结果不会修改项目，最终整合与完整检查仍由 Composer 负责。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -298,7 +352,7 @@ fn delegate_tool() -> Tool {
     }
 }
 
-fn delegate_messages(arguments: &str) -> Result<Vec<Message>> {
+fn delegate_messages(arguments: &str, diagnostic_packet: Option<&str>) -> Result<Vec<Message>> {
     let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
     let task = parsed["task"].as_str().context("task 缺失")?.trim();
     if task.is_empty() {
@@ -308,15 +362,22 @@ fn delegate_messages(arguments: &str) -> Result<Vec<Message>> {
         None => "",
         Some(value) => value.as_str().context("context 必须是字符串")?.trim(),
     };
-    let user_message = if context.is_empty() {
+    let mut user_message = if context.is_empty() {
         format!("【委派任务】\n{task}")
     } else {
         format!("【委派任务】\n{task}\n\n【上下文】\n{context}")
     };
+    let mut system_message = include_str!("../prompts/subagent.md").to_string();
+    if let Some(packet) = diagnostic_packet {
+        system_message.push_str("\n\n");
+        system_message.push_str(include_str!("../prompts/diagnostic-reviewer.md"));
+        user_message.push_str("\n\n");
+        user_message.push_str(packet);
+    }
     Ok(vec![
         Message {
             role: "system".to_string(),
-            content: Some(include_str!("../prompts/subagent.md").to_string()),
+            content: Some(system_message),
             tool_calls: None,
             tool_call_id: None,
         },
@@ -335,10 +396,10 @@ fn model_tools(host_tools: bool) -> Vec<Tool> {
         delegate_tool(),
         lookup_docs_tool(),
         inspect_alda_source_tool(),
+        inspect_alda_patch_tool(host_tools),
     ];
     if host_tools {
         tools.extend([
-            inspect_alda_patch_tool(),
             score_tool("inspect_score", "真实解析并检查当前或工作乐谱，返回源码哈希、时长、段落、声部、事件、乐器和约束检查；源码哈希可直接作为 inspect_alda_patch 的基线。"),
             score_tool("render_score", "真实导出 MIDI 并用 FluidSynth 渲染 WAV，返回音频时长、采样率、峰值、RMS 和静音判断。"),
             play_score_tool(),
@@ -453,6 +514,14 @@ struct CandidateCheckpoint {
     edit_scope: Option<EditScope>,
 }
 
+impl CandidateCheckpoint {
+    fn is_valid(&self) -> bool {
+        self.checks
+            .iter()
+            .all(|check| check.status != CheckStatus::Fail)
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 struct EditScope {
     mode: EditMode,
@@ -472,6 +541,7 @@ enum EditMode {
 struct ModelToolResult {
     content: String,
     candidate_checkpoint: Option<CandidateCheckpoint>,
+    diagnostic_observation: Option<DiagnosticObservation>,
 }
 
 impl ModelToolResult {
@@ -479,11 +549,359 @@ impl ModelToolResult {
         Self {
             content,
             candidate_checkpoint: None,
+            diagnostic_observation: None,
         }
     }
 }
 
-fn oversized_source_inspection(source: &str, scope: &str, candidate: bool) -> ModelToolResult {
+#[derive(Debug, Clone)]
+struct DiagnosticObservation {
+    checks: Vec<AldaCheck>,
+    source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticErrorClass {
+    SyntaxOrDsl,
+    MidiRange,
+    MarkerOrForm,
+    Duration,
+    ToolProtocol,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct DiagnosticState {
+    error_class: DiagnosticErrorClass,
+    consecutive_failures: usize,
+    origin_source: String,
+    origin_source_hash: String,
+    origin_source_signature: String,
+    source: String,
+    source_hash: String,
+    source_signature: String,
+    checks: Vec<AldaCheck>,
+    docs_consulted: bool,
+    reviewer_completed: bool,
+    current_hypothesis: Option<String>,
+    last_test_changed: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct DiagnosticTracker {
+    current: Option<DiagnosticState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticAction {
+    None,
+    LookupDocs,
+    EquivalentReproduction,
+    Reviewer,
+    CorrectProtocol,
+}
+
+impl DiagnosticTracker {
+    fn observe_failure(&mut self, checks: &[AldaCheck], source: &str) {
+        let Some(error_class) = dominant_error_class(checks) else {
+            return;
+        };
+        let source_hash = sha256_hex(source);
+        let source_signature = source_diagnostic_signature(source);
+        match self.current.as_mut() {
+            Some(current) if current.error_class == error_class => {
+                let previous_hash = current.source_hash.clone();
+                let previous_signature = current.source_signature.clone();
+                current.consecutive_failures += 1;
+                current.source = source.to_string();
+                current.source_hash = source_hash;
+                current.source_signature = source_signature;
+                current.checks = checks.to_vec();
+                current.reviewer_completed = false;
+                current.last_test_changed = Some(if current.source_hash == previous_hash {
+                    "失败源码与上次完全相同".to_string()
+                } else if current.source_signature == previous_signature {
+                    format!(
+                        "失败源码哈希已改变，但关键状态签名保持：{}",
+                        current.source_signature
+                    )
+                } else {
+                    format!(
+                        "关键状态签名已改变；上次={}；本次={}",
+                        previous_signature, current.source_signature
+                    )
+                });
+            }
+            _ => {
+                self.current = Some(DiagnosticState {
+                    error_class,
+                    consecutive_failures: 1,
+                    origin_source: source.to_string(),
+                    origin_source_hash: source_hash.clone(),
+                    origin_source_signature: source_signature.clone(),
+                    source: source.to_string(),
+                    source_hash,
+                    source_signature,
+                    checks: checks.to_vec(),
+                    docs_consulted: false,
+                    reviewer_completed: false,
+                    current_hypothesis: None,
+                    last_test_changed: None,
+                });
+            }
+        }
+    }
+
+    fn observe_test(&mut self, arguments: &str) {
+        let Some(current) = self.current.as_mut() else {
+            return;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(arguments) else {
+            return;
+        };
+        if let Some(hypothesis) = parsed["diagnostic"]["hypothesis"].as_str() {
+            current.current_hypothesis = Some(hypothesis.trim().to_string());
+        }
+        let Some(source) = parsed["alda_code"].as_str() else {
+            return;
+        };
+        let hash = sha256_hex(source);
+        let signature = source_diagnostic_signature(source);
+        current.last_test_changed = Some(if hash == current.source_hash {
+            "源码与失败基线完全相同".to_string()
+        } else if signature == current.source_signature {
+            format!("源码哈希已改变，但关键状态签名保持：{signature}")
+        } else {
+            format!(
+                "关键状态签名已改变；失败基线={}；本次测试={}",
+                current.source_signature, signature
+            )
+        });
+    }
+
+    fn mark_docs_consulted(&mut self) {
+        if let Some(current) = self.current.as_mut() {
+            current.docs_consulted = true;
+        }
+    }
+
+    fn mark_reviewer_completed(&mut self) {
+        if let Some(current) = self.current.as_mut() {
+            current.reviewer_completed = true;
+        }
+    }
+
+    fn required_action(&self) -> DiagnosticAction {
+        let Some(current) = &self.current else {
+            return DiagnosticAction::None;
+        };
+        if current.error_class == DiagnosticErrorClass::ToolProtocol {
+            return DiagnosticAction::CorrectProtocol;
+        }
+        if current.error_class == DiagnosticErrorClass::SyntaxOrDsl
+            && current.consecutive_failures == 1
+            && !current.docs_consulted
+        {
+            return DiagnosticAction::LookupDocs;
+        }
+        if current.consecutive_failures >= 3 && !current.reviewer_completed {
+            return DiagnosticAction::Reviewer;
+        }
+        if current.consecutive_failures >= 2 && !current.reviewer_completed {
+            return DiagnosticAction::EquivalentReproduction;
+        }
+        DiagnosticAction::None
+    }
+
+    fn validate_action(&self, tool_name: &str, arguments: &str) -> Result<()> {
+        match self.required_action() {
+            DiagnosticAction::None | DiagnosticAction::CorrectProtocol => Ok(()),
+            DiagnosticAction::LookupDocs if tool_name == "lookup_alda_docs" => Ok(()),
+            DiagnosticAction::LookupDocs => {
+                bail!("当前首次语法事实失败必须先调用 lookup_alda_docs 查询对应官方章节")
+            }
+            DiagnosticAction::Reviewer | DiagnosticAction::EquivalentReproduction
+                if tool_name == "delegate" =>
+            {
+                Ok(())
+            }
+            DiagnosticAction::Reviewer => {
+                bail!(
+                    "当前已进入 diagnose_only；必须先调用 delegate 完成独立诊断，不能继续重写、检查或提交整曲"
+                )
+            }
+            DiagnosticAction::EquivalentReproduction
+                if matches!(tool_name, "inspect_alda_source" | "inspect_alda_patch") =>
+            {
+                self.validate_diagnostic_claim(arguments)
+            }
+            DiagnosticAction::EquivalentReproduction => bail!(
+                "同类硬失败已连续发生两次；下一步只能使用带 diagnostic 声明的 inspect_alda_source/inspect_alda_patch 做等价最小复现，或调用 delegate 独立诊断"
+            ),
+        }
+    }
+
+    fn validate_diagnostic_claim(&self, arguments: &str) -> Result<()> {
+        let current = self.current.as_ref().context("当前没有诊断状态")?;
+        let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
+        let claim = parsed["diagnostic"]
+            .as_object()
+            .context("同类失败后的检查必须提供 diagnostic 等价性声明")?;
+        let field = |name: &str| -> Result<&str> {
+            claim
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("diagnostic.{name} 不能为空"))
+        };
+        if field("baseline_source_hash")? != current.source_hash {
+            bail!("diagnostic.baseline_source_hash 必须引用最新失败基线")
+        }
+        for name in [
+            "hypothesis",
+            "preserved_conditions",
+            "changed_conditions",
+            "equivalence_reason",
+        ] {
+            field(name)?;
+        }
+        Ok(())
+    }
+
+    fn snapshot(
+        &self,
+        remaining_calls: usize,
+        max_model_calls: usize,
+    ) -> Option<serde_json::Value> {
+        let current = self.current.as_ref()?;
+        let required_next_action = match self.required_action() {
+            DiagnosticAction::None => "minimal_fix_or_final_validation",
+            DiagnosticAction::LookupDocs => "lookup_alda_docs",
+            DiagnosticAction::EquivalentReproduction => {
+                "equivalent_reproduction_or_diagnostic_delegation"
+            }
+            DiagnosticAction::Reviewer => "diagnose_only_delegate",
+            DiagnosticAction::CorrectProtocol => "correct_tool_protocol",
+        };
+        let budget_phase = if remaining_calls.saturating_mul(5) <= max_model_calls {
+            "wrap_up"
+        } else {
+            "normal"
+        };
+        Some(serde_json::json!({
+            "supersedes_earlier_diagnostic_states": true,
+            "error_class": current.error_class,
+            "consecutive_failures": current.consecutive_failures,
+            "baseline_source_hash": current.source_hash,
+            "origin_source_hash": current.origin_source_hash,
+            "must_preserve": current.source_signature,
+            "origin_conditions": current.origin_source_signature,
+            "current_hypothesis": current.current_hypothesis.as_deref().unwrap_or("unset"),
+            "last_test_changed": current.last_test_changed,
+            "docs_consulted": current.docs_consulted,
+            "reviewer_completed": current.reviewer_completed,
+            "remaining_model_calls": remaining_calls,
+            "budget_phase": budget_phase,
+            "required_next_action": required_next_action
+        }))
+    }
+
+    fn reviewer_packet(&self) -> Option<String> {
+        let current = self.current.as_ref()?;
+        let failures = current
+            .checks
+            .iter()
+            .filter(|check| check.status == CheckStatus::Fail)
+            .map(|check| format!("- {}: {}", check.name, check.detail))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let latest = (current.source_hash != current.origin_source_hash).then(|| {
+            format!(
+                "\n\n【最新失败基线｜不能替代首次失败基线】\nlatest_source_hash: {}\nlatest_source_signature: {}\n{}",
+                current.source_hash, current.source_signature, current.source
+            )
+        });
+        Some(format!(
+            "【宿主诊断升级｜不得省略或改写关键条件】\nerror_class: {:?}\nconsecutive_failures: {}\norigin_source_hash: {}\norigin_source_signature: {}\ncurrent_hypothesis: {}\n\n【原始硬失败】\n{}\n\n【首次失败 Alda 源码】\n{}{}",
+            current.error_class,
+            current.consecutive_failures,
+            current.origin_source_hash,
+            current.origin_source_signature,
+            current.current_hypothesis.as_deref().unwrap_or("unset"),
+            failures,
+            current.origin_source,
+            latest.as_deref().unwrap_or("")
+        ))
+    }
+}
+
+fn dominant_error_class(checks: &[AldaCheck]) -> Option<DiagnosticErrorClass> {
+    checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Fail)
+        .map(|check| {
+            let combined = format!("{} {}", check.name, check.detail).to_ascii_lowercase();
+            if combined.contains("midi")
+                || combined.contains("音域")
+                || combined.contains("note 128")
+                || combined.contains("note -")
+            {
+                DiagnosticErrorClass::MidiRange
+            } else if check.name.contains("Alda 语法")
+                || combined.contains("语法")
+                || combined.contains("解析")
+            {
+                DiagnosticErrorClass::SyntaxOrDsl
+            } else if check.name.contains("Marker")
+                || check.name.contains("结构计划")
+                || check.name.contains("修改范围")
+                || combined.contains("form_plan")
+            {
+                DiagnosticErrorClass::MarkerOrForm
+            } else if check.name == "时长" {
+                DiagnosticErrorClass::Duration
+            } else if matches!(check.name, "结果类型" | "运行策略" | "输出完整性") {
+                DiagnosticErrorClass::ToolProtocol
+            } else {
+                DiagnosticErrorClass::Other
+            }
+        })
+        .next()
+}
+
+fn sha256_hex(source: &str) -> String {
+    format!("{:x}", Sha256::digest(source.as_bytes()))
+}
+
+fn source_diagnostic_signature(source: &str) -> String {
+    let repeat_pattern = Regex::new(r"\*\s*(\d+)").expect("static repeat regex is valid");
+    let octave_pattern = Regex::new(r"\bo(\d+)\b").expect("static octave regex is valid");
+    let mut repeats = repeat_pattern
+        .captures_iter(source)
+        .filter_map(|capture| capture[1].parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    repeats.sort_unstable();
+    let mut octaves = octave_pattern
+        .captures_iter(source)
+        .filter_map(|capture| capture[1].parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    octaves.sort_unstable();
+    format!(
+        "repeat_counts={repeats:?}; octave_steps=+{}/-{}; explicit_octaves={octaves:?}",
+        source.chars().filter(|character| *character == '>').count(),
+        source.chars().filter(|character| *character == '<').count(),
+    )
+}
+
+fn oversized_source_inspection(
+    source: &str,
+    scope: &str,
+    candidate: bool,
+    form_plan: Option<FormPlan>,
+    edit_scope: Option<EditScope>,
+) -> ModelToolResult {
     let size_detail = if candidate {
         format!(
             "源码为 {} 字节，超过 {} 字节上限；请缩减完整候选后再检查",
@@ -502,9 +920,11 @@ fn oversized_source_inspection(source: &str, scope: &str, candidate: bool) -> Mo
         status: CheckStatus::Fail,
         detail: size_detail,
     }];
+    let source_hash = candidate.then(|| sha256_hex(source));
     let content = serde_json::json!({
         "scope": scope,
         "parse_ok": false,
+        "source_hash": source_hash,
         "duration_secs": null,
         "markers": [],
         "sections": [],
@@ -518,7 +938,17 @@ fn oversized_source_inspection(source: &str, scope: &str, candidate: bool) -> Mo
     .to_string();
     ModelToolResult {
         content,
-        candidate_checkpoint: None,
+        candidate_checkpoint: source_hash.map(|source_hash| CandidateCheckpoint {
+            alda_code: source.to_string(),
+            checks: checks.to_vec(),
+            form_plan,
+            source_hash,
+            edit_scope,
+        }),
+        diagnostic_observation: Some(DiagnosticObservation {
+            checks: checks.to_vec(),
+            source: source.to_string(),
+        }),
     }
 }
 
@@ -819,8 +1249,11 @@ impl Agent {
         let mut rendered_wav = None;
         let mut candidate_artifacts = None;
         let mut candidate_checkpoint: Option<CandidateCheckpoint> = None;
+        let mut diagnostic_checkpoint: Option<CandidateCheckpoint> = None;
+        let mut diagnostics = DiagnosticTracker::default();
         let mut terminal_error = None;
         let mut continuing_after_tool = false;
+        let mut wrap_up_injected = false;
 
         loop {
             let stop_detail = if model_calls >= max_model_calls {
@@ -842,6 +1275,19 @@ impl Agent {
                     detail,
                 });
                 break;
+            }
+            let remaining_before_call = max_model_calls.saturating_sub(model_calls);
+            if !wrap_up_injected && remaining_before_call.saturating_mul(5) <= max_model_calls {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: Some(
+                        "<budget_state supersedes_earlier_budget_states=\"true\" phase=\"wrap_up\">剩余模型调用已进入最后 20%；停止扩展曲式、大范围重命名和引入无关假设，只允许诊断、最小修复、最终验证或如实结束。</budget_state>"
+                            .to_string(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                wrap_up_injected = true;
             }
             model_calls += 1;
             if std::mem::take(&mut continuing_after_tool) {
@@ -925,7 +1371,7 @@ impl Agent {
                         )
                     })
                     .collect::<Vec<_>>();
-                messages.push(tool_calls_message(&normalized_calls, round_text));
+                messages.push(tool_calls_message(&normalized_calls, &round_text));
                 for (id, _, _) in &normalized_calls {
                     messages.push(Message {
                         role: "tool".to_string(),
@@ -990,16 +1436,50 @@ impl Agent {
             let tool_call_id =
                 tool_id.unwrap_or_else(|| format!("call_{}", tool_turns + round + 1));
 
+            if let Err(error) = diagnostics.validate_action(&tool_name, &tool_args) {
+                tool_turns += 1;
+                messages.push(tool_call_message(
+                    &tool_call_id,
+                    &tool_name,
+                    &tool_args,
+                    &round_text,
+                ));
+                messages.push(Message {
+                    role: "tool".to_string(),
+                    content: Some(
+                        serde_json::json!({
+                            "ok": false,
+                            "error": error.to_string(),
+                            "diagnostic_state": diagnostics.snapshot(
+                                max_model_calls.saturating_sub(model_calls),
+                                max_model_calls,
+                            )
+                        })
+                        .to_string(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_call_id),
+                });
+                continuing_after_tool = true;
+                continue;
+            }
+
             if tool_name != "submit_result" {
                 tool_turns += 1;
                 messages.push(tool_call_message(
                     &tool_call_id,
                     &tool_name,
                     &tool_args,
-                    round_text,
+                    &round_text,
                 ));
-                let outcome = if tool_name == "delegate" {
-                    match delegate_messages(&tool_args) {
+                let diagnostic_packet = matches!(
+                    diagnostics.required_action(),
+                    DiagnosticAction::EquivalentReproduction | DiagnosticAction::Reviewer
+                )
+                .then(|| diagnostics.reviewer_packet())
+                .flatten();
+                let mut outcome = if tool_name == "delegate" {
+                    match delegate_messages(&tool_args, diagnostic_packet.as_deref()) {
                         Err(error) => Err(error),
                         Ok(_) if model_calls.saturating_add(1) >= max_model_calls => {
                             Err(anyhow::anyhow!(
@@ -1027,10 +1507,32 @@ impl Agent {
                         &tool_args,
                         validation.tool_context.as_ref(),
                         &validation.score,
+                        diagnostic_checkpoint.as_ref(),
                     )
                     .await
                 };
-                if let Ok(outcome) = &outcome {
+                if let Ok(outcome) = &mut outcome {
+                    if tool_name == "lookup_alda_docs" {
+                        diagnostics.mark_docs_consulted();
+                    }
+                    if tool_name == "delegate" && diagnostic_packet.is_some() {
+                        diagnostics.mark_reviewer_completed();
+                    }
+                    if matches!(
+                        tool_name.as_str(),
+                        "inspect_alda_source" | "inspect_alda_patch"
+                    ) {
+                        diagnostics.observe_test(&tool_args);
+                    }
+                    if let Some(observation) = outcome.diagnostic_observation.clone() {
+                        if observation
+                            .checks
+                            .iter()
+                            .any(|check| check.status == CheckStatus::Fail)
+                        {
+                            diagnostics.observe_failure(&observation.checks, &observation.source);
+                        }
+                    }
                     let parsed = serde_json::from_str::<serde_json::Value>(&tool_args).ok();
                     let target = parsed
                         .as_ref()
@@ -1054,8 +1556,19 @@ impl Agent {
                         last_form_plan.clone_from(&checkpoint.form_plan);
                         last_checks.clone_from(&checkpoint.checks);
                         last_was_truncated = was_truncated;
-                        interpretation = "完整候选检查点（尚未正式提交）".to_string();
-                        candidate_checkpoint = Some(checkpoint.clone());
+                        interpretation = if checkpoint.is_valid() {
+                            "完整候选检查点（尚未正式提交）"
+                        } else {
+                            "待修正诊断候选（尚未正式提交）"
+                        }
+                        .to_string();
+                        diagnostic_checkpoint = Some(checkpoint.clone());
+                        candidate_checkpoint = checkpoint.is_valid().then(|| checkpoint.clone());
+                    }
+                    if let Some(snapshot) = diagnostics
+                        .snapshot(max_model_calls.saturating_sub(model_calls), max_model_calls)
+                    {
+                        outcome.content = attach_diagnostic_state(&outcome.content, snapshot);
                     }
                 }
                 messages.push(Message {
@@ -1104,7 +1617,7 @@ impl Agent {
                         &tool_call_id,
                         &tool_name,
                         &tool_args,
-                        round_text,
+                        &round_text,
                     ));
                     let detail = if was_truncated {
                         "模型响应被截断，submit_result 参数不是完整 JSON".to_string()
@@ -1152,15 +1665,20 @@ impl Agent {
                 last_checks.clone_from(&checks);
                 last_was_truncated = was_truncated;
                 interpretation.clone_from(&submitted.message);
+                diagnostics.observe_failure(&checks, "");
                 messages.push(tool_call_message(
                     &tool_call_id,
                     "submit_result",
                     &tool_args,
-                    round_text,
+                    &round_text,
                 ));
                 messages.push(Message {
                     role: "tool".to_string(),
-                    content: Some(build_tool_feedback(&checks, Some(&tool_call_id))),
+                    content: Some(build_tool_feedback(
+                        &checks,
+                        diagnostics
+                            .snapshot(max_model_calls.saturating_sub(model_calls), max_model_calls),
+                    )),
                     tool_calls: None,
                     tool_call_id: Some(tool_call_id),
                 });
@@ -1182,7 +1700,7 @@ impl Agent {
                     &tool_call_id,
                     "submit_result",
                     &tool_args,
-                    round_text,
+                    &round_text,
                 ));
                 messages.push(Message {
                     role: "tool".to_string(),
@@ -1240,7 +1758,7 @@ impl Agent {
                     &tool_call_id,
                     &tool_name,
                     &tool_args,
-                    round_text,
+                    &round_text,
                 ));
                 messages.push(Message {
                     role: "tool".to_string(),
@@ -1351,6 +1869,18 @@ impl Agent {
             }
             reporter.report(AgentEvent::ValidationCompleted(checks.clone()));
             let all_pass = checks.iter().all(|check| check.status != CheckStatus::Fail);
+            if !all_pass {
+                diagnostics.observe_failure(&checks, &alda_code);
+                if submitted.kind == AgentResultKind::Candidate {
+                    diagnostic_checkpoint = Some(CandidateCheckpoint {
+                        alda_code: alda_code.clone(),
+                        checks: checks.clone(),
+                        form_plan: form_plan.clone(),
+                        source_hash: sha256_hex(&alda_code),
+                        edit_scope: edit_scope.clone(),
+                    });
+                }
+            }
             last_alda_code = Some(alda_code.clone());
             last_form_plan.clone_from(&form_plan);
             last_checks.clone_from(&checks);
@@ -1360,11 +1890,15 @@ impl Agent {
                 &tool_call_id,
                 "submit_result",
                 &tool_args,
-                round_text,
+                &round_text,
             ));
             messages.push(Message {
                 role: "tool".to_string(),
-                content: Some(build_tool_feedback(&checks, Some(&tool_call_id))),
+                content: Some(build_tool_feedback(
+                    &checks,
+                    diagnostics
+                        .snapshot(max_model_calls.saturating_sub(model_calls), max_model_calls),
+                )),
                 tool_calls: None,
                 tool_call_id: Some(tool_call_id),
             });
@@ -1413,7 +1947,7 @@ impl Agent {
             },
             success: false,
             needs_input: false,
-            kind: if candidate_checkpoint.is_some() {
+            kind: if diagnostic_checkpoint.is_some() {
                 AgentResultKind::Candidate
             } else {
                 score_kind.unwrap_or(AgentResultKind::Candidate)
@@ -1427,7 +1961,7 @@ impl Agent {
             played_target,
             rendered_wav,
             candidate_artifacts: None,
-            recovery_checkpoint: candidate_checkpoint
+            recovery_checkpoint: diagnostic_checkpoint
                 .is_some()
                 .then_some(RecoveryCheckpoint::InspectedCandidate),
             terminal_error,
@@ -1440,6 +1974,7 @@ impl Agent {
         arguments: &str,
         context: Option<&AgentToolContext>,
         validation: &ScoreValidation,
+        diagnostic_checkpoint: Option<&CandidateCheckpoint>,
     ) -> Result<ModelToolResult> {
         if name == "lookup_alda_docs" {
             return lookup_alda_docs(arguments).map(ModelToolResult::content);
@@ -1450,9 +1985,8 @@ impl Agent {
                 .await;
         }
         if name == "inspect_alda_patch" {
-            let context = context.context("当前调用没有项目乐谱上下文")?;
             return self
-                .inspect_alda_patch(arguments, validation, context)
+                .inspect_alda_patch(arguments, validation, context, diagnostic_checkpoint)
                 .await;
         }
         let context = context.context("当前调用没有项目乐谱上下文")?;
@@ -1565,7 +2099,7 @@ impl Agent {
                 &tool_call_id,
                 &tool_name,
                 &tool_args,
-                result,
+                &result,
             ));
             let outcome = self
                 .execute_subagent_tool(&tool_name, &tool_args, context, validation)
@@ -1604,7 +2138,7 @@ impl Agent {
                 self.inspect_alda_source(arguments, validation, None).await
             }
             "inspect_score" if context.is_some() => {
-                self.execute_model_tool(name, arguments, context, validation)
+                self.execute_model_tool(name, arguments, context, validation, None)
                     .await
             }
             "inspect_score" => bail!("当前委派没有项目乐谱上下文，不能调用 inspect_score"),
@@ -1682,7 +2216,9 @@ impl Agent {
             bail!("edit_scope 只适用于 scope=candidate");
         }
         if source.len() > MAX_INSPECT_ALDA_SOURCE_BYTES {
-            return Ok(oversized_source_inspection(source, scope, candidate));
+            return Ok(oversized_source_inspection(
+                source, scope, candidate, form_plan, edit_scope,
+            ));
         }
 
         let temporary = tempfile::Builder::new()
@@ -1725,9 +2261,7 @@ impl Agent {
                 checks.push(check);
             }
         }
-        let source_hash = (candidate
-            && checks.iter().all(|check| check.status != CheckStatus::Fail))
-        .then(|| format!("{:x}", Sha256::digest(source.as_bytes())));
+        let source_hash = candidate.then(|| sha256_hex(source));
         let inspection_json = alda_inspection_json(
             scope,
             parse_ok,
@@ -1739,10 +2273,14 @@ impl Agent {
             content: inspection_json,
             candidate_checkpoint: source_hash.map(|source_hash| CandidateCheckpoint {
                 alda_code: source.to_string(),
-                checks,
-                form_plan,
+                checks: checks.clone(),
+                form_plan: form_plan.clone(),
                 source_hash,
-                edit_scope,
+                edit_scope: edit_scope.clone(),
+            }),
+            diagnostic_observation: Some(DiagnosticObservation {
+                checks,
+                source: source.to_string(),
             }),
         })
     }
@@ -1751,33 +2289,43 @@ impl Agent {
         &self,
         arguments: &str,
         validation: &ScoreValidation,
-        context: &AgentToolContext,
+        context: Option<&AgentToolContext>,
+        diagnostic_checkpoint: Option<&CandidateCheckpoint>,
     ) -> Result<ModelToolResult> {
         let mut parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
         let base_kind = parsed["base"]["kind"].as_str().context("base.kind 缺失")?;
         let expected_hash = parsed["base"]["source_hash"]
             .as_str()
             .context("base.source_hash 缺失")?;
-        let base_path = match base_kind {
-            "work" => context.working_path.as_ref().context("项目没有工作乐谱")?,
-            "current" => context
-                .current_path
+        let source = if base_kind == "diagnostic" {
+            let checkpoint = diagnostic_checkpoint.context("当前没有运行中的诊断候选")?;
+            checkpoint.alda_code.clone()
+        } else {
+            let context = context.context("work/current 补丁需要项目乐谱上下文")?;
+            if diagnostic_checkpoint.is_some() {
+                bail!("存在更新的运行中诊断候选，补丁必须使用 base.kind=diagnostic");
+            }
+            let base_path = match base_kind {
+                "work" => context.working_path.as_ref().context("项目没有工作乐谱")?,
+                "current" => context
+                    .current_path
+                    .as_ref()
+                    .context("项目没有当前有效版本")?,
+                _ => bail!("base.kind 必须是 work、current 或 diagnostic"),
+            };
+            let active_baseline = context
+                .revision_path
                 .as_ref()
-                .context("项目没有当前有效版本")?,
-            _ => bail!("base.kind 必须是 work 或 current"),
+                .or(context.working_path.as_ref())
+                .or(context.current_path.as_ref())
+                .context("项目没有可用的修改基线")?;
+            if base_path != active_baseline {
+                bail!("补丁必须基于最新工作基线；存在更新的恢复候选时请使用 revision 基线继续");
+            }
+            fs::read_to_string(base_path)
+                .with_context(|| format!("无法读取补丁基线 {}", base_path.display()))?
         };
-        let active_baseline = context
-            .revision_path
-            .as_ref()
-            .or(context.working_path.as_ref())
-            .or(context.current_path.as_ref())
-            .context("项目没有可用的修改基线")?;
-        if base_path != active_baseline {
-            bail!("补丁必须基于最新工作基线；存在更新的恢复候选时请提交完整候选");
-        }
-        let source = fs::read_to_string(base_path)
-            .with_context(|| format!("无法读取补丁基线 {}", base_path.display()))?;
-        let actual_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let actual_hash = sha256_hex(&source);
         if actual_hash != expected_hash {
             bail!("补丁基线 source_hash 已失效；请重新读取当前乐谱");
         }
@@ -1831,7 +2379,7 @@ impl Agent {
             .as_object_mut()
             .expect("tool arguments are an object")
             .remove("replacements");
-        self.inspect_alda_source(&parsed.to_string(), validation, Some(context))
+        self.inspect_alda_source(&parsed.to_string(), validation, context)
             .await
     }
 }
@@ -2207,10 +2755,10 @@ fn edit_scope_failure(detail: impl Into<String>) -> AldaCheck {
     }
 }
 
-fn tool_call_message(id: &str, name: &str, arguments: &str, content: String) -> Message {
+fn tool_call_message(id: &str, name: &str, arguments: &str, content: &str) -> Message {
     Message {
         role: "assistant".to_string(),
-        content: (!content.trim().is_empty()).then_some(content),
+        content: compact_tool_narration(content),
         tool_calls: Some(vec![crate::deepseek::ToolCallMsg {
             id: id.to_string(),
             ty: "function".to_string(),
@@ -2223,10 +2771,10 @@ fn tool_call_message(id: &str, name: &str, arguments: &str, content: String) -> 
     }
 }
 
-fn tool_calls_message(calls: &[(String, String, String)], content: String) -> Message {
+fn tool_calls_message(calls: &[(String, String, String)], content: &str) -> Message {
     Message {
         role: "assistant".to_string(),
-        content: (!content.trim().is_empty()).then_some(content),
+        content: compact_tool_narration(content),
         tool_calls: Some(
             calls
                 .iter()
@@ -2242,6 +2790,15 @@ fn tool_calls_message(calls: &[(String, String, String)], content: String) -> Me
         ),
         tool_call_id: None,
     }
+}
+
+fn compact_tool_narration(content: &str) -> Option<String> {
+    let first_line = content.lines().find(|line| !line.trim().is_empty())?.trim();
+    let mut compact = first_line.chars().take(160).collect::<String>();
+    if first_line.chars().count() > 160 {
+        compact.push('…');
+    }
+    Some(compact)
 }
 
 #[derive(Default)]
@@ -2673,6 +3230,9 @@ fn resolve_candidate_reference(
     if checkpoint.source_hash != source_hash {
         bail!("candidate_ref 只能引用本轮最近一次有效检查点的 source_hash");
     }
+    if !checkpoint.is_valid() {
+        bail!("candidate_ref 不能引用仍有硬失败的诊断检查点；请先修复并重新检查")
+    }
     submitted.alda_code = Some(checkpoint.alda_code.clone());
     submitted.form_plan.clone_from(&checkpoint.form_plan);
     submitted.edit_scope.clone_from(&checkpoint.edit_scope);
@@ -2695,7 +3255,10 @@ fn requests_user_input(message: &str) -> bool {
         .any(|marker| message.contains(marker))
 }
 
-fn build_tool_feedback(checks: &[AldaCheck], _tool_call_id: Option<&str>) -> String {
+fn build_tool_feedback(
+    checks: &[AldaCheck],
+    diagnostic_state: Option<serde_json::Value>,
+) -> String {
     let failures: Vec<_> = checks
         .iter()
         .filter(|c| c.status == CheckStatus::Fail)
@@ -2758,8 +3321,26 @@ fn build_tool_feedback(checks: &[AldaCheck], _tool_call_id: Option<&str>) -> Str
         );
     }
 
-    msg.push_str("\n请保持已通过部分，只修正硬失败后重新提交。若无法可靠确认循环、片段或声部长度，停止手算并用 inspect_alda_source 检查 4–16 小节材料。");
+    if let Some(state) = diagnostic_state {
+        msg.push_str("\n【当前诊断状态｜取代更早状态】\n<diagnostic_state>");
+        msg.push_str(&state.to_string());
+        msg.push_str("</diagnostic_state>\n必须执行 required_next_action；未在等价条件下复现时不得排除根因。");
+    }
+    msg.push_str("\n请保持已通过部分，只修正硬失败。若无法可靠确认循环、片段或声部长度，停止手算并用 inspect_alda_source 检查 4–16 小节材料。");
     msg
+}
+
+fn attach_diagnostic_state(content: &str, diagnostic_state: serde_json::Value) -> String {
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(mut value) if value.is_object() => {
+            value
+                .as_object_mut()
+                .expect("checked object")
+                .insert("diagnostic_state".to_string(), diagnostic_state);
+            value.to_string()
+        }
+        _ => format!("{content}\n\n<diagnostic_state>{diagnostic_state}</diagnostic_state>"),
+    }
 }
 
 /// 从时长检查的 detail 文本中解析实际值与有效目标区间。
@@ -3202,10 +3783,166 @@ mod tests {
         let compiled = compiled_instructions(&ProjectPreferences::default());
         let rendered = compiled.rendered();
 
-        assert!(rendered.contains("只把硬失败作为自动修正目标"));
-        assert!(rendered.contains("不得为了改善诊断而让所有声部持续铺满"));
-        assert!(rendered.contains("不能把同一短循环按比例复制"));
-        assert!(rendered.contains("不继续扩大整曲"));
+        assert!(rendered.contains("收到硬失败后只修正硬失败"));
+        assert!(rendered.contains("持续铺满声部或强制同时结束"));
+        assert!(rendered.contains("不把同一短循环按比例复制"));
+        assert!(rendered.contains("进入 `diagnose_only`"));
+    }
+
+    #[test]
+    fn first_syntax_failure_requires_docs_before_correction() {
+        let checks = [AldaCheck {
+            name: "Alda 语法",
+            status: CheckStatus::Fail,
+            detail: "解析失败：变量名格式无效".to_string(),
+        }];
+        let mut tracker = DiagnosticTracker::default();
+        tracker.observe_failure(&checks, "piano: p2A = c");
+
+        assert_eq!(tracker.required_action(), DiagnosticAction::LookupDocs);
+        assert!(
+            tracker
+                .validate_action("submit_result", r#"{"kind":"candidate"}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("lookup_alda_docs")
+        );
+        tracker
+            .validate_action("lookup_alda_docs", r#"{"topic":"variables"}"#)
+            .unwrap();
+
+        tracker.mark_docs_consulted();
+        assert_eq!(tracker.required_action(), DiagnosticAction::None);
+        tracker
+            .validate_action(
+                "inspect_alda_source",
+                r#"{"alda_code":"piano: pa = c","scope":"candidate"}"#,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn second_failure_requires_a_matching_diagnostic_claim() {
+        let checks = [AldaCheck {
+            name: "音域",
+            status: CheckStatus::Fail,
+            detail: "MIDI note 128 超出范围".to_string(),
+        }];
+        let source = "piano: o4 [e8 g b > c+ e8 g b g e]*6";
+        let mut tracker = DiagnosticTracker::default();
+        tracker.observe_failure(&checks, source);
+        tracker.observe_failure(&checks, source);
+        assert_eq!(
+            tracker.required_action(),
+            DiagnosticAction::EquivalentReproduction
+        );
+
+        let missing = serde_json::json!({
+            "alda_code": source,
+            "scope": "candidate"
+        });
+        assert!(
+            tracker
+                .validate_action("inspect_alda_source", &missing.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("diagnostic")
+        );
+
+        let mut claim = serde_json::json!({
+            "alda_code": source,
+            "scope": "candidate",
+            "diagnostic": {
+                "baseline_source_hash": "0".repeat(64),
+                "hypothesis": "不平衡的升八度在反复间累积",
+                "preserved_conditions": "保留 *6、o4 和同一声部实例",
+                "changed_conditions": "none",
+                "equivalence_reason": "使用原失败源码"
+            }
+        });
+        assert!(
+            tracker
+                .validate_action("inspect_alda_source", &claim.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("最新失败基线")
+        );
+
+        claim["diagnostic"]["baseline_source_hash"] = serde_json::Value::String(sha256_hex(source));
+        tracker
+            .validate_action("inspect_alda_source", &claim.to_string())
+            .unwrap();
+    }
+
+    #[test]
+    fn diagnostic_escalation_preserves_the_original_failure_conditions() {
+        let checks = [AldaCheck {
+            name: "音域",
+            status: CheckStatus::Fail,
+            detail: "MIDI note 128 超出范围".to_string(),
+        }];
+        let original = "piano: o4 [e8 g b > c+ e8 g b g e]*6";
+        let simplified = "piano: o4 [e8 g b > c+ e8 g b g e]*2";
+        let mut tracker = DiagnosticTracker::default();
+        tracker.observe_failure(&checks, original);
+        tracker.observe_failure(&checks, simplified);
+
+        let snapshot = tracker.snapshot(10, 24).unwrap();
+        assert!(
+            snapshot["origin_conditions"]
+                .as_str()
+                .unwrap()
+                .contains("[6]")
+        );
+        assert!(snapshot["must_preserve"].as_str().unwrap().contains("[2]"));
+        assert!(
+            snapshot["last_test_changed"]
+                .as_str()
+                .unwrap()
+                .contains("关键状态签名已改变")
+        );
+
+        tracker.observe_failure(&checks, simplified);
+        assert_eq!(tracker.required_action(), DiagnosticAction::Reviewer);
+        assert!(tracker.validate_action("submit_result", "{}").is_err());
+        tracker
+            .validate_action("delegate", r#"{"task":"定位音域越界"}"#)
+            .unwrap();
+
+        let packet = tracker.reviewer_packet().unwrap();
+        assert!(packet.contains("【首次失败 Alda 源码】"));
+        assert!(packet.contains(original));
+        assert!(packet.contains("【最新失败基线｜不能替代首次失败基线】"));
+        assert!(packet.contains(simplified));
+
+        let messages = delegate_messages(r#"{"task":"定位音域越界"}"#, Some(&packet)).unwrap();
+        assert!(
+            messages[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("你当前执行由宿主触发的独立诊断")
+        );
+        assert!(messages[1].content.as_deref().unwrap().contains(original));
+    }
+
+    #[test]
+    fn tool_narration_keeps_one_unicode_safe_line() {
+        assert_eq!(
+            compact_tool_narration("\n  先检查原始失败条件  \n然后重写完整候选"),
+            Some("先检查原始失败条件".to_string())
+        );
+        let long = "音".repeat(161);
+        let compact = compact_tool_narration(&long).unwrap();
+        assert_eq!(compact.chars().count(), 161);
+        assert!(compact.ends_with('…'));
+        assert_eq!(
+            compact
+                .chars()
+                .filter(|character| *character == '音')
+                .count(),
+            160
+        );
     }
 
     #[tokio::test]
@@ -3245,8 +3982,17 @@ mod tests {
     async fn improving_candidate_can_succeed_after_more_than_three_submissions() {
         let (base_url, _requests) = serve(vec![
             MockResponse::sse(tool_response("syntax_bad", "tool_calls")),
+            MockResponse::sse(host_tool_response(
+                "lookup_alda_docs",
+                &serde_json::json!({ "topic": "notes" }),
+            )),
             MockResponse::sse(tool_response("short", "tool_calls")),
             MockResponse::sse(tool_response("closer", "tool_calls")),
+            MockResponse::sse(host_tool_response(
+                "delegate",
+                &serde_json::json!({ "task": "独立诊断时长失败" }),
+            )),
+            MockResponse::sse(plain_text_response("时长修复应保持材料并扩展发展段")),
             MockResponse::sse(tool_response("target", "tool_calls")),
         ]);
         let client = DeepSeekClient::new(
@@ -3284,6 +4030,7 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.rounds, 4);
+        assert_eq!(result.stats.delegations, 1);
         assert_eq!(result.alda_code.as_deref(), Some("target"));
         let artifacts = result.candidate_artifacts.as_ref().unwrap();
         assert!(artifacts.wav_path().is_file());
@@ -3307,6 +4054,11 @@ mod tests {
         let (base_url, _requests) = serve(vec![
             MockResponse::sse(tool_response("piano: c", "tool_calls")),
             MockResponse::sse(tool_response("piano: c", "tool_calls")),
+            MockResponse::sse(host_tool_response(
+                "delegate",
+                &serde_json::json!({ "task": "独立诊断静音渲染失败" }),
+            )),
+            MockResponse::sse(plain_text_response("候选音频保持静音，需检查音符事件")),
             MockResponse::sse(tool_response("piano: c", "tool_calls")),
         ]);
         let client = DeepSeekClient::new(
@@ -3318,7 +4070,7 @@ mod tests {
         let (directory, runner) = fake_runner();
         let result = Agent::new(client, runner)
             .with_audio_renderer(fake_audio_renderer_with_amplitude(directory.path(), 0))
-            .create(request(3))
+            .create(request(5))
             .await
             .unwrap();
 
@@ -3924,6 +4676,19 @@ mod tests {
         assert_eq!(
             tool.function.parameters["required"],
             serde_json::json!(["alda_code", "scope"])
+        );
+
+        let patch = tools
+            .iter()
+            .find(|tool| tool.function.name == "inspect_alda_patch")
+            .expect("diagnostic patching should not require project context");
+        assert_eq!(
+            patch.function.parameters["properties"]["base"]["properties"]["kind"]["enum"],
+            serde_json::json!(["diagnostic"])
+        );
+        assert_eq!(
+            patch.function.parameters["required"],
+            serde_json::json!(["base", "replacements"])
         );
     }
 
@@ -4768,6 +5533,7 @@ mod tests {
                 &arguments.to_string(),
                 Some(&context),
                 &validation,
+                None,
             )
             .await
             .unwrap();
@@ -4784,23 +5550,99 @@ mod tests {
                 &stale.to_string(),
                 Some(&context),
                 &validation,
+                None,
             )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("source_hash 已失效"));
+    }
 
-        let revision_path = directory.path().join("revision.alda");
-        fs::write(&revision_path, "newer revision").unwrap();
-        let newer_context = AgentToolContext {
-            revision_path: Some(revision_path),
-            ..context
+    #[tokio::test]
+    async fn inspect_alda_patch_accepts_diagnostic_checkpoint() {
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = section_runner();
+        let baseline_source = "baseline";
+        let diagnostic_checkpoint = CandidateCheckpoint {
+            alda_code: baseline_source.to_string(),
+            checks: vec![AldaCheck {
+                name: "Alda 语法",
+                status: CheckStatus::Fail,
+                detail: "待修复诊断候选".to_string(),
+            }],
+            form_plan: Some(test_form_plan()),
+            source_hash: sha256_hex(baseline_source),
+            edit_scope: None,
         };
-        let error = agent
+        let arguments = serde_json::json!({
+            "base": {
+                "kind": "diagnostic",
+                "source_hash": diagnostic_checkpoint.source_hash
+            },
+            "replacements": [{ "old": "baseline", "new": "target_changed" }],
+            "form_plan": test_form_plan(),
+            "edit_scope": {
+                "mode": "local",
+                "target_sections": ["climax"],
+                "intent": "增强高潮"
+            }
+        });
+
+        let inspected = Agent::new(client, runner)
             .execute_model_tool(
                 "inspect_alda_patch",
                 &arguments.to_string(),
-                Some(&newer_context),
-                &validation,
+                None,
+                &ScoreValidation::new(None, Vec::new(), Vec::new()),
+                Some(&diagnostic_checkpoint),
+            )
+            .await
+            .unwrap();
+
+        assert!(inspected.candidate_checkpoint.is_some());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn inspect_alda_patch_rejects_outdated_work_baseline() {
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = section_runner();
+        let baseline_path = directory.path().join("baseline.alda");
+        let revision_path = directory.path().join("revision.alda");
+        let baseline_source = "baseline";
+        fs::write(&baseline_path, baseline_source).unwrap();
+        fs::write(&revision_path, "newer revision").unwrap();
+        let context = AgentToolContext {
+            project_root: directory.path().to_path_buf(),
+            current_path: None,
+            working_path: Some(baseline_path),
+            revision_path: Some(revision_path),
+            form_plan: Some(test_form_plan()),
+        };
+        let arguments = serde_json::json!({
+            "base": {
+                "kind": "work",
+                "source_hash": sha256_hex(baseline_source)
+            },
+            "replacements": [{ "old": "baseline", "new": "target_changed" }]
+        });
+
+        let error = Agent::new(client, runner)
+            .execute_model_tool(
+                "inspect_alda_patch",
+                &arguments.to_string(),
+                Some(&context),
+                &ScoreValidation::new(None, Vec::new(), Vec::new()),
+                None,
             )
             .await
             .unwrap_err();
@@ -4860,6 +5702,7 @@ mod tests {
                 .to_string(),
                 None,
                 &validation,
+                None,
             )
             .await
             .unwrap();
@@ -4877,6 +5720,7 @@ mod tests {
                 .to_string(),
                 None,
                 &validation,
+                None,
             )
             .await
             .unwrap();
@@ -4902,6 +5746,7 @@ mod tests {
                 .to_string(),
                 None,
                 &validation,
+                None,
             )
             .await
             .unwrap();
@@ -4921,6 +5766,55 @@ mod tests {
             entries, 1,
             "inspection must not persist source beside the project"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_candidate_remains_patchable_but_cannot_be_submitted() {
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = progress_runner();
+        let oversized_source = "c".repeat(MAX_INSPECT_ALDA_SOURCE_BYTES + 1);
+        let inspected = Agent::new(client, runner)
+            .execute_model_tool(
+                "inspect_alda_source",
+                &serde_json::json!({
+                    "alda_code": oversized_source,
+                    "scope": "candidate"
+                })
+                .to_string(),
+                None,
+                &ScoreValidation::new(None, Vec::new(), Vec::new()),
+                None,
+            )
+            .await
+            .unwrap();
+        let checkpoint = inspected
+            .candidate_checkpoint
+            .as_ref()
+            .expect("oversized candidate remains patchable");
+        assert!(!checkpoint.is_valid());
+        assert_eq!(checkpoint.source_hash, sha256_hex(&oversized_source));
+        let inspection: serde_json::Value = serde_json::from_str(&inspected.content).unwrap();
+        assert_eq!(
+            inspection["source_hash"],
+            serde_json::Value::String(sha256_hex(&oversized_source))
+        );
+
+        let submitted = parse_submitted_result(
+            &serde_json::json!({
+                "kind": "candidate",
+                "message": "提交超长检查点",
+                "candidate_ref": { "source_hash": checkpoint.source_hash }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(resolve_candidate_reference(submitted, Some(checkpoint)).is_err());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]
@@ -4948,6 +5842,7 @@ mod tests {
                 &serde_json::json!({ "target": "current" }).to_string(),
                 Some(&context),
                 &ScoreValidation::new(None, Vec::new(), Vec::new()),
+                None,
             )
             .await
             .unwrap();
@@ -4989,6 +5884,7 @@ mod tests {
                 &arguments("fragment"),
                 None,
                 &validation,
+                None,
             )
             .await
             .unwrap();
@@ -5002,12 +5898,21 @@ mod tests {
                 &arguments("candidate"),
                 None,
                 &validation,
+                None,
             )
             .await
             .unwrap();
         let candidate_json: serde_json::Value = serde_json::from_str(&candidate.content).unwrap();
-        assert!(candidate.candidate_checkpoint.is_none());
-        assert!(candidate_json["source_hash"].is_null());
+        assert!(
+            candidate
+                .candidate_checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| !checkpoint.is_valid())
+        );
+        assert_eq!(
+            candidate_json["source_hash"],
+            serde_json::Value::String(sha256_hex("midi-acoustic-grand-piano: target"))
+        );
         assert!(
             candidate_json["hard_failures"]
                 .as_array()
@@ -5078,6 +5983,68 @@ mod tests {
         assert!(result.checks.iter().any(|check| {
             check.name == "运行策略" && check.detail.contains("1 次模型调用")
         }));
+    }
+
+    #[tokio::test]
+    async fn creation_can_patch_a_failed_candidate_without_project_context() {
+        let repaired_hash = sha256_hex("target");
+        let (base_url, _requests) = serve(vec![
+            MockResponse::sse(tool_response("short", "tool_calls")),
+            MockResponse::sse(host_tool_response(
+                "inspect_alda_patch",
+                &serde_json::json!({
+                    "base": {
+                        "kind": "diagnostic",
+                        "source_hash": sha256_hex("short")
+                    },
+                    "replacements": [{ "old": "short", "new": "target" }]
+                }),
+            )),
+            MockResponse::sse(host_tool_response(
+                "submit_result",
+                &serde_json::json!({
+                    "kind": "candidate",
+                    "message": "提交已修复的检查点",
+                    "candidate_ref": { "source_hash": repaired_hash }
+                }),
+            )),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = progress_runner();
+        let result = Agent::new(client, runner)
+            .with_audio_renderer(fake_audio_renderer(directory.path()))
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("完成三秒作品".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(
+                        Some(crate::instructions::DurationConstraint::exact(3.0)),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    run_policy: test_policy(3),
+                    tool_context: None,
+                    require_candidate: true,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.alda_code.as_deref(), Some("target"));
+        assert_eq!(result.rounds, 2);
+        assert_eq!(result.stats.tool_turns, 1);
     }
 
     #[test]
@@ -5199,7 +6166,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_identical_failure_continues_until_the_model_call_guard() {
+    async fn final_budget_fifth_injects_wrap_up_state() {
+        let lookup = || {
+            MockResponse::sse(host_tool_response(
+                "lookup_alda_docs",
+                &serde_json::json!({ "topic": "notes" }),
+            ))
+        };
+        let (base_url, _requests) = serve(vec![
+            lookup(),
+            lookup(),
+            lookup(),
+            lookup(),
+            MockResponse::sse(text_response("answer", "按剩余预算收尾")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("查询后简短回答".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(5),
+                    tool_context: None,
+                    require_candidate: false,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.kind, AgentResultKind::Answer);
+        assert!(result.checks.is_empty());
+        assert_eq!(result.stats.model_calls, 5);
+        assert_eq!(result.stats.tool_turns, 4);
+        assert!(result.conversation.iter().any(|message| {
+            message.role == "system"
+                && message.content.as_deref().is_some_and(|content| {
+                    content.contains("phase=\"wrap_up\"")
+                        && content.contains("剩余模型调用已进入最后 20%")
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_failure_is_stopped_by_the_diagnostic_gate() {
         let (base_url, _requests) = serve(vec![
             MockResponse::sse(tool_response("", "tool_calls")),
             MockResponse::sse(tool_response("", "tool_calls")),
@@ -5214,7 +6237,7 @@ mod tests {
         let (_directory, runner) = fake_runner();
         let result = Agent::new(client, runner).create(request(3)).await.unwrap();
 
-        assert_eq!(result.rounds, 3);
+        assert_eq!(result.rounds, 2);
         assert!(!result.success);
         assert!(!result.checks.iter().any(|check| check.name == "修正进展"));
         assert!(result.checks.iter().any(|check| {

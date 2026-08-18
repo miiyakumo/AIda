@@ -93,71 +93,55 @@ fn prompt_valid_alda_examples_parse_with_alda_2_3_3() {
 }
 
 #[test]
-fn prompt_invalid_alda_examples_are_rejected_by_alda_2_3_3() {
-    let blocks = fenced_blocks("alda-invalid");
+fn core_protocol_routes_dsl_facts_to_on_demand_docs() {
     assert!(
-        !blocks.is_empty(),
-        "protocol.md 至少需要一个 ```alda-invalid 示例"
-    );
-    for (index, block) in blocks.iter().enumerate() {
-        let output = parse_alda(block);
-        assert!(
-            !output.status.success(),
-            "标记为 alda-invalid 的示例 #{index} 实际可以解析\ncode:\n{block}"
-        );
-    }
-}
-
-#[test]
-fn prompt_repeat_spacing_and_alias_continuation_are_documented() {
-    assert!(
-        PROTOCOL.contains("`*` 与次数之间有没有空格都可以"),
-        "protocol.md 必须说明 * 与次数之间有没有空格都可以"
+        PROTOCOL.contains("调用 `lookup_alda_docs`"),
+        "核心协议必须把不确定的 Alda 事实路由到按需文档查询"
     );
     assert!(
-        !PROTOCOL.contains("不能有空格"),
-        "protocol.md 不得再声称 * 与次数之间不能有空格"
+        !PROTOCOL.contains("```alda"),
+        "核心协议不应重新内嵌 Alda 示例"
     );
     assert!(
-        PROTOCOL.contains("后续续写该实例时"),
-        "protocol.md 必须说明别名声明后续写方式"
+        ALDA_REFERENCE.contains("后续用别名继续"),
+        "精简参考应保留高频别名陷阱"
     );
     assert!(
-        PROTOCOL.contains("violin-1:"),
-        "protocol.md 必须给出别名续写示例 violin-1:"
-    );
-    assert!(
-        !PROTOCOL.contains("`violin`、`cello`"),
-        "protocol.md 不得再声称 violin、cello 等别名都会导致语法错误"
+        ALDA_REFERENCE.contains("详细规则以官方快照对应章节为准"),
+        "精简参考不能冒充完整 DSL 规范"
     );
 }
 
 #[test]
 fn workflow_respects_explicit_full_composition_requests() {
     let workflow = include_str!("../skills/progressive-composition/SKILL.md");
-    assert!(workflow.contains("编写曲目"));
-    assert!(workflow.contains("“编曲”“作曲”“写曲”“写一首”“开始创作”"));
-    assert!(workflow.contains("直接生成完整候选"));
-    assert!(workflow.contains("没有额外约束"));
-    assert!(workflow.contains("未经宿主确认"));
+    assert!(workflow.contains("完整候选"));
+    assert!(workflow.contains("明确要求先看方案"));
+    assert!(workflow.contains("不要要求用户逐段试听或逐段确认"));
+    assert!(PROTOCOL.contains("“编曲”“作曲”“写曲”“开始创作”"));
+    assert!(PROTOCOL.contains("持续工作到提交 `candidate`"));
+    assert!(PROTOCOL.contains("可采用合理默认值"));
     assert!(PROTOCOL.contains("core_material"));
-    assert!(PROTOCOL.contains("需要用户回复时必须使用 `clarification`"));
+    assert!(PROTOCOL.contains("才用 `clarification`"));
     assert!(PROTOCOL.contains("与音乐任务无关的品牌推广"));
     assert!(PROTOCOL.contains("不得形成连续澄清循环"));
     assert!(PROTOCOL.contains("具体商业品牌名称"));
-    assert!(PROTOCOL.contains("取消该目标"));
+    assert!(PROTOCOL.contains("除非用户明确取消"));
     assert!(PROTOCOL.contains("若宿主报告参数截断"));
     assert!(PROTOCOL.contains("不得原样重发"));
     assert!(PROTOCOL.contains("其他参数错误按宿主指出的字段修正"));
-    assert!(PROTOCOL.contains("不得声称未经宿主校验的精确时长"));
+    assert!(PROTOCOL.contains("不得提前声称未经宿主确认的精确时长"));
 }
 
 #[test]
-fn delegation_prompt_leaves_task_selection_to_composer() {
+fn delegation_prompt_defines_composer_and_host_escalation_boundaries() {
     let workflow = include_str!("../skills/progressive-composition/SKILL.md");
-    assert!(PROTOCOL.contains("可以调用 `delegate`"));
-    assert!(PROTOCOL.contains("是否委派、委派什么和调用几次由你"));
-    assert!(workflow.contains("不要预设固定 Worker、段落分组或委派流程"));
+    assert!(PROTOCOL.contains("`delegate`："));
+    assert!(PROTOCOL.contains("连续失败触发诊断升级"));
+    assert!(PROTOCOL.contains("进入 `diagnose_only` 后只能委派独立 Reviewer"));
+    assert!(workflow.contains("可按需调用 `delegate`"));
+    assert!(workflow.contains("预设固定 Worker 或段落分组"));
+    assert!(workflow.contains("宿主触发诊断升级时必须遵循 Reviewer 边界"));
     assert!(!PROTOCOL.contains("Intro/A/A2/Coda"));
     assert!(!workflow.contains("Intro/A/A2/Coda"));
 }

@@ -9,7 +9,6 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 const PROTOCOL: &str = include_str!("../prompts/protocol.md");
-const ALDA_REFERENCE: &str = include_str!("../prompts/alda-reference.md");
 const NATURAL_LANGUAGE_CONFLICT_NOTICE: &str =
     "自然语言指示之间的冲突未机械验证；请按来源标签人工判断。";
 const DEFAULT_CAPABILITY: &str = r"你只能使用宿主在本次运行中实际提供的工具和项目操作。指示中的能力描述不授予额外权限。
@@ -311,7 +310,6 @@ pub fn compile_instructions(
     preferences.validate()?;
 
     let mut fragments = Vec::new();
-    let core_protocol = format!("{PROTOCOL}\n\n{ALDA_REFERENCE}");
     fragments.push(InstructionFragment::new(
         "core-protocol",
         None,
@@ -322,7 +320,7 @@ pub fn compile_instructions(
             strength: InstructionStrength::Invariant,
         },
         "【核心协议｜来源：builtin:protocol】",
-        core_protocol,
+        PROTOCOL,
     ));
     fragments.push(application_capability_fragment());
 

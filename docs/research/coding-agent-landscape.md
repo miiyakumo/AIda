@@ -27,7 +27,8 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
   官方文档抓取（Aider FAQ、Goose docs、OpenHands docs、Codex README）。
 - 局限：本轮 WebSearch 工具不可用，Claude Code / Cursor / Amp / Cline / Devin 等未逐条抓到
   实时文档，描述来自既有知识；方向性结论不受影响，精确核验某家时可再单独抓取。
-- 对 `deepseek-harness` 的机制细节以 [deepseek-harness.md](deepseek-harness.md) 为准。
+- 对提示词拼装、运行时状态和失败升级的机制细节以
+  [Coding Agent 提示词的组织方式与控制原理](coding-agent-prompt-design.md) 为准。
 
 ## 市场概览
 
@@ -106,7 +107,7 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
 | 特性 | 判定 | 说明 |
 |---|---|---|
 | 并行只读工具调用 | **优先做** | 工具多数宿主固定且无副作用，同一快照上的 `inspect_*` 可安全并行；[selective-parallel-tool-calls](../todo/selective-parallel-tool-calls.md) 已是正确方向 |
-| Invocation 快照/可复现 | 条件触发 | 需要审计或可复现时保存指令 fingerprint、编译后指示、动态上下文、工具 schema；见 [deepseek-harness.md](deepseek-harness.md) 建议，优先级高于 subagent |
+| Invocation 快照/可复现 | 条件触发 | 需要审计或可复现时保存指令 fingerprint、编译后指示、动态上下文、工具 schema；见 [Coding Agent 提示词的组织方式与控制原理](coding-agent-prompt-design.md) 建议，优先级高于 subagent |
 | Context 管理/compaction | 暂缓 | 先记录请求大小与趋势，真实会话达到窗口或成本阈值后再压缩；不要预先引入完整 surface 代数 |
 | Plan mode 门 | 已有等效物 | 明确创作意图在同一轮完成；只有需要"不确认不进下一步"时才补门 |
 | MCP/通用扩展 | 不需要 | 工具集固定且领域化，无接入外部工具生态的需求 |
@@ -121,7 +122,7 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
 
 ## 关联文档
 
-- [DeepSeek Harness 架构与机制](deepseek-harness.md)：subagent/goal/compaction 的机制与取舍。
+- [Coding Agent 提示词的组织方式与控制原理](coding-agent-prompt-design.md)：DeepSeek Harness 为主的提示词拼装、运行时状态与失败闭环调研。
 - [Coding Agent 的工作区与会话关系](agent-workspace-sessions.md)：会话初始化与工作区关联。
 - [Coding Agent 的终端信息分层](coding-agent-terminal-information-layout.md)：终端信息结构。
 - [Subagent 委派 A/B 验收](../todo/workflow-artifacts-and-agent-roles.md)：按需委派的验收与撤回条件。
