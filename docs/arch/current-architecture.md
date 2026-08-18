@@ -182,11 +182,24 @@ stdout/stderr；它把 SSE 中的 `content` 与 `submit_result.message` 解码�
 （包括 Alda 源码）不回流到 UI。宿主阶段、检查、结果和错误继续由各 UI 适配器统一渲染。
 
 模型请求在提供工具时显式发送 `parallel_tool_calls: false`，每次响应只允许调用一个工具。除 `submit_result`
-外，宿主提供 `lookup_alda_docs`、`inspect_alda_source`、`inspect_score`、
-`render_score` 和 `play_score`：分别读取固定官方章节、检查尚未提交的临时源码、检查已有乐谱、生成
-MIDI/WAV 并返回真实音频指标、以及真实发起播放。宿主工具往返和协议恢复不计作候选提交。生成结果分别
-统计模型调用、宿主工具往返、协议恢复与正式结果提交；终端摘要和 JSONL 控制面都返回这四项真实计数，
-不再把 0 次提交显示成“0 轮修正”。SSE 按 tool-call index 分别聚合；若供应商仍
+外，模型始终可用 `delegate`、`lookup_alda_docs` 和 `inspect_alda_source`；项目会话另提供
+`inspect_alda_patch`、`inspect_score`、`render_score` 和 `play_score`。这些工具分别承担按需委派、读取固定
+官方章节、检查临时源码或补丁、检查已有乐谱、生成 MIDI/WAV 并返回真实音频指标，以及真实发起播放。
+
+`delegate(task, context?)` 发起一次隔离的 subagent 运行。subagent 只收到专用 system prompt 和 Composer 显式
+提供的任务与必要上下文，不复制主对话、Project prompt 或乐谱源码。它始终可调用 `lookup_alda_docs` 与仅限
+`scope=fragment` 的 `inspect_alda_source`；项目会话中还可用只读 `inspect_score(work|current)` 获取结构、检查
+结果和源码哈希，但不能取得源码。schema 与运行时 dispatch 同时拒绝 `submit_result`、递归 `delegate`、
+`inspect_alda_patch`、渲染和播放；片段检查不产生候选检查点。
+
+subagent 可以在只读工具结果之间继续调用模型，直到返回非空文本；只有最终文本作为 `delegate` 的 tool result
+交回 Composer。Composer 自行决定是否委派、委派什么和调用几次；宿主不预设 Worker、段落分组、依赖图或
+Workflow。所有 subagent 模型请求与 Composer 请求共同受模型调用上限约束，实际执行的内部工具计入工具往返，
+一次委派在 `delegations` 中记一次。每次实际启动的委派都为 Composer 保留至少一次续写额度。
+
+工具往返和协议恢复不计作候选提交。生成结果分别统计模型调用、委派、工具往返、协议恢复与正式结果提交；
+终端摘要和 JSONL 控制面都返回这些真实计数，不再把 0 次提交显示成“0 轮修正”。SSE 按 tool-call index 分别
+聚合；若供应商仍
 返回多个并行调用，宿主拒绝且不执行全部调用，把每个对应错误写回上下文后自动继续。模型只返回普通文本
 或空响应而未调用工具时，宿主同样把协议错误写回并自动继续；原始文本不作为已完成结果持久化，但会按
 增量显示。终端将工具往返、协议恢复和候选提交分别显示，不再展示固定提交额度。

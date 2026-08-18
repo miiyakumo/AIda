@@ -360,8 +360,12 @@ fn render_result(result: &ActionResult, writer: &mut impl Write) -> Result<()> {
     if let ActionResult::AgentCompleted { stats, .. } = result {
         writeln!(
             writer,
-            "  运行：模型调用 {} · 工具往返 {} · 协议恢复 {} · 结果提交 {}",
-            stats.model_calls, stats.tool_turns, stats.protocol_recoveries, stats.submissions
+            "  运行：模型调用 {}（委派 {}） · 工具往返 {} · 协议恢复 {} · 结果提交 {}",
+            stats.model_calls,
+            stats.delegations,
+            stats.tool_turns,
+            stats.protocol_recoveries,
+            stats.submissions
         )?;
     }
     Ok(())
@@ -790,6 +794,7 @@ mod tests {
             rounds: 0,
             stats: crate::agent::GenerationStats {
                 model_calls: 24,
+                delegations: 3,
                 tool_turns: 19,
                 protocol_recoveries: 5,
                 submissions: 0,

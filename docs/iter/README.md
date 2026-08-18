@@ -22,4 +22,7 @@ description：确定性指示编译、Skill 安全加载、项目启用配置、
 description：补齐 Alda 到 WAV 的真实产物链、官方手册快照、宿主工具状态机、约束持久化和状态反馈。
 
 [长篇叙事作曲 Agent 困境分析](long-form-composition-agent-diagnosis/README.md)
-description：对比两次五分钟运行、结构机制效果、剩余作曲问题与任务专用角色拆分的触发证据。
+description：对比两次五分钟运行、结构机制效果、剩余作曲问题与按需委派 A/B 的触发证据。
+
+[按需 Subagent 委派](on-demand-subagent-delegation/README.md)
+description：记录 Composer 按需委派的最小接口、隔离边界、调用统计、非目标和自动验证证据。

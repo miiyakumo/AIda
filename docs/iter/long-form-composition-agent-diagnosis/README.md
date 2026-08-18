@@ -3,7 +3,7 @@
 ## 目的与范围
 
 本文记录同一五分钟叙事配乐任务在结构化曲式机制落地前后的两次真实运行，作为后续优化长篇作曲 Agent
-及评估任务专用 subagent 原型的工程基线。
+及评估按需 subagent 委派的工程基线。
 
 运行任务：依据《香樟太守》创作约五分钟、具有东方 Project 风格的叙事主题曲。
 
@@ -446,8 +446,8 @@ Marker 和 form_plan 已建立自然语言段落与 Alda 时间轴的统一映�
 - 所有声部必须等长；
 - 东方 Project 风格等于 Loop。
 
-这些结论仍需试听与源码分析支持。但第二次运行已经提供了启动“长篇作曲专用最小 A/B 原型”的证据：用
-对照实验验证职责隔离是否有收益，而不是直接建设通用 Multi-Agent 平台。
+这些结论仍需试听与源码分析支持。但第二次运行已经提供了启动按需委派 A/B 的证据：用对照实验验证职责
+隔离是否有收益，而不是直接建设固定角色或通用 Multi-Agent 平台。
 
 ---
 
@@ -489,12 +489,13 @@ Marker 和 form_plan 已建立自然语言段落与 Alda 时间轴的统一映�
 - 为预检候选返回内容哈希，正式提交直接引用该 checkpoint；
 - 统一数值显示格式。
 
-### P4：验证任务专用角色拆分
+### P4：验证按需委派
 
-以当前单 Agent 运行作为基线，只为长篇作曲实现两个段落家族 Worker：主题家族负责 Intro/A/A2/Coda，
-对比发展家族负责 B/C/D。主 Agent 负责精确动机、和声路线、曲式、织体和变形关系；Worker 将段落契约实现为
-通过 Alda 解析的片段；Harness 唯一负责确定性组装与最终校验；独立 Reviewer 只读审查。是否保留该原型由
-调用成本、游标错误、主题可定位性和完整试听 A/B 决定。
+以不委派的 Composer 运行作为基线，允许 Composer 自行选择边界清晰的音乐设计、Alda 实现或只读复核任务，
+通过 `task/context` 交给隔离 subagent。subagent 不继承主对话或乐谱源码，但可查询文档、检查临时片段，并在
+项目会话中只读检查 work/current；返回文本仍由 Composer 判断和整合，现有宿主继续负责最终检查和提交。
+是否保留该能力由总模型调用、DSL 错误、主题可定位性和完整试听 A/B 决定，不预设 Worker、段落家族、
+Reviewer 或 Workflow。
 
 ---
 
@@ -523,9 +524,10 @@ Marker 和 form_plan 已建立自然语言段落与 Alda 时间轴的统一映�
 - 修改结构化乐谱必须声明 `edit_scope`，局部模式机械保护非目标段落；
 - `inspect_alda_patch` 可在已知 source hash 上检查少量唯一替换，不直接改写项目；
 - 整曲试听和完整 WAV 仍是默认路径；按 Marker 的带上下文局部播放只用于定位问题和 A/B，不进行逐段审批。
+- `delegate` 已提供带最小只读工具集的隔离 subagent 循环，所有内部调用计入总模型调用并单独统计委派数。
 
 这些机制解决的是状态漂移、全局重写和反馈粒度，不自动判断主题发展或风格质量。下一步先补齐游标回跳、
-跨段溢出和意外重叠检查，再用新的 3–5 分钟任务对照单 Agent 与任务专用角色原型的调用成本和完整试听结果；
+跨段溢出和意外重叠检查，再用新的 3–5 分钟任务对照不委派与按需委派的调用成本和完整试听结果；
 不能用机制完成替代音乐质量验收，也不能在 A/B 前宣称 subagent 有效。
 
 ---
@@ -537,4 +539,4 @@ Marker 和 form_plan 已建立自然语言段落与 Alda 时间轴的统一映�
 - [Alda 音频产物与 Agent 回合闭环](../alda-artifacts-and-agent-turns/README.md)
 - [当前架构](../../arch/current-architecture.md)
 - [长篇作曲质量与可控修改](../../todo/long-form-composition-quality.md)
-- [Workflow 产物与 Agent 角色派生](../../todo/workflow-artifacts-and-agent-roles.md)
+- [Subagent 委派 A/B 验收](../../todo/workflow-artifacts-and-agent-roles.md)

@@ -521,7 +521,7 @@ fn render_summary(
     let included = display_list(&preferences.included_instruments);
     let excluded = display_list(&preferences.excluded_instruments);
     format!(
-        "核心协议：builtin:protocol\n生效 Skill：{skills}\n项目偏好：mode={}, target_duration={}, include={}, exclude={}\n角色：builtin:default-agent\n有效模型工具：submit_result、lookup_alda_docs；项目会话另提供 inspect_score、render_score、play_score\n能力：可查询、校验、渲染、播放和更新工作乐谱；不能接受候选或写入有效版本\n结构化冲突：未发现\n{}\n片段摘要：{fragment_digests}\nFingerprint：{fingerprint}",
+        "核心协议：builtin:protocol\n生效 Skill：{skills}\n项目偏好：mode={}, target_duration={}, include={}, exclude={}\n角色：builtin:default-agent\n有效模型工具：submit_result、delegate、lookup_alda_docs、inspect_alda_source；项目会话另提供 inspect_alda_patch、inspect_score、render_score、play_score\n能力：可按需委派具有最小只读工具集的 subagent，可查询、校验、渲染、播放和更新工作乐谱；不能接受候选或写入有效版本\n结构化冲突：未发现\n{}\n片段摘要：{fragment_digests}\nFingerprint：{fingerprint}",
         preferences.mode,
         duration,
         included,

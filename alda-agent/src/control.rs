@@ -532,6 +532,7 @@ mod tests {
             rounds: 0,
             stats: crate::agent::GenerationStats {
                 model_calls: 24,
+                delegations: 3,
                 tool_turns: 19,
                 protocol_recoveries: 5,
                 submissions: 0,
@@ -547,6 +548,7 @@ mod tests {
         assert_eq!(json["kind"], "agent_completed");
         assert_eq!(json["recovery_checkpoint"], "inspected_candidate");
         assert_eq!(json["stats"]["model_calls"], 24);
+        assert_eq!(json["stats"]["delegations"], 3);
         assert_eq!(json["stats"]["tool_turns"], 19);
         assert_eq!(json["stats"]["protocol_recoveries"], 5);
         assert_eq!(json["stats"]["submissions"], 0);

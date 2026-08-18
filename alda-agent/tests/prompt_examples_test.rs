@@ -151,3 +151,13 @@ fn workflow_respects_explicit_full_composition_requests() {
     assert!(PROTOCOL.contains("其他参数错误按宿主指出的字段修正"));
     assert!(PROTOCOL.contains("不得声称未经宿主校验的精确时长"));
 }
+
+#[test]
+fn delegation_prompt_leaves_task_selection_to_composer() {
+    let workflow = include_str!("../skills/progressive-composition/SKILL.md");
+    assert!(PROTOCOL.contains("可以调用 `delegate`"));
+    assert!(PROTOCOL.contains("是否委派、委派什么和调用几次由你"));
+    assert!(workflow.contains("不要预设固定 Worker、段落分组或委派流程"));
+    assert!(!PROTOCOL.contains("Intro/A/A2/Coda"));
+    assert!(!workflow.contains("Intro/A/A2/Coda"));
+}

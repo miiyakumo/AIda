@@ -190,6 +190,32 @@ fn inspect_alda_source_tool() -> Tool {
     }
 }
 
+fn inspect_alda_fragment_tool() -> Tool {
+    Tool {
+        ty: "function".to_string(),
+        function: FunctionDef {
+            name: "inspect_alda_source".to_string(),
+            description: "真实解析尚未提交的 Alda 临时片段，返回时长、Marker、事件、声部覆盖和语法检查；只允许 scope=fragment，不读取或更新项目候选检查点。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "alda_code": {
+                        "type": "string",
+                        "description": "需要独立检查的 Alda 临时片段",
+                        "maxLength": MAX_INSPECT_ALDA_SOURCE_BYTES
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["fragment"],
+                        "description": "固定为 fragment"
+                    }
+                },
+                "required": ["alda_code", "scope"]
+            }),
+        },
+    }
+}
+
 fn inspect_alda_patch_tool() -> Tool {
     Tool {
         ty: "function".to_string(),
@@ -247,9 +273,66 @@ fn lookup_docs_tool() -> Tool {
     }
 }
 
+fn delegate_tool() -> Tool {
+    Tool {
+        ty: "function".to_string(),
+        function: FunctionDef {
+            name: "delegate".to_string(),
+            description: "把一个边界清晰的音乐设计、Alda 实现或只读复核任务交给独立 subagent，并取得其文本结果。subagent 不继承当前对话；请在 context 中提供完成任务所需的信息。它可查询 Alda 文档、检查临时片段，并在项目会话中只读检查 work/current；结果不会修改项目，由你判断、整合并通过现有完整检查。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "交给 subagent 的单一、可直接执行的任务"
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "可选；完成任务所需的规格、约束、相关 Alda 源码或待复核内容"
+                    }
+                },
+                "required": ["task"]
+            }),
+        },
+    }
+}
+
+fn delegate_messages(arguments: &str) -> Result<Vec<Message>> {
+    let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
+    let task = parsed["task"].as_str().context("task 缺失")?.trim();
+    if task.is_empty() {
+        bail!("task 不能为空");
+    }
+    let context = match parsed.get("context") {
+        None => "",
+        Some(value) => value.as_str().context("context 必须是字符串")?.trim(),
+    };
+    let user_message = if context.is_empty() {
+        format!("【委派任务】\n{task}")
+    } else {
+        format!("【委派任务】\n{task}\n\n【上下文】\n{context}")
+    };
+    Ok(vec![
+        Message {
+            role: "system".to_string(),
+            content: Some(include_str!("../prompts/subagent.md").to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Some(user_message),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ])
+}
+
 fn model_tools(host_tools: bool) -> Vec<Tool> {
     let mut tools = vec![
         submit_result_tool(),
+        delegate_tool(),
         lookup_docs_tool(),
         inspect_alda_source_tool(),
     ];
@@ -260,6 +343,17 @@ fn model_tools(host_tools: bool) -> Vec<Tool> {
             score_tool("render_score", "真实导出 MIDI 并用 FluidSynth 渲染 WAV，返回音频时长、采样率、峰值、RMS 和静音判断。"),
             play_score_tool(),
         ]);
+    }
+    tools
+}
+
+fn subagent_tools(project_context: bool) -> Vec<Tool> {
+    let mut tools = vec![lookup_docs_tool(), inspect_alda_fragment_tool()];
+    if project_context {
+        tools.push(score_tool(
+            "inspect_score",
+            "只读解析并检查当前或工作乐谱，返回源码哈希、时长、段落、声部、事件、乐器和项目约束检查；不返回源码，也不修改项目。",
+        ));
     }
     tools
 }
@@ -338,6 +432,7 @@ pub struct CreationResult {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct GenerationStats {
     pub model_calls: usize,
+    pub delegations: usize,
     pub tool_turns: usize,
     pub protocol_recoveries: usize,
     pub submissions: usize,
@@ -711,6 +806,7 @@ impl Agent {
         let max_elapsed = run_policy.max_elapsed.max(Duration::from_secs(1));
         let mut round = 0_usize;
         let mut model_calls = 0_usize;
+        let mut delegations = 0_usize;
         let mut tool_turns = 0_usize;
         let mut protocol_recoveries = 0_usize;
         let mut interpretation = String::new();
@@ -902,14 +998,38 @@ impl Agent {
                     &tool_args,
                     round_text,
                 ));
-                let outcome = self
-                    .execute_model_tool(
+                let outcome = if tool_name == "delegate" {
+                    match delegate_messages(&tool_args) {
+                        Err(error) => Err(error),
+                        Ok(_) if model_calls.saturating_add(1) >= max_model_calls => {
+                            Err(anyhow::anyhow!(
+                                "delegate 还需要一次 subagent 调用和一次 Composer 续写，但本轮只剩不足两次模型调用额度"
+                            ))
+                        }
+                        Ok(delegate_messages) => {
+                            delegations += 1;
+                            let subagent_call_limit =
+                                max_model_calls.saturating_sub(model_calls.saturating_add(1));
+                            self.execute_delegate(
+                                delegate_messages,
+                                validation.tool_context.as_ref(),
+                                &validation.score,
+                                subagent_call_limit,
+                                &mut model_calls,
+                                &mut tool_turns,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    self.execute_model_tool(
                         &tool_name,
                         &tool_args,
                         validation.tool_context.as_ref(),
                         &validation.score,
                     )
-                    .await;
+                    .await
+                };
                 if let Ok(outcome) = &outcome {
                     let parsed = serde_json::from_str::<serde_json::Value>(&tool_args).ok();
                     let target = parsed
@@ -1074,6 +1194,7 @@ impl Agent {
                     rounds: round,
                     stats: GenerationStats {
                         model_calls,
+                        delegations,
                         tool_turns,
                         protocol_recoveries,
                         submissions: round,
@@ -1252,6 +1373,7 @@ impl Agent {
                     rounds: round,
                     stats: GenerationStats {
                         model_calls,
+                        delegations,
                         tool_turns,
                         protocol_recoveries,
                         submissions: round,
@@ -1284,6 +1406,7 @@ impl Agent {
             rounds: round,
             stats: GenerationStats {
                 model_calls,
+                delegations,
                 tool_turns,
                 protocol_recoveries,
                 submissions: round,
@@ -1381,6 +1504,111 @@ impl Agent {
             }
             "play_score" => self.execute_play_score(&parsed, target, path).await,
             _ => bail!("未知模型工具 {name:?}"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_delegate(
+        &self,
+        mut messages: Vec<Message>,
+        context: Option<&AgentToolContext>,
+        validation: &ScoreValidation,
+        call_limit: usize,
+        model_calls: &mut usize,
+        tool_turns: &mut usize,
+    ) -> Result<ModelToolResult> {
+        let tools = subagent_tools(context.is_some());
+        for call in 1..=call_limit {
+            *model_calls += 1;
+            let events = self
+                .client
+                .chat_stream(messages.clone(), Some(tools.clone()))
+                .await?;
+            let mut result = String::new();
+            let mut calls = Vec::new();
+            let mut truncated = false;
+            for event in events {
+                match event {
+                    StreamEvent::Text(text) => result.push_str(&text),
+                    StreamEvent::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => calls.push((id, name, arguments)),
+                    StreamEvent::Done { finish_reason } => {
+                        truncated = finish_reason == "length";
+                    }
+                }
+            }
+            if calls.len() > 1 {
+                bail!("subagent 一次响应返回了多个工具调用，全部未执行");
+            }
+            let Some((tool_id, tool_name, tool_args)) = calls.pop() else {
+                if result.trim().is_empty() {
+                    bail!("subagent 未返回结果");
+                }
+                return Ok(ModelToolResult::content(
+                    serde_json::json!({
+                        "ok": true,
+                        "result": result,
+                        "truncated": truncated
+                    })
+                    .to_string(),
+                ));
+            };
+            if call == call_limit {
+                bail!("subagent 已用完委派模型调用额度，无法继续处理最后一次工具结果");
+            }
+            *tool_turns += 1;
+            let tool_call_id = tool_id.unwrap_or_else(|| format!("subagent_call_{call}"));
+            messages.push(tool_call_message(
+                &tool_call_id,
+                &tool_name,
+                &tool_args,
+                result,
+            ));
+            let outcome = self
+                .execute_subagent_tool(&tool_name, &tool_args, context, validation)
+                .await;
+            messages.push(Message {
+                role: "tool".to_string(),
+                content: Some(match outcome {
+                    Ok(outcome) => outcome.content,
+                    Err(error) => serde_json::json!({
+                        "ok": false,
+                        "error": format!("{error:#}")
+                    })
+                    .to_string(),
+                }),
+                tool_calls: None,
+                tool_call_id: Some(tool_call_id),
+            });
+        }
+        bail!("subagent 未在委派模型调用额度内返回结果")
+    }
+
+    async fn execute_subagent_tool(
+        &self,
+        name: &str,
+        arguments: &str,
+        context: Option<&AgentToolContext>,
+        validation: &ScoreValidation,
+    ) -> Result<ModelToolResult> {
+        match name {
+            "lookup_alda_docs" => lookup_alda_docs(arguments).map(ModelToolResult::content),
+            "inspect_alda_source" => {
+                let parsed = serde_json::from_str::<serde_json::Value>(arguments)?;
+                if parsed["scope"].as_str() != Some("fragment") {
+                    bail!("subagent 的 inspect_alda_source 只允许 scope=fragment");
+                }
+                self.inspect_alda_source(arguments, validation, None).await
+            }
+            "inspect_score" if context.is_some() => {
+                self.execute_model_tool(name, arguments, context, validation)
+                    .await
+            }
+            "inspect_score" => bail!("当前委派没有项目乐谱上下文，不能调用 inspect_score"),
+            _ => bail!("subagent 不允许调用工具 {name:?}"),
         }
     }
 
@@ -3492,6 +3720,7 @@ mod tests {
             result.stats,
             GenerationStats {
                 model_calls: 2,
+                delegations: 0,
                 tool_turns: 2,
                 protocol_recoveries: 2,
                 submissions: 0,
@@ -3696,6 +3925,520 @@ mod tests {
             tool.function.parameters["required"],
             serde_json::json!(["alda_code", "scope"])
         );
+    }
+
+    #[test]
+    fn delegate_tool_is_available_without_project_context() {
+        let tools = model_tools(false);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.function.name == "delegate")
+            .expect("delegate should not require project context");
+
+        assert_eq!(
+            tool.function.parameters["required"],
+            serde_json::json!(["task"])
+        );
+        assert!(tool.function.parameters["properties"]["context"].is_object());
+    }
+
+    #[test]
+    fn subagent_tools_are_read_only_and_project_aware() {
+        let without_project = subagent_tools(false);
+        let names = without_project
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["lookup_alda_docs", "inspect_alda_source"]);
+        assert_eq!(
+            without_project[1].function.parameters["properties"]["scope"]["enum"],
+            serde_json::json!(["fragment"])
+        );
+        assert!(
+            without_project[1].function.parameters["properties"]
+                .get("form_plan")
+                .is_none()
+        );
+
+        let with_project = subagent_tools(true);
+        let names = with_project
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["lookup_alda_docs", "inspect_alda_source", "inspect_score"]
+        );
+        assert!(!names.iter().any(|name| matches!(
+            *name,
+            "submit_result" | "delegate" | "inspect_alda_patch" | "render_score" | "play_score"
+        )));
+    }
+
+    #[tokio::test]
+    async fn composer_can_delegate_and_receive_an_isolated_result() {
+        let task = "为高潮设计核心动机的三种变形";
+        let context = "D 小调，4/4，保持原有附点节奏";
+        let delegated_result = "倒影、增值和移位模进三种方案";
+        let (base_url, requests) = serve(vec![
+            MockResponse::sse(host_tool_response(
+                "delegate",
+                &serde_json::json!({ "task": task, "context": context }),
+            )),
+            MockResponse::sse(plain_text_response(delegated_result)),
+            MockResponse::sse(text_response("answer", "已整合委派结果")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("分析高潮材料".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(3),
+                    tool_context: None,
+                    require_candidate: false,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.kind, AgentResultKind::Answer);
+        assert_eq!(result.interpretation, "已整合委派结果");
+        assert_eq!(
+            result.stats,
+            GenerationStats {
+                model_calls: 3,
+                delegations: 1,
+                tool_turns: 1,
+                protocol_recoveries: 0,
+                submissions: 1,
+            }
+        );
+
+        let main_request = String::from_utf8(requests.recv().unwrap()).unwrap();
+        let subagent_request = String::from_utf8(requests.recv().unwrap()).unwrap();
+        let continuation_request = String::from_utf8(requests.recv().unwrap()).unwrap();
+        assert!(main_request.contains("\"name\":\"delegate\""));
+        assert!(subagent_request.contains(task));
+        assert!(subagent_request.contains(context));
+        assert!(subagent_request.contains("\"name\":\"lookup_alda_docs\""));
+        assert!(subagent_request.contains("\"name\":\"inspect_alda_source\""));
+        assert!(!subagent_request.contains("\"name\":\"inspect_score\""));
+        assert!(!subagent_request.contains("\"name\":\"delegate\""));
+        assert!(!subagent_request.contains("分析高潮材料"));
+        assert!(continuation_request.contains(delegated_result));
+    }
+
+    #[tokio::test]
+    async fn subagent_can_use_all_available_read_only_tools_before_returning() {
+        let delegated_result = "已根据文档、片段解析和当前乐谱完成复核";
+        let (base_url, requests) = serve(vec![
+            MockResponse::sse(host_tool_response(
+                "delegate",
+                &serde_json::json!({ "task": "复核当前乐谱与新片段" }),
+            )),
+            MockResponse::sse(host_tool_response(
+                "lookup_alda_docs",
+                &serde_json::json!({ "topic": "notes" }),
+            )),
+            MockResponse::sse(host_tool_response(
+                "inspect_alda_source",
+                &serde_json::json!({
+                    "alda_code": "piano: c d e f",
+                    "scope": "fragment"
+                }),
+            )),
+            MockResponse::sse(host_tool_response(
+                "inspect_score",
+                &serde_json::json!({ "target": "current" }),
+            )),
+            MockResponse::sse(plain_text_response(delegated_result)),
+            MockResponse::sse(text_response("answer", "Composer 已整合复核结果")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (directory, runner) = fake_runner();
+        let current_path = directory.path().join("current.alda");
+        let current_source = "piano: c d e f";
+        let current_hash = format!("{:x}", Sha256::digest(current_source.as_bytes()));
+        fs::write(&current_path, current_source).unwrap();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("分析当前乐谱".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(6),
+                    tool_context: Some(AgentToolContext {
+                        project_root: directory.path().to_path_buf(),
+                        current_path: Some(current_path),
+                        working_path: None,
+                        revision_path: None,
+                        form_plan: None,
+                    }),
+                    require_candidate: false,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.interpretation, "Composer 已整合复核结果");
+        assert_eq!(result.stats.model_calls, 6);
+        assert_eq!(result.stats.delegations, 1);
+        assert_eq!(result.stats.tool_turns, 4);
+        assert_eq!(result.stats.submissions, 1);
+
+        let _main_request = requests.recv().unwrap();
+        let subagent_request = String::from_utf8(requests.recv().unwrap()).unwrap();
+        let after_docs = String::from_utf8(requests.recv().unwrap()).unwrap();
+        let after_fragment = String::from_utf8(requests.recv().unwrap()).unwrap();
+        let after_score = String::from_utf8(requests.recv().unwrap()).unwrap();
+        let composer_continuation = String::from_utf8(requests.recv().unwrap()).unwrap();
+        assert!(subagent_request.contains("\"name\":\"lookup_alda_docs\""));
+        assert!(subagent_request.contains("\"name\":\"inspect_alda_source\""));
+        assert!(subagent_request.contains("\"name\":\"inspect_score\""));
+        assert!(after_docs.contains("\"role\":\"tool\""));
+        assert!(after_fragment.contains("parse_ok"));
+        assert!(after_score.contains(&current_hash));
+        assert!(composer_continuation.contains(delegated_result));
+        assert!(!composer_continuation.contains("parse_ok"));
+        assert!(!composer_continuation.contains(&current_hash));
+    }
+
+    #[tokio::test]
+    async fn subagent_cannot_inspect_candidate_scope() {
+        let (base_url, requests) = serve(vec![
+            MockResponse::sse(host_tool_response(
+                "delegate",
+                &serde_json::json!({ "task": "检查片段" }),
+            )),
+            MockResponse::sse(host_tool_response(
+                "inspect_alda_source",
+                &serde_json::json!({
+                    "alda_code": "piano: c",
+                    "scope": "candidate"
+                }),
+            )),
+            MockResponse::sse(plain_text_response("已收到越权拒绝")),
+            MockResponse::sse(text_response("answer", "Composer 已接管完整候选检查")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("检查候选".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(4),
+                    tool_context: None,
+                    require_candidate: false,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.stats.model_calls, 4);
+        assert_eq!(result.stats.delegations, 1);
+        assert_eq!(result.stats.tool_turns, 2);
+        assert!(result.recovery_checkpoint.is_none());
+
+        let _main_request = requests.recv().unwrap();
+        let _subagent_request = requests.recv().unwrap();
+        let subagent_continuation = String::from_utf8(requests.recv().unwrap()).unwrap();
+        assert!(subagent_continuation.contains("只允许 scope=fragment"));
+    }
+
+    #[tokio::test]
+    async fn subagent_runtime_rejects_unlisted_and_projectless_tools() {
+        let (base_url, _requests) = serve(Vec::new());
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let agent = Agent::new(client, runner);
+        let validation = ScoreValidation::new(None, Vec::new(), Vec::new());
+
+        for name in [
+            "submit_result",
+            "delegate",
+            "inspect_alda_patch",
+            "render_score",
+            "play_score",
+        ] {
+            let error = agent
+                .execute_subagent_tool(name, "{}", None, &validation)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("不允许调用工具"),
+                "unexpected error for {name}: {error:#}"
+            );
+        }
+
+        let error = agent
+            .execute_subagent_tool(
+                "inspect_score",
+                &serde_json::json!({ "target": "current" }).to_string(),
+                None,
+                &validation,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("没有项目乐谱上下文"));
+
+        let error = agent
+            .execute_subagent_tool(
+                "inspect_alda_source",
+                &serde_json::json!({
+                    "alda_code": "piano: c",
+                    "scope": "candidate",
+                    "form_plan": []
+                })
+                .to_string(),
+                None,
+                &validation,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("只允许 scope=fragment"));
+    }
+
+    #[tokio::test]
+    async fn subagent_parallel_tool_calls_are_not_executed() {
+        let (base_url, requests) = serve(vec![
+            MockResponse::sse(host_tool_response(
+                "delegate",
+                &serde_json::json!({ "task": "查询后复核" }),
+            )),
+            MockResponse::sse(parallel_tool_response()),
+            MockResponse::sse(text_response("answer", "Composer 接管并行调用错误")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("复核材料".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(3),
+                    tool_context: None,
+                    require_candidate: false,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.interpretation, "Composer 接管并行调用错误");
+        assert_eq!(result.stats.model_calls, 3);
+        assert_eq!(result.stats.delegations, 1);
+        assert_eq!(result.stats.tool_turns, 1);
+
+        let _main_request = requests.recv().unwrap();
+        let _subagent_request = requests.recv().unwrap();
+        let composer_continuation = String::from_utf8(requests.recv().unwrap()).unwrap();
+        assert!(composer_continuation.contains("多个工具调用，全部未执行"));
+    }
+
+    #[tokio::test]
+    async fn subagent_tool_loop_preserves_composer_continuation_budget() {
+        let (base_url, requests) = serve(vec![
+            MockResponse::sse(host_tool_response(
+                "delegate",
+                &serde_json::json!({ "task": "连续查询文档" }),
+            )),
+            MockResponse::sse(host_tool_response(
+                "lookup_alda_docs",
+                &serde_json::json!({ "topic": "notes" }),
+            )),
+            MockResponse::sse(host_tool_response(
+                "lookup_alda_docs",
+                &serde_json::json!({ "topic": "repeats" }),
+            )),
+            MockResponse::sse(text_response("answer", "Composer 使用剩余额度完成")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("查询后回答".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(4),
+                    tool_context: None,
+                    require_candidate: false,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.interpretation, "Composer 使用剩余额度完成");
+        assert_eq!(result.stats.model_calls, 4);
+        assert_eq!(result.stats.delegations, 1);
+        assert_eq!(result.stats.tool_turns, 2);
+
+        let _main_request = requests.recv().unwrap();
+        let _first_subagent_request = requests.recv().unwrap();
+        let _second_subagent_request = requests.recv().unwrap();
+        let composer_continuation = String::from_utf8(requests.recv().unwrap()).unwrap();
+        assert!(composer_continuation.contains("无法继续处理最后一次工具结果"));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn delegate_preserves_one_model_call_for_composer_continuation() {
+        let (base_url, requests) = serve(vec![
+            MockResponse::sse(host_tool_response(
+                "delegate",
+                &serde_json::json!({ "task": "复核高潮" }),
+            )),
+            MockResponse::sse(text_response("answer", "额度不足时由 Composer 继续完成")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("分析高潮材料".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(2),
+                    tool_context: None,
+                    require_candidate: false,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.interpretation, "额度不足时由 Composer 继续完成");
+        assert_eq!(result.stats.model_calls, 2);
+        assert_eq!(result.stats.delegations, 0);
+        assert_eq!(result.stats.tool_turns, 1);
+
+        let _initial_request = requests.recv().unwrap();
+        let continuation_request = String::from_utf8(requests.recv().unwrap()).unwrap();
+        assert!(continuation_request.contains("只剩不足两次模型调用额度"));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_delegate_arguments_do_not_count_as_a_model_call() {
+        let (base_url, requests) = serve(vec![
+            MockResponse::sse(host_tool_response(
+                "delegate",
+                &serde_json::json!({ "task": "" }),
+            )),
+            MockResponse::sse(text_response("answer", "参数失败后继续完成")),
+        ]);
+        let client = DeepSeekClient::new(
+            "test-key".to_string(),
+            base_url,
+            "example-model".to_string(),
+        )
+        .unwrap();
+        let (_directory, runner) = fake_runner();
+        let result = Agent::new(client, runner)
+            .run_generation(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: Some("分析高潮材料".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                ValidationRequest {
+                    score: ScoreValidation::new(None, Vec::new(), Vec::new()),
+                    run_policy: test_policy(3),
+                    tool_context: None,
+                    require_candidate: false,
+                    forbid_clarification: false,
+                },
+                &mut SilentReporter,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.interpretation, "参数失败后继续完成");
+        assert_eq!(result.stats.model_calls, 2);
+        assert_eq!(result.stats.delegations, 0);
+        assert_eq!(result.stats.tool_turns, 1);
+
+        let _initial_request = requests.recv().unwrap();
+        let continuation_request = String::from_utf8(requests.recv().unwrap()).unwrap();
+        assert!(continuation_request.contains("task 不能为空"));
+        assert!(requests.try_recv().is_err());
     }
 
     #[test]
@@ -4326,6 +5069,7 @@ mod tests {
             result.stats,
             GenerationStats {
                 model_calls: 1,
+                delegations: 0,
                 tool_turns: 1,
                 protocol_recoveries: 0,
                 submissions: 0,
@@ -4426,6 +5170,7 @@ mod tests {
             result.stats,
             GenerationStats {
                 model_calls: 6,
+                delegations: 0,
                 tool_turns: 5,
                 protocol_recoveries: 0,
                 submissions: 1,

@@ -6,15 +6,15 @@
 Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。没有哪个 Agent 能凭单一
 特性通吃，差异在于各自突出哪些轴。
 
-对照 `alda-agent`（单领域、单 Agent、宿主固定工具集）：
+对照 `alda-agent`（单领域 Composer、宿主固定工具集、受限按需委派）：
 
 - **Memory**：项目状态、持久对话、Skill 已经构成足够的结构化记忆；不需要引入 Cline Memory Bank
   或自动记忆这类"跨会话经验"子系统。当前失败模式不是记忆问题。
 - **Goal**：完整候选要求（对话状态持久化）与已落地的 `form_plan` 持久化就是本领域的 Goal；
   不需要抽象成 DeepSeek Harness 那种事件溯源 goal 服务。
-- **Subagent/多 Agent**：第一阶段“不引入”的判断在 Marker/form_plan 落地前成立。第二次同题运行证明反馈表示
-  之外还存在明确的作曲设计、拍数核算、DSL 排错和协议恢复职责耦合；当前建议启动长篇作曲专用 A/B 原型，
-  仍不建设通用 subagent 平台。
+- **Subagent/多 Agent**：第二次同题运行暴露了作曲设计、拍数核算、DSL 排错和协议恢复的职责耦合。当前已
+  落地单个 `delegate(task, context?)` 原语，允许 Composer 按需调用具备最小只读工具集的 subagent；价值仍需长篇 A/B
+  验证，不建设角色、调度或通用 workflow 平台。
 - 其余特性按真实需求条件触发，见下表。
 
 最贴合当前架构、又有市场共识的下一步是**并行只读工具调用**（todo 已有方案）与
@@ -53,7 +53,7 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
 |---|---|---|
 | Memory（跨会话经验） | Cline Memory Bank、Claude Code 自动记忆 | 项目状态 + 持久对话 + Skill；缺自动经验记忆，不需要 |
 | Goal（可跨轮/重启的目标） | dsh goal、Devin plan | 候选要求持久化 + form_plan；缺通用抽象，不需要 |
-| Subagent/多 Agent | Claude Code Task、Amp、Cursor、Goose、dsh workflow | 无；长篇作曲专用最小 A/B 原型待实现，不引入通用平台 |
+| Subagent/多 Agent | Claude Code Task、Amp、Cursor、Goose、dsh workflow | 已有隔离的按需委派和最小只读工具集；无固定角色、递归委派或 workflow 编排 |
 | Plan mode（执行前批准门） | Claude Code、Amp、Cursor | `submit_result(plan)` 已有计划产物；当前一轮完成，无需打断 |
 | Sandbox/审批 | Codex、Goose、OpenHands、dsh | 宿主固定持有校验与文件写入，无需下游沙箱 |
 | Context 管理（compaction） | Claude Code /compact、dsh、OpenHands | 无；对话已按需裁剪，先做可观测性再压缩 |
@@ -89,17 +89,17 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
   ConversationState 已覆盖 goal 的转向/中断/恢复语义。
 - 事件溯源 goal 域在 Rust 单 crate 里是纯负担；把 form_plan 与候选要求做实即等价于领域目标。
 
-### Subagent：证据门槛已达到原型阶段，尚未达到生产采纳阶段
+### Subagent：最小能力已落地，生产价值待验证
 
 第一阶段的因果判断仍成立一半：multi-agent 不能替代 Marker、form_plan、静态校验或人工试听，也不能单独
 解决反馈不对称。Marker/form_plan 落地后的第二次运行则补充了新的证据：同一 Agent 同时设计动机、和声、
 曲式和织体，又手算拍数、修 Alda 语法、维护 Marker 和提交字段，最终用了 20 次模型调用、19 次工具往返、
 3 次协议恢复，并留下跨段溢出和游标回跳。
 
-这足以验证职责隔离是否有效，但不足以采纳通用平台。当前只做固定的长篇作曲 A/B：主 Agent 持有精确音乐
-规格，两个 Worker 按段落家族实现 Alda 片段，Harness 确定性组装，独立 Reviewer 只读复核。若调用成本、
-游标正确性和完整试听没有可测改善，撤回原型。具体边界见
-[Workflow 产物与 Agent 角色派生](../todo/workflow-artifacts-and-agent-roles.md)。
+这足以验证职责隔离是否有效，但不足以采用角色或工作流平台。当前最小实现只是 Composer 可按需调用
+`delegate(task, context?)`；subagent 不继承主对话或源码，只能查询文档、检查片段和只读检查项目乐谱，最终
+组装、完整检查和提交仍由 Composer 与现有宿主完成。若调用成本、DSL 正确性或完整试听没有可测改善，调整提示或撤回入口。具体边界见
+[Subagent 委派 A/B 验收](../todo/workflow-artifacts-and-agent-roles.md)。
 
 ## 其余特性判定
 
@@ -115,7 +115,7 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
 ## 建议优先级
 
 1. 补齐声部游标回跳、跨段溢出和意外重叠的确定性检查。
-2. 用现有单 Agent 作为基线，执行长篇作曲专用 subagent A/B 原型。
+2. 用不委派运行作为基线，执行长篇作曲按需委派 A/B。
 3. 并行只读工具调用与 Invocation 可观测性按现有 todo 推进。
 4. 暂不引入 memory 子系统、通用 goal、通用 subagent/workflow 平台。
 
@@ -124,6 +124,6 @@ Plan mode、Sandbox/审批、Context 管理、Skill/Hooks、Checkpoint/版本。
 - [DeepSeek Harness 架构与机制](deepseek-harness.md)：subagent/goal/compaction 的机制与取舍。
 - [Coding Agent 的工作区与会话关系](agent-workspace-sessions.md)：会话初始化与工作区关联。
 - [Coding Agent 的终端信息分层](coding-agent-terminal-information-layout.md)：终端信息结构。
-- [Workflow 产物与 Agent 角色派生](../todo/workflow-artifacts-and-agent-roles.md)：Role/fork 证据门槛。
+- [Subagent 委派 A/B 验收](../todo/workflow-artifacts-and-agent-roles.md)：按需委派的验收与撤回条件。
 - [长篇作曲质量与可控修改](../todo/long-form-composition-quality.md)：本领域 Goal 与结构化产物方案。
 - [分级开放工具并行调用](../todo/selective-parallel-tool-calls.md)：并行只读工具方案。
