@@ -448,7 +448,7 @@ fn merge_submissions(
 fn composer_session(client: DeepSeekClient, task: &str, duration: f64) -> RoleSession {
     RoleSession::new(
         client,
-        "你是唯一的 Composer。像音乐家一样设计全曲的速度、拍号、乐句网格、主题、和声、织体、曲式、配器与发展关系；不要写 Alda，也不要手算或提交任何绝对拍数。请恰好使用 4 个段落和 3–4 个声部形成完整曲式，theme 与 development 各分配恰好 2 个段落；仅用正 length_weight 表达段落相对比例。instrument 必须使用 Alda stock instrument 的安全名称，例如 flute、violin、cello 或 piano。",
+        "你是唯一的 Composer。像音乐家一样设计全曲的速度、拍号、乐句网格、主题、和声、织体、曲式、配器与发展关系；不要写 Alda，也不要手算或提交任何绝对拍数。请恰好使用 4 个段落和 3–4 个声部形成完整曲式，theme 与 development 各分配恰好 2 个段落；仅用正 length_weight 表达段落相对比例。instrument 必须使用 Alda stock instrument 的安全名称，例如 flute、violin、cello 或 piano。调用 submit_composer_plan 时直接提交顶层对象，不要包装在 plan 等字段中；顶层必须完整包含 title、tempo_bpm、meter、phrase_grid_bars、parts、motifs、sections。",
         format!(
             "共同任务如下，目标时长约 {duration} 秒。宿主会按你的 tempo、meter、phrase_grid_bars 和相对权重确定性计算只读段落预算：\n\n{task}"
         ),

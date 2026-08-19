@@ -9,7 +9,7 @@ use crate::command::{
     AldaAction, ConfigAction, ExportFormat, ProjectAction, ScoreTarget, UserAction, help,
 };
 use crate::config::ModelConfig;
-use crate::conversation::{ConversationMessage, ConversationState};
+use crate::conversation::{Conversation, ConversationMessage, ConversationRole, ConversationState};
 use crate::deepseek::{ChatError, DeepSeekClient};
 use crate::instructions::{
     CompiledInstructions, CreationMode, DurationConstraint, ProjectPreferences,
@@ -607,11 +607,12 @@ impl Application {
         } else {
             None
         };
+        let requirement = composition_ab_requirement(self.project.conversation(), &prompt);
         let task = existing_score.map_or_else(
-            || prompt.clone(),
+            || requirement.clone(),
             |score| {
                 format!(
-                    "用户本轮要求：\n{prompt}\n\n现有完整 Alda 乐谱如下。请保留要求中未被修改的音乐意图，并生成完整替换候选：\n```alda\n{score}\n```"
+                    "用户要求：\n{requirement}\n\n现有完整 Alda 乐谱如下。请保留要求中未被修改的音乐意图，并生成完整替换候选：\n```alda\n{score}\n```"
                 )
             },
         );
@@ -1268,6 +1269,34 @@ fn render_versions(view: &ProjectView) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+fn composition_ab_requirement(conversation: &Conversation, prompt: &str) -> String {
+    if conversation.state() != ConversationState::RequestPending {
+        return prompt.to_string();
+    }
+    let mut requirements = conversation
+        .messages()
+        .iter()
+        .rev()
+        .take_while(|message| message.role == ConversationRole::User)
+        .filter_map(|message| message.content.as_deref())
+        .collect::<Vec<_>>();
+    requirements.reverse();
+    if requirements.last().copied() != Some(prompt) {
+        requirements.push(prompt);
+    }
+    if requirements.len() == 1 {
+        return requirements[0].to_string();
+    }
+    let items = requirements
+        .iter()
+        .enumerate()
+        .map(|(index, requirement)| format!("{}. {requirement}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("以下条目属于同一项尚未完成的创作请求，后续条目用于补充或重试前文：\n\n{items}")
+}
+
 fn render_config(view: &ProjectView) -> String {
     format!(
         "Agent 模式：{}\n创作模式：{}\n目标时长：{}\n包含乐器：{}\n排除乐器：{}\n内建工作流：builtin:progressive-composition\nAdvisory Skills：{}\n模型名称：{}\nAPI Base URL：{}\n模型密钥：{}",
@@ -1371,6 +1400,21 @@ mod tests {
             explicit_duration_secs("目标时长 3 分钟，开头 30 秒只用弦乐"),
             Some(DurationConstraint::exact(180.0))
         );
+    }
+
+    #[test]
+    fn composition_ab_retry_keeps_the_unfinished_requirement() {
+        let mut conversation = Conversation::default();
+        conversation.add_user_message("根据完整故事创作五分钟主题曲".to_string());
+        conversation.set_state(ConversationState::RequestPending);
+
+        assert_eq!(
+            composition_ab_requirement(&conversation, "根据完整故事创作五分钟主题曲"),
+            "根据完整故事创作五分钟主题曲"
+        );
+        let retry = composition_ab_requirement(&conversation, "重试原要求");
+        assert!(retry.contains("根据完整故事创作五分钟主题曲"));
+        assert!(retry.contains("重试原要求"));
     }
 
     #[test]
