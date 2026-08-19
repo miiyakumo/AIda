@@ -162,6 +162,35 @@ pub enum WorkingScoreKind {
     Candidate,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentMode {
+    #[default]
+    Single,
+    CompositionAb,
+}
+
+impl std::fmt::Display for AgentMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single => formatter.write_str("single"),
+            Self::CompositionAb => formatter.write_str("composition-ab"),
+        }
+    }
+}
+
+impl std::str::FromStr for AgentMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim() {
+            "single" => Ok(Self::Single),
+            "composition-ab" => Ok(Self::CompositionAb),
+            other => bail!("无效的 Agent 模式: {other}（应为 single 或 composition-ab）"),
+        }
+    }
+}
+
 impl std::fmt::Display for WorkingScoreKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -193,6 +222,8 @@ pub struct PendingRevision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub project_name: String,
+    #[serde(default)]
+    agent_mode: AgentMode,
     #[serde(default)]
     instruction_profile: InstructionProfile,
     #[serde(flatten)]
@@ -234,6 +265,7 @@ impl Project {
         fs::create_dir_all(root.join("exports")).context("无法创建 exports 目录")?;
         let project = Self {
             project_name: project_name.to_string(),
+            agent_mode: AgentMode::default(),
             instruction_profile: InstructionProfile::default(),
             preferences: ProjectPreferences::default(),
             current_version: 0,
@@ -287,6 +319,16 @@ impl Project {
     #[must_use]
     pub fn mode(&self) -> CreationMode {
         self.preferences.mode
+    }
+
+    #[must_use]
+    pub const fn agent_mode(&self) -> AgentMode {
+        self.agent_mode
+    }
+
+    pub fn configure_agent_mode(&mut self, mode: AgentMode) -> Result<()> {
+        self.agent_mode = mode;
+        self.write_metadata()
     }
 
     #[must_use]
@@ -1294,6 +1336,22 @@ mod tests {
             reloaded.versions().get(&1).unwrap().checks[0].status,
             CheckStatus::Pass
         );
+    }
+
+    #[test]
+    fn agent_mode_defaults_to_single_and_persists() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut project = Project::load_or_create(root.clone(), "test", "").unwrap();
+        assert_eq!(project.agent_mode(), AgentMode::Single);
+
+        project
+            .configure_agent_mode(AgentMode::CompositionAb)
+            .unwrap();
+        drop(project);
+
+        let project = Project::load_or_create(root, "ignored", "").unwrap();
+        assert_eq!(project.agent_mode(), AgentMode::CompositionAb);
     }
 
     #[test]

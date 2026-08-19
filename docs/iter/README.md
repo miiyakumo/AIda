@@ -28,4 +28,4 @@ description：对比两次五分钟运行、结构机制效果、剩余作曲问
 description：验证声明式段落、Worker Alda 片段、无回跳组装和真实解析时间探针的首个纵切原型。
 
 [Composer–Worker–Reviewer 真实 A/B](composer-worker-reviewer-ab/README.md)
-description：保存任务专用角色需求、失败演进、成功配对事实和以原生 Alda 加薄 Harness 为核心的最终设计。
+description：保存角色 A/B 证据、原生 Alda 薄 Harness 设计及可选 composition-ab 主程序模式的接入状态。

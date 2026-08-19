@@ -1,112 +1,45 @@
 mod domain;
 mod protocol;
 
-use alda_agent::agent::{Agent, CreationRequest, RunPolicy};
-use alda_agent::alda::{AldaRunner, ScoreInfo, find_alda};
-use alda_agent::audio::{ArtifactReport, AudioRenderer};
-use alda_agent::composition::{
-    SectionArtifact, TimelineVerification, assemble_sections, verify_timeline,
-};
-use alda_agent::config::ModelConfig;
-use alda_agent::deepseek::DeepSeekClient;
-use alda_agent::instructions::{
-    CompiledInstructions, CreationMode, DurationConstraint, InstructionProfile, ProjectPreferences,
-};
-use alda_agent::skills::SkillCatalog;
+use crate::agent::GenerationStats;
+use crate::alda::{AldaCheck, AldaRunner, CheckStatus, ScoreInfo};
+use crate::audio::AudioRenderer;
+use crate::composition::{SectionArtifact, assemble_sections, verify_timeline};
+use crate::deepseek::DeepSeekClient;
+use crate::instructions::DurationConstraint;
+use crate::project::{FormPlan, FormSection, MaterialAction, SectionEnergy};
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 use domain::{
     BudgetCompilation, ComposerPlan, ReviewReport, SectionFamily, WorkerSubmission, validate_review,
 };
 use protocol::{RoleSession, RoleStats};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::Path;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "composition-ab",
-    about = "隔离运行单 Agent 与角色工作流 A/B 实验"
-)]
-struct Args {
-    /// 两个实验臂共同使用的创作任务文件。
-    #[arg(short, long)]
-    file: PathBuf,
-    /// 目标时长（秒）。
-    #[arg(long, default_value_t = 300.0)]
-    duration: f64,
-    /// 新建的实验输出目录；为保护已有产物，不允许覆盖。
-    #[arg(short, long)]
-    output: PathBuf,
-    /// model.json 所在目录。
-    #[arg(long, default_value = ".")]
-    config_root: PathBuf,
+#[derive(Debug)]
+pub struct CompositionAbResult {
+    _directory: tempfile::TempDir,
+    pub alda_code: String,
+    pub checks: Vec<AldaCheck>,
+    pub form_plan: FormPlan,
+    pub summary: String,
+    pub stats: GenerationStats,
+    midi_path: std::path::PathBuf,
+    wav_path: std::path::PathBuf,
 }
 
-#[derive(Serialize)]
-struct ExperimentReport {
-    task: String,
-    task_sha256: String,
-    target_duration_secs: f64,
-    model: String,
-    base_url: String,
-    run_order: [&'static str; 2],
-    baseline: ArmOutcome<BaselineReport>,
-    roles: ArmOutcome<RolesReport>,
-}
-
-#[derive(Serialize)]
-struct ArmOutcome<T: Serialize> {
-    success: bool,
-    elapsed_secs: f64,
-    result: Option<T>,
-    error: Option<String>,
-}
-
-impl<T: Serialize> ArmOutcome<T> {
-    fn from_result(result: Result<T>, elapsed_secs: f64) -> Self {
-        match result {
-            Ok(result) => Self {
-                success: true,
-                elapsed_secs,
-                result: Some(result),
-                error: None,
-            },
-            Err(error) => Self {
-                success: false,
-                elapsed_secs,
-                result: None,
-                error: Some(format!("{error:#}")),
-            },
-        }
+impl CompositionAbResult {
+    #[must_use]
+    pub fn midi_path(&self) -> &Path {
+        &self.midi_path
     }
-}
 
-#[derive(Serialize)]
-struct BaselineReport {
-    elapsed_secs: f64,
-    stats: alda_agent::agent::GenerationStats,
-    interpretation: String,
-    checks: Vec<alda_agent::alda::AldaCheck>,
-    artifact: ArtifactReport,
-}
-
-#[derive(Serialize)]
-struct RolesReport {
-    elapsed_secs: f64,
-    budget: BudgetCompilation,
-    composer_stats: RoleStats,
-    theme_worker_stats: RoleStats,
-    development_worker_stats: RoleStats,
-    reviewer_stats: RoleStats,
-    timeline: TimelineVerification,
-    score: ScoreInfo,
-    checks: Vec<alda_agent::alda::AldaCheck>,
-    artifact: ArtifactReport,
-    review: ReviewReport,
+    #[must_use]
+    pub fn wav_path(&self) -> &Path {
+        &self.wav_path
+    }
 }
 
 struct WorkerResult {
@@ -123,174 +56,26 @@ enum WorkerOutcome {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    validate_args(&args)?;
-    let task = fs::read_to_string(&args.file)
-        .with_context(|| format!("无法读取任务文件 {}", args.file.display()))?;
-    if task.trim().is_empty() {
-        bail!("任务文件不能为空");
-    }
-    create_output_tree(&args.output)?;
-    fs::write(args.output.join("task.txt"), &task)?;
-
-    let config = ModelConfig::load(&args.config_root)?.resolve()?;
-    let alda_path = find_alda().context("未找到 alda")?;
-    let alda = AldaRunner::new(alda_path);
-    let renderer = AudioRenderer::discover()?;
-    let client = DeepSeekClient::new(
-        config.api_key.clone(),
-        config.base_url.clone(),
-        config.model.clone(),
-    )?;
-
-    let task_sha256 = format!("{:x}", Sha256::digest(task.as_bytes()));
-    let baseline_started = Instant::now();
-    let baseline_result = run_baseline(
-        &task,
-        args.duration,
-        &args.output.join("baseline"),
-        client.clone(),
-        alda.clone(),
-        renderer.clone(),
-    )
-    .await;
-    let baseline =
-        ArmOutcome::from_result(baseline_result, baseline_started.elapsed().as_secs_f64());
-    let roles_started = Instant::now();
-    let roles_result = run_roles(
-        &task,
-        args.duration,
-        &args.output.join("roles"),
-        client,
-        alda,
-        renderer,
-    )
-    .await;
-    let roles = ArmOutcome::from_result(roles_result, roles_started.elapsed().as_secs_f64());
-    let complete = baseline.success && roles.success;
-    write_json(
-        &args.output.join("report.json"),
-        &ExperimentReport {
-            task,
-            task_sha256,
-            target_duration_secs: args.duration,
-            model: config.model,
-            base_url: config.base_url,
-            run_order: ["baseline", "roles"],
-            baseline,
-            roles,
-        },
-    )?;
-    if !complete {
-        bail!(
-            "A/B 至少一个实验臂失败；已将可审计结果保存到 {}",
-            args.output.join("report.json").display()
-        );
-    }
-    Ok(())
-}
-
-fn validate_args(args: &Args) -> Result<()> {
-    if !args.duration.is_finite() || args.duration <= 0.0 {
-        bail!("duration 必须是正有限数");
-    }
-    if args.output.exists() {
-        bail!("输出目录已存在，拒绝覆盖：{}", args.output.display());
-    }
-    Ok(())
-}
-
-fn create_output_tree(root: &Path) -> Result<()> {
-    for child in ["baseline", "roles"] {
-        fs::create_dir_all(root.join(child))?;
-    }
-    Ok(())
-}
-
-async fn run_baseline(
-    task: &str,
-    duration: f64,
-    output: &Path,
-    client: DeepSeekClient,
-    alda: AldaRunner,
-    renderer: AudioRenderer,
-) -> Result<BaselineReport> {
-    let preferences = preferences(duration);
-    let catalog = SkillCatalog::discover(None, None)?;
-    let instructions =
-        CompiledInstructions::compile(&catalog, &InstructionProfile::default(), &preferences)?;
-    let agent = Agent::new(client, alda.clone()).with_audio_renderer(renderer.clone());
-    let started = Instant::now();
-    let result = agent
-        .create_candidate(CreationRequest {
-            source_material: task.to_string(),
-            instructions: "请直接完成一首完整曲目并提交 candidate。".to_string(),
-            compiled_instructions: instructions,
-            run_policy: RunPolicy {
-                max_elapsed: Duration::from_secs(30 * 60),
-                max_model_calls: 24,
-                max_protocol_recoveries: 8,
-            },
-        })
-        .await?;
-    let elapsed_secs = started.elapsed().as_secs_f64();
-    if !result.success {
-        if let Some(source) = result.alda_code.as_deref() {
-            fs::write(output.join("failed-score.alda"), source)?;
-        }
-        write_json(
-            &output.join("failure.json"),
-            &json!({
-                "elapsed_secs": elapsed_secs,
-                "stats": result.stats,
-                "kind": format!("{:?}", result.kind),
-                "interpretation": result.interpretation,
-                "checks": result.checks,
-            }),
-        )?;
-        bail!("baseline 未生成通过检查的完整候选");
-    }
-    let source = result
-        .alda_code
-        .as_deref()
-        .context("baseline 缺少 Alda 源码")?;
-    let score_path = output.join("score.alda");
-    fs::write(&score_path, source)?;
-    let staged = result
-        .candidate_artifacts
-        .as_ref()
-        .context("baseline 成功候选缺少已验证的 MIDI/WAV")?;
-    let midi_path = output.join("score.mid");
-    let wav_path = output.join("score.wav");
-    fs::copy(staged.midi_path(), &midi_path)?;
-    fs::copy(staged.wav_path(), &wav_path)?;
-    let mut artifact = staged.report().clone();
-    artifact.alda_path = score_path;
-    artifact.midi_path = midi_path;
-    artifact.wav_path = wav_path;
-    Ok(BaselineReport {
-        elapsed_secs,
-        stats: result.stats,
-        interpretation: result.interpretation,
-        checks: result.checks,
-        artifact,
-    })
-}
-
 #[allow(clippy::too_many_lines)]
-async fn run_roles(
+pub async fn run(
     task: &str,
     duration: f64,
-    output: &Path,
+    included_instruments: &[String],
+    excluded_instruments: &[String],
     client: DeepSeekClient,
     alda: AldaRunner,
     renderer: AudioRenderer,
-) -> Result<RolesReport> {
-    let started = Instant::now();
+) -> Result<CompositionAbResult> {
+    if task.trim().is_empty() {
+        bail!("composition-ab 创作要求不能为空");
+    }
+    if !duration.is_finite() || duration <= 0.0 {
+        bail!("composition-ab 目标时长必须是正有限数");
+    }
+    let directory = tempfile::tempdir()?;
+    let output = directory.path();
     let mut composer = composer_session(client.clone(), task, duration);
-    let plan = match composer.submit(validate_experiment_plan).await {
+    let plan = match composer.submit(validate_plan).await {
         Ok(plan) => plan,
         Err(error) => {
             write_role_failure(
@@ -344,23 +129,20 @@ async fn run_roles(
     let assembly = assemble_sections(&spec, &artifacts)?;
     fs::write(output.join("probe.alda"), &assembly.probe_source)?;
     let probe_score = alda.parse(&output.join("probe.alda"))?;
-    let timeline = verify_timeline(&spec, &assembly, &probe_score)?;
+    let _timeline = verify_timeline(&spec, &assembly, &probe_score)?;
     let score_path = output.join("score.alda");
     fs::write(&score_path, &assembly.alda_source)?;
     let score = alda.parse(&score_path)?;
     let checks = alda.validate(
         &score_path,
-        &[],
-        &[],
+        included_instruments,
+        excluded_instruments,
         Some(DurationConstraint::exact(duration)),
         10.0,
     );
-    if checks
-        .iter()
-        .any(|check| check.status == alda_agent::alda::CheckStatus::Fail)
-    {
+    if checks.iter().any(|check| check.status == CheckStatus::Fail) {
         write_json(&output.join("candidate-checks.json"), &checks)?;
-        bail!("角色工作流完整候选未通过与 baseline 等价的 Alda/时长检查");
+        bail!("composition-ab 完整候选未通过项目 Alda/时长检查");
     }
 
     let mut reviewer = reviewer_session(client, &plan, &budget, &assembly.alda_source, &score)?;
@@ -387,37 +169,44 @@ async fn run_roles(
             "submission": review,
         }),
     )?;
-    let artifact = renderer
+    let midi_path = output.join("score.mid");
+    let wav_path = output.join("score.wav");
+    renderer
         .render_score_async(
             alda,
-            score_path,
-            output.join("score.mid"),
-            output.join("score.wav"),
+            score_path.clone(),
+            midi_path.clone(),
+            wav_path.clone(),
         )
         .await?;
     if !review.approved {
         bail!("只读 Reviewer 提出了阻断性问题；保留已渲染产物供审计");
     }
 
-    Ok(RolesReport {
-        elapsed_secs: started.elapsed().as_secs_f64(),
-        budget,
-        composer_stats: composer.stats(),
-        theme_worker_stats: theme.stats,
-        development_worker_stats: development.stats,
-        reviewer_stats: reviewer.stats(),
-        timeline,
-        score,
+    let stats = combined_stats([
+        composer.stats(),
+        theme.stats,
+        development.stats,
+        reviewer.stats(),
+    ]);
+    let form_plan = project_form_plan(&plan, &budget);
+    let summary = format!("{}（Reviewer：{}）", plan.title, review.summary);
+    Ok(CompositionAbResult {
+        _directory: directory,
+        alda_code: assembly.alda_source,
         checks,
-        artifact,
-        review,
+        form_plan,
+        summary,
+        stats,
+        midi_path,
+        wav_path,
     })
 }
 
-fn validate_experiment_plan(plan: &ComposerPlan) -> Result<()> {
+fn validate_plan(plan: &ComposerPlan) -> Result<()> {
     plan.validate()?;
     if plan.sections.len() != 4 || !(3..=4).contains(&plan.parts.len()) {
-        bail!("本次 A/B 的 Composer 必须提交恰好 4 个段落和 3–4 个声部");
+        bail!("composition-ab 的 Composer 必须提交恰好 4 个段落和 3–4 个声部");
     }
     for family in [SectionFamily::Theme, SectionFamily::Development] {
         if plan
@@ -427,10 +216,62 @@ fn validate_experiment_plan(plan: &ComposerPlan) -> Result<()> {
             .count()
             != 2
         {
-            bail!("本次 A/B 的 theme 与 development 必须各有恰好 2 个段落");
+            bail!("composition-ab 的 theme 与 development 必须各有恰好 2 个段落");
         }
     }
     Ok(())
+}
+
+fn combined_stats(stats: [RoleStats; 4]) -> GenerationStats {
+    GenerationStats {
+        model_calls: stats.iter().map(|value| value.model_calls).sum(),
+        tool_turns: 0,
+        protocol_recoveries: stats.iter().map(|value| value.protocol_recoveries).sum(),
+        submissions: stats.len() + stats.iter().map(|value| value.revisions).sum::<usize>(),
+    }
+}
+
+fn project_form_plan(plan: &ComposerPlan, budget: &BudgetCompilation) -> FormPlan {
+    let target_duration_secs = budget.planned_duration_secs;
+    let last_index = plan.sections.len() - 1;
+    let sections = plan
+        .sections
+        .iter()
+        .zip(&budget.sections)
+        .enumerate()
+        .map(|(index, (section, budget))| FormSection {
+            id: section.id.clone(),
+            target_start_secs: beat_seconds(budget.planned_start_beats, plan.tempo_bpm),
+            target_end_secs: beat_seconds(budget.planned_end_beats, plan.tempo_bpm),
+            function: format!(
+                "{}；{}；{}",
+                section.harmonic_plan, section.texture, section.material_plan
+            ),
+            material_action: if index == 0 {
+                MaterialAction::Introduce
+            } else if index == last_index {
+                MaterialAction::Close
+            } else if section.family == SectionFamily::Development {
+                MaterialAction::Develop
+            } else {
+                MaterialAction::Reprise
+            },
+            energy: match index {
+                0 => SectionEnergy::Low,
+                1 => SectionEnergy::Medium,
+                index if index == last_index => SectionEnergy::Peak,
+                _ => SectionEnergy::High,
+            },
+        })
+        .collect();
+    FormPlan {
+        target_duration_secs,
+        sections,
+    }
+}
+
+fn beat_seconds(beat: crate::composition::Beat, tempo_bpm: u32) -> f64 {
+    f64::from(beat.numerator) / f64::from(beat.denominator) * 60.0 / f64::from(tempo_bpm)
 }
 
 fn write_worker_outcome(output: &Path, family: &str, outcome: &WorkerOutcome) -> Result<()> {
@@ -494,7 +335,7 @@ async fn run_worker(
         }
     };
     let mut submission = match session
-        .submit(|value: &WorkerSubmission| validate_experiment_worker(value, &plan, family))
+        .submit(|value: &WorkerSubmission| validate_worker(value, &plan, family))
         .await
     {
         Ok(submission) => submission,
@@ -524,7 +365,7 @@ async fn run_worker(
                 .expect("JSON value serialization cannot fail")
         ));
         submission = match session
-            .submit(|value: &WorkerSubmission| validate_experiment_worker(value, &plan, family))
+            .submit(|value: &WorkerSubmission| validate_worker(value, &plan, family))
             .await
         {
             Ok(submission) => submission,
@@ -550,7 +391,7 @@ async fn run_worker(
     })
 }
 
-fn validate_experiment_worker(
+fn validate_worker(
     submission: &WorkerSubmission,
     plan: &ComposerPlan,
     family: SectionFamily,
@@ -562,7 +403,7 @@ fn validate_experiment_worker(
             .iter()
             .any(|part| part.alda_sequence_body.contains(['<', '>']))
     }) {
-        bail!("本次 A/B 的反复乐句禁止使用会跨反复累积的 < 或 >；请改用绝对 o4/o5/o6")
+        bail!("composition-ab 的反复乐句禁止使用会跨反复累积的 < 或 >；请改用绝对 o4/o5/o6")
     }
     Ok(())
 }
@@ -689,7 +530,7 @@ fn required_worker_template(
     }))
 }
 
-fn beat_label(beat: alda_agent::composition::Beat) -> String {
+fn beat_label(beat: crate::composition::Beat) -> String {
     if beat.denominator == 1 {
         beat.numerator.to_string()
     } else {
@@ -698,8 +539,8 @@ fn beat_label(beat: alda_agent::composition::Beat) -> String {
 }
 
 fn exact_repeat_count(
-    duration: alda_agent::composition::Beat,
-    phrase: alda_agent::composition::Beat,
+    duration: crate::composition::Beat,
+    phrase: crate::composition::Beat,
 ) -> Result<u32> {
     let numerator = u64::from(duration.numerator)
         .checked_mul(u64::from(phrase.denominator))
@@ -734,15 +575,6 @@ fn reviewer_session(
         "提交只读结构化审查报告。",
         review_schema(),
     ))
-}
-
-fn preferences(duration: f64) -> ProjectPreferences {
-    ProjectPreferences {
-        mode: CreationMode::Full,
-        target_duration_secs: Some(DurationConstraint::exact(duration)),
-        included_instruments: Vec::new(),
-        excluded_instruments: Vec::new(),
-    }
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -813,18 +645,6 @@ fn review_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn output_directory_must_be_new() {
-        let directory = tempfile::tempdir().unwrap();
-        let args = Args {
-            file: PathBuf::from("task.txt"),
-            duration: 300.0,
-            output: directory.path().to_path_buf(),
-            config_root: PathBuf::from("."),
-        };
-        assert!(validate_args(&args).is_err());
-    }
 
     #[test]
     fn role_schemas_are_objects() {

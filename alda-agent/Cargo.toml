@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
+autobins = false
+
+[[bin]]
+name = "alda-agent"
+path = "src/main.rs"
 
 [lints.rust]
 unsafe_code = "warn"

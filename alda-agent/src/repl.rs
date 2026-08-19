@@ -2,8 +2,8 @@ use crate::agent::{AgentEvent, AgentReporter};
 use crate::alda::{AldaCheck, CancellationToken, CheckStatus};
 use crate::application::{ActionResult, Application, ProjectView};
 use crate::command::{
-    ALDA_COMMANDS, CONFIG_COMMANDS, PROJECT_COMMANDS, SKILL_COMMANDS, TOP_LEVEL_COMMANDS,
-    contains_inline_api_key, parse,
+    AGENT_MODES, ALDA_COMMANDS, CONFIG_COMMANDS, PROJECT_COMMANDS, SKILL_COMMANDS,
+    TOP_LEVEL_COMMANDS, contains_inline_api_key, parse,
 };
 use crate::command::{ProjectAction, UserAction};
 use anyhow::{Context, Result};
@@ -378,6 +378,7 @@ fn project_summary(view: &ProjectView) -> String {
             "完整曲目"
         }
         .to_string(),
+        view.agent_mode.clone(),
     ]
     .join(" · ")
 }
@@ -700,7 +701,9 @@ impl Completer for CommandCompleter {
                 .map(|candidate| suggestion(candidate, lead, pos))
                 .collect();
         }
-        let (candidates, start) = if let Some(rest) = prefix.strip_prefix("/alda ") {
+        let (candidates, start) = if let Some(rest) = prefix.strip_prefix("/agent ") {
+            (AGENT_MODES, pos - rest.len())
+        } else if let Some(rest) = prefix.strip_prefix("/alda ") {
             (ALDA_COMMANDS, pos - rest.len())
         } else if let Some(rest) = prefix.strip_prefix("/project skills ") {
             (SKILL_COMMANDS, pos - rest.len())
@@ -818,6 +821,7 @@ mod tests {
             first_request: None,
             current_version: Some(2),
             working_score: None,
+            agent_mode: "single".into(),
             versions: vec![],
             mode: "full".into(),
             target_duration_secs: Some(crate::instructions::DurationConstraint::exact(180.0)),
@@ -835,7 +839,10 @@ mod tests {
 
     #[test]
     fn summary_keeps_project_context() {
-        assert_eq!(project_summary(&project_view()), "poem · v2 · 完整曲目");
+        assert_eq!(
+            project_summary(&project_view()),
+            "poem · v2 · 完整曲目 · single"
+        );
     }
 
     #[test]
@@ -874,7 +881,7 @@ mod tests {
 
         assert_eq!(
             prompt.render_prompt_left(),
-            "\n项目 · poem · v2 · 完整曲目\n状态 · 已发起播放 v1 · /alda stop 停止\n"
+            "\n项目 · poem · v2 · 完整曲目 · single\n状态 · 已发起播放 v1 · /alda stop 停止\n"
         );
         assert_eq!(prompt.render_prompt_indicator(PromptEditMode::Emacs), "› ");
         assert_eq!(prompt.render_prompt_multiline_indicator(), "· ");

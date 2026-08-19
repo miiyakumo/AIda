@@ -62,6 +62,9 @@ enum ControlAction {
     },
     ProjectAccept,
     ProjectDiscard,
+    AgentMode {
+        mode: String,
+    },
     ConfigShow,
     ConfigMode {
         mode: String,
@@ -155,6 +158,7 @@ impl ControlAction {
             Self::ProjectAdopt { path } => UserAction::Project(ProjectAction::Adopt(path)),
             Self::ProjectAccept => UserAction::Project(ProjectAction::Accept),
             Self::ProjectDiscard => UserAction::Project(ProjectAction::Discard),
+            Self::AgentMode { mode } => UserAction::Project(ProjectAction::AgentMode(Some(mode))),
             Self::ConfigShow => UserAction::Project(ProjectAction::Config(ConfigAction::Show)),
             Self::ConfigMode { mode } => {
                 UserAction::Project(ProjectAction::Config(ConfigAction::Mode(mode)))

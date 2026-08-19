@@ -11,8 +11,10 @@ use crate::command::{
 use crate::config::ModelConfig;
 use crate::conversation::{ConversationMessage, ConversationState};
 use crate::deepseek::{ChatError, DeepSeekClient};
-use crate::instructions::{CompiledInstructions, DurationConstraint, ProjectPreferences};
-use crate::project::{CheckRecord, Project, WorkingScoreKind};
+use crate::instructions::{
+    CompiledInstructions, CreationMode, DurationConstraint, ProjectPreferences,
+};
+use crate::project::{AgentMode, CheckRecord, Project, WorkingScoreKind};
 use crate::skills::{QualifiedSkillId, SkillCatalog, SkillKind};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -79,6 +81,7 @@ pub struct ProjectView {
     pub first_request: Option<String>,
     pub current_version: Option<u32>,
     pub working_score: Option<String>,
+    pub agent_mode: String,
     pub versions: Vec<VersionView>,
     pub mode: String,
     pub target_duration_secs: Option<DurationConstraint>,
@@ -241,6 +244,7 @@ impl Application {
                 .project
                 .working_score()
                 .map(|working| working.kind.to_string()),
+            agent_mode: self.project.agent_mode().to_string(),
             versions: self
                 .project
                 .versions()
@@ -340,6 +344,19 @@ impl Application {
 
     #[allow(clippy::too_many_lines)]
     async fn execute_agent(
+        &mut self,
+        prompt: String,
+        reporter: &mut impl AgentReporter,
+    ) -> Result<ActionResult> {
+        if self.project.agent_mode() == AgentMode::CompositionAb {
+            self.execute_composition_ab(prompt, reporter).await
+        } else {
+            self.execute_single_agent(prompt, reporter).await
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_single_agent(
         &mut self,
         prompt: String,
         reporter: &mut impl AgentReporter,
@@ -552,6 +569,114 @@ impl Application {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
+    async fn execute_composition_ab(
+        &mut self,
+        prompt: String,
+        reporter: &mut impl AgentReporter,
+    ) -> Result<ActionResult> {
+        let config = ModelConfig::load(self.project.root()).and_then(|config| config.resolve())?;
+        let mut preferences = self.project.preferences().clone();
+        let explicit_duration = explicit_duration_secs(&prompt);
+        if let Some(duration) = explicit_duration {
+            preferences.target_duration_secs = Some(duration);
+        }
+        if preferences.mode != CreationMode::Full {
+            bail!("composition-ab 只生成完整曲目；请先使用 /project config mode full");
+        }
+        let duration = match preferences.target_duration_secs {
+            Some(DurationConstraint::Exact(seconds)) => seconds,
+            Some(DurationConstraint::Range { min_secs, max_secs }) => min_secs.midpoint(max_secs),
+            None => bail!("composition-ab 需要目标时长；请先使用 /project config duration SECONDS"),
+        };
+        let runner = self
+            .alda
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("未找到 alda；Agent 不能绕过校验保存候选"))?;
+        let renderer = if let Some(error) = &self.audio_renderer_preflight_error {
+            bail!("完整候选音频渲染环境不可用：{error}");
+        } else if let Some(renderer) = &self.audio_renderer {
+            renderer.clone()
+        } else {
+            AudioRenderer::discover().context("完整候选需要先配置可用的 FluidSynth 与 SoundFont")?
+        };
+        let existing_score = if self.project.working_score().is_some() {
+            Some(self.project.working_code()?)
+        } else if self.project.current_version() > 0 {
+            Some(self.project.current_code()?)
+        } else {
+            None
+        };
+        let task = existing_score.map_or_else(
+            || prompt.clone(),
+            |score| {
+                format!(
+                    "用户本轮要求：\n{prompt}\n\n现有完整 Alda 乐谱如下。请保留要求中未被修改的音乐意图，并生成完整替换候选：\n```alda\n{score}\n```"
+                )
+            },
+        );
+        let previous_working_code = self
+            .project
+            .working_score()
+            .map(|_| self.project.working_code())
+            .transpose()?;
+        if explicit_duration.is_some() {
+            self.project.configure(&preferences)?;
+        }
+        self.project
+            .prepare_user_message_with_requirement(&prompt, true)?;
+        if !self.privacy_shown {
+            reporter.report(crate::agent::AgentEvent::PrivacyNotice);
+            self.privacy_shown = true;
+        }
+        reporter.report(crate::agent::AgentEvent::RoundStarted { attempt: 1 });
+        let client = DeepSeekClient::new(config.api_key, config.base_url, config.model)?;
+        let result = crate::composition_ab::run(
+            &task,
+            duration,
+            &preferences.included_instruments,
+            &preferences.excluded_instruments,
+            client,
+            runner,
+            renderer,
+        )
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.last_model_failure = ModelFailure::from_error(&error);
+                return Err(error);
+            }
+        };
+        reporter.report(crate::agent::AgentEvent::ValidationCompleted(
+            result.checks.clone(),
+        ));
+        self.project.save_rendered_candidate_with_plan(
+            &result.alda_code,
+            &result.summary,
+            &result.checks,
+            result.midi_path(),
+            result.wav_path(),
+            Some(result.form_plan.clone()),
+        )?;
+        self.project
+            .finish_agent_turn(result.summary.clone(), ConversationState::Ready)?;
+        self.last_model_failure = None;
+        self.model_request_succeeded = true;
+        let working_score_changed =
+            previous_working_code.as_deref() != self.project.working_code().ok().as_deref();
+        Ok(ActionResult::AgentCompleted {
+            kind: AgentResultKind::Candidate,
+            success: true,
+            rounds: result.stats.submissions,
+            stats: result.stats,
+            needs_input: false,
+            recovery_checkpoint: None,
+            working_score_changed,
+            working_score_status: render_working_status(&self.project),
+        })
+    }
+
     async fn execute_alda(&mut self, action: AldaAction) -> Result<ActionResult> {
         match action {
             AldaAction::Play(target) => {
@@ -712,6 +837,20 @@ impl Application {
                 Ok(ActionResult::Message(
                     "✓ 已放弃工作乐谱；当前有效版本未改变".to_string(),
                 ))
+            }
+            ProjectAction::AgentMode(mode) => {
+                if let Some(mode) = mode {
+                    self.project
+                        .configure_agent_mode(mode.parse::<AgentMode>()?)?;
+                    Ok(ActionResult::Message(format!(
+                        "✓ Agent 模式已切换为 {mode}"
+                    )))
+                } else {
+                    Ok(ActionResult::Message(format!(
+                        "Agent 模式：{}",
+                        self.project.agent_mode()
+                    )))
+                }
             }
             ProjectAction::Config(config) => self.configure(config),
         }
@@ -1131,7 +1270,8 @@ fn render_versions(view: &ProjectView) -> String {
 }
 fn render_config(view: &ProjectView) -> String {
     format!(
-        "模式：{}\n目标时长：{}\n包含乐器：{}\n排除乐器：{}\n内建工作流：builtin:progressive-composition\nAdvisory Skills：{}\n模型名称：{}\nAPI Base URL：{}\n模型密钥：{}",
+        "Agent 模式：{}\n创作模式：{}\n目标时长：{}\n包含乐器：{}\n排除乐器：{}\n内建工作流：builtin:progressive-composition\nAdvisory Skills：{}\n模型名称：{}\nAPI Base URL：{}\n模型密钥：{}",
+        view.agent_mode,
         view.mode,
         view.target_duration_secs
             .map_or_else(|| "无".to_string(), |value| value.to_string()),

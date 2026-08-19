@@ -54,6 +54,7 @@ pub enum ProjectAction {
     Adopt(PathBuf),
     Accept,
     Discard,
+    AgentMode(Option<String>),
     Config(ConfigAction),
 }
 
@@ -71,7 +72,8 @@ pub enum ConfigAction {
     ApiKey(Option<String>),
 }
 
-pub const TOP_LEVEL_COMMANDS: &[&str] = &["/alda", "/project", "/help", "/quit"];
+pub const TOP_LEVEL_COMMANDS: &[&str] = &["/alda", "/agent", "/project", "/help", "/quit"];
+pub const AGENT_MODES: &[&str] = &["single", "composition-ab"];
 pub const ALDA_COMMANDS: &[&str] = &["play", "stop", "check", "export"];
 pub const PROJECT_COMMANDS: &[&str] = &[
     "instructions",
@@ -101,6 +103,10 @@ pub fn parse(input: &str) -> Result<UserAction> {
         return parse_alda(&words[1..]).map(UserAction::Alda);
     }
     match words.as_slice() {
+        ["/agent"] => Ok(UserAction::Project(ProjectAction::AgentMode(None))),
+        ["/agent", mode @ ("single" | "composition-ab")] => Ok(UserAction::Project(
+            ProjectAction::AgentMode(Some((*mode).to_string())),
+        )),
         ["/quit"] => Ok(UserAction::Quit),
         ["/help", rest @ ..] => Ok(UserAction::Help(
             rest.iter().map(ToString::to_string).collect(),
@@ -257,7 +263,8 @@ fn parse_export(words: &[&str]) -> Result<AldaAction> {
 #[must_use]
 pub fn help(path: &[String]) -> String {
     match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        [] => "自然语言输入用于讨论、规划和发展工作乐谱。\n/alda ...     校验、播放、停止和导出\n/project ...  接受候选、查看版本和修改设置\n/help ...     查看分层帮助\n/quit         退出".to_string(),
+        [] => "自然语言输入用于讨论、规划和发展工作乐谱。\n/agent ...    查看或切换 Agent 工作模式\n/alda ...     校验、播放、停止和导出\n/project ...  接受候选、查看版本和修改设置\n/help ...     查看分层帮助\n/quit         退出".to_string(),
+        ["agent"] => "/agent\n/agent single\n/agent composition-ab".to_string(),
         ["alda"] => "/alda play [VERSION|work]\n/alda stop\n/alda check [VERSION|work]\n/alda check --file PATH\n/alda export [current|work|VERSION] [--format alda|midi|wav|all]".to_string(),
         ["project"] => "/project\n/project instructions\n/project skills [enable|disable QUALIFIED_ID]\n/project accept\n/project discard\n/project versions\n/project switch VERSION\n/project adopt PATH\n/project config ...".to_string(),
         ["project", "skills"] => "/project skills\n/project skills enable user:NAME|project:NAME\n/project skills disable user:NAME|project:NAME".to_string(),
@@ -272,6 +279,10 @@ mod tests {
     use super::*;
     #[test]
     fn parses_grouped_commands_and_rejects_old_ones() {
+        assert_eq!(
+            parse("/agent composition-ab").unwrap(),
+            UserAction::Project(ProjectAction::AgentMode(Some("composition-ab".to_string())))
+        );
         assert_eq!(
             parse("/alda play v2").unwrap(),
             UserAction::Alda(AldaAction::Play(ScoreTarget::Version(Some(2))))

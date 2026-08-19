@@ -1,6 +1,6 @@
 # 段落组装与时间线机制验证
 
-> 状态：首个纵切原型已通过；已接入独立实验入口并完成首轮真实 A/B，尚未接入正式生成循环
+> 状态：首个纵切原型和真实 A/B 已完成；2026-08-19 已接入主程序可选 `composition-ab` 模式
 
 ## 要验证的问题
 
@@ -108,7 +108,8 @@ cargo clippy --manifest-path alda-agent/Cargo.toml --all-targets -- -D warnings
 
 ## 后续结果
 
-原型已接入独立 `composition-ab` 实验入口，固定一个 Composer、两个段落家族 Worker 和只读 Reviewer，且
+原型先接入独立 `composition-ab` 实验入口完成验证，随后进入主程序可选模式；工作流固定一个 Composer、
+两个段落家族 Worker 和只读 Reviewer，且
 没有修改 Project 的单一事实主体。首轮同题真实 A/B 中单 Agent 成功，角色臂的 Composer 在协议恢复后仍只
 声明出 37.14 秒时间线，未进入 Worker。详见
 [Composer–Worker–Reviewer 真实 A/B](../composer-worker-reviewer-ab/README.md)。这说明精确拍数分配应由

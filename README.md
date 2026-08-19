@@ -11,6 +11,7 @@ AIda 是一个面向音乐创作的终端 Agent。用户可以提供意象、叙
 
 - 一次性生成完整曲目或即兴片段；
 - 在增强型滚动 REPL 中创建和继续项目，以自然语言创作、澄清和修改；
+- 默认使用 single-agent，并可按项目切换到 Composer–Worker–Reviewer `composition-ab` 模式；
 - 多行编辑、项目级历史、分层命令补全，以及持续可见的项目与任务状态；
 - 检查 Alda 语法、非空内容、总时长、Marker 引用和包含/排除乐器约束；
 - 自动修正直至校验通过或用户取消，失败时不覆盖当前有效版本，最新失败源码保留为继续修正的检查点；
@@ -69,7 +70,14 @@ cargo run -- --project ../my-music compose --file input.txt --mode improv --outp
 ```
 
 进入 REPL 后可输入 `/help` 查看分组命令：`/alda` 负责播放、校验与导出，`/project` 负责版本和持久
-设置。自然语言输入直接交给 Agent。
+设置。自然语言输入直接交给 Agent。新项目默认使用 single-agent；角色模式用于完整曲目，并需要目标时长：
+
+```console
+/project config duration 300
+/agent composition-ab
+# 输入完整曲目要求
+/agent single
+```
 
 ## 开发验证
 

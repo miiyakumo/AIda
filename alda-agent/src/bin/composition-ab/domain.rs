@@ -1,4 +1,4 @@
-use alda_agent::composition::{Beat, CompositionSpec, PartSpec, SectionArtifact, SectionContract};
+use crate::composition::{Beat, CompositionSpec, PartSpec, SectionArtifact, SectionContract};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

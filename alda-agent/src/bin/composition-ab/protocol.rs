@@ -1,4 +1,4 @@
-use alda_agent::deepseek::{
+use crate::deepseek::{
     DeepSeekClient, FunctionCallArgs, FunctionDef, Message, StreamEvent, Tool, ToolCallMsg,
 };
 use anyhow::{Context, Result, bail};

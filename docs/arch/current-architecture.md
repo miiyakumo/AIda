@@ -1,6 +1,6 @@
 # 当前架构
 
-> 代码基线：启动环境门禁、模型文本流、乐谱诊断与候选音频门禁（2026-08-18）
+> 代码基线：single / composition-ab 双 Agent 模式与统一项目候选闭环（2026-08-19）
 >
 > 本文描述当前源码实际行为。
 
@@ -18,6 +18,7 @@ Shell CLI（main.rs）
     ├── application.rs：动作执行、能力装载、双视图快照
     ├── project.rs + conversation.rs：项目聚合与持久对话
     ├── agent.rs + deepseek.rs：模型生成、事件报告与协议转换
+    ├── composition_ab：Composer、双 Worker、Reviewer 与确定性组装
     ├── alda.rs：解析、校验、播放、停止、MIDI 导出与单操作取消
     └── audio.rs：FluidSynth 渲染、SoundFont 发现和 WAV 信息分析
 ```
@@ -42,8 +43,9 @@ alda-agent doctor [--probe model|alda|all] # 无 probe 时只做本地环境检�
 alda-agent [--name NAME | --project PATH] control
 ```
 
-项目内命令按职责分组：自然语言输入进入 Agent；`/alda` 只执行本地工具动作；`/project` 查看和修改
-持久项目；`/help` 提供分层帮助；`/quit` 退出。旧的扁平命令已删除。
+项目内命令按职责分组：自然语言输入进入当前 Agent 模式；`/agent single|composition-ab` 查看或切换项目级
+工作模式；`/alda` 只执行本地工具动作；`/project` 查看和修改持久项目；`/help` 提供分层帮助；`/quit`
+退出。新项目和未保存该字段的旧项目默认使用 `single`。
 
 ## JSONL 控制面
 
@@ -61,7 +63,7 @@ alda-agent [--name NAME | --project PATH] control
 
 | 分组 | `type` |
 |---|---|
-| Agent | `agent` |
+| Agent | `agent`、`agent_mode` |
 | Alda | `alda_play`、`alda_stop`、`alda_check`、`alda_export` |
 | Project | `project_overview`、`project_instructions`、`project_skills`、`project_skill_enable`、`project_skill_disable`、`project_versions`、`project_switch`、`project_adopt`、`project_accept`、`project_discard` |
 | Config | `config_show`、`config_mode`、`config_duration`、`config_include`、`config_exclude`、`config_model`、`config_url` |
@@ -90,7 +92,7 @@ TTY 的活动输入块分为 `项目 ·`、`状态 ·` 和 `›` 三层。项目
 
 ## 项目聚合与双视图
 
-`Project` 是聚合根，直接持有规范化、强类型的 `ProjectPreferences`、至多一个工作乐谱、至多一个待修正
+`Project` 是聚合根，直接持有强类型 `AgentMode`、规范化 `ProjectPreferences`、至多一个工作乐谱、至多一个待修正
 候选、当前有效版本、线性版本元数据和一条供应商无关的 `Conversation`。持久 Conversation 只保存用户
 消息和成功提交的语义助手消息，以及 `ready`、`awaiting_input`、`revision_available`、`request_pending`
 状态；供应商 tool call、tool result、失败候选源码和模型临时推演只存在于当前模型往返。加载旧项目时会
@@ -171,23 +173,25 @@ Skill 内容只影响模型输入。Alda 校验、工作乐谱写入、候选接
 
 ## 生成与输出边界
 
-`composition.rs` 是尚未接入正式运行时的段落组装纵切：它接收声明式段落契约和按声部拆分的 Alda 片段，
-生成临时探针源码与正式源码，并用真实解析结果核对声部段界和音乐入口。独立的 `composition-ab` 实验二进制
-在此底座上运行单 Agent 与 Composer–Worker–Reviewer 同题 A/B；它不经过正式 CLI、`Application` 或
-`Project`，也不会创建正式工作乐谱或版本。
+`composition.rs` 提供声明式段落契约、按声部 Alda 片段组装、临时时间探针和真实边界核对。
+`composition_ab` 在此底座上运行 Composer、theme/development 两个 Worker 和只读 Reviewer；原独立 A/B
+二进制已经移除。该模式只生成完整曲目，需要项目目标时长，成功结果通过与 single-agent 相同的 Alda、
+配器、时长和音频门禁，随后保存为唯一工作候选；它不能直接接受候选或创建版本。
 
-实验已改为 Composer 声明相对比例、Harness 确定性编译只读预算、两个段落家族 Worker 提交受限原生 Alda、
-只读 Reviewer 审查最终结果。一次真实配对运行已让 baseline 与 roles 都生成 Alda、MIDI 和完整非静音 WAV，
-证明该路径可端到端执行；这不证明音乐质量或稳定收益，因此正式候选流程仍不调用该模块。Harness 不会扩展成
-Alda 之上的片段语言：Alda 继续负责变量、序列、反复、声部和时间线执行，宿主只保留预算量化、固定模板、
-安全边界和真实解析验收。机制、实验结果与后续设计分别见
+Composer 只声明音乐计划和相对比例，宿主确定性编译只读预算，Worker 提交受限原生 Alda，Reviewer 只能
+批准或提出有段落证据的阻断问题。Alda 继续负责变量、序列、反复、声部和时间线执行，宿主只保留预算量化、
+固定模板、安全边界和真实解析验收。机制与历史实验结果分别见
 [段落组装与时间线机制验证](../iter/section-assembly-mechanism/README.md)和
 [Composer–Worker–Reviewer 真实 A/B](../iter/composer-worker-reviewer-ab/README.md)中的设计索引。
 
-Agent 只有交互式 `respond_with_reporter` 和一次性 `create` 两个真实生成入口，两者共享同一个内部
+single-agent 有交互式 `respond_with_reporter` 和一次性 `create` 两个生成入口，两者共享同一个内部
 `run_generation` 循环。`Application::execute` 驱动交互入口；`application::prepare_compose` 与
 `application::compose_once` 负责一次性 compose 所需的 Project、模型配置、Skill、指示和 Alda 编排，
 `main.rs` 只处理 CLI 输入输出、文件读取写入与退出语义。
+
+`Application` 按持久化的 `AgentMode` 路由自然语言请求。`single` 沿用上述生成循环；`composition-ab` 把
+本轮要求和已有工作/当前乐谱交给角色工作流，生成完整替换候选。两条路径最终都只能更新 Project 的单一
+工作乐谱，并共享 `/alda play work`、`/project accept|discard` 和线性版本语义。
 
 Agent 在每次结果提交前报告开始事件，并报告候选校验、完整检查结果和自动修正。模型传输层不写
 stdout/stderr；它把 SSE 中的 `content` 与 `submit_result.message` 解码为增量 `ModelText` 语义事件。

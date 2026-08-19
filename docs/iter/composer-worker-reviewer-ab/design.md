@@ -1,5 +1,8 @@
 # 原生 Alda 上的最小角色工作流设计
 
+> 后续状态：2026-08-19 已将本文的 roles 路径接入主程序 `composition-ab` 模式；A/B 实验入口已移除，
+> Project 仍是工作候选和版本的唯一事实主体。
+
 ## 设计结论
 
 Alda 已经提供 sequence、variable、repeat、instrument parts、voices、rests 和 Marker，能够定义、复用和按时间
@@ -177,7 +180,8 @@ Placement、对位关系或材料变形验证。需要晚进入的声部由 Work
 - 保留宿主命名、转义防护、双源码探针和 `alda parse`；
 - 放弃早期计划中的通用 Cue/Placement、对位分析器和富音乐 `CompositionSpec` 方向。
 
-正式 `Application`、Project 持久化、工作稿和版本模型保持不变。实验成功前不把角色中间产物持久化。
+接入后 `Application` 负责按项目 Agent 模式路由，Project 的工作稿和版本模型保持不变。角色中间产物仍不
+持久化，只有通过最终检查和渲染的完整候选写入统一工作乐谱。
 
 ## A/B 与接入门槛
 

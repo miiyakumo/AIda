@@ -1,7 +1,7 @@
 # Composer–Worker–Reviewer 真实 A/B
 
-> 状态：薄 Harness 已实现并完成一次成功配对运行；两份完整 WAV 已可人工盲听，尚未得出音乐质量胜负，
-> 也尚未达到接入正式流程的门槛。
+> 状态：A/B 历史实验已完成；2026-08-19 按产品决策将 roles 路径接入主程序为可选
+> `composition-ab` 模式，single-agent 仍为默认。
 
 ## 文档索引
 
@@ -24,8 +24,21 @@ description：首轮与后续同题实验使用的五分钟东方风格叙事作
   `development` 两个 Worker 各自实现所属段落的全部声部；Harness 用固定模板组装普通 Alda；只读
   Reviewer 最后审查。
 
-实验入口是独立的 `composition-ab` 二进制，不修改正式 CLI、`Application`、`Project`、工作乐谱或版本事实。
+该段描述 2026-08-18 的实验边界：当时入口是独立二进制，不修改正式 CLI、`Application`、`Project`、工作
+乐谱或版本事实。
 Alda 仍是唯一的音乐片段和时间线语言；Harness 不续写、补拍、改和声、改配器或建设第二套音乐 IR。
+
+## 主程序接入
+
+2026-08-19 起，独立 A/B 二进制被移除，角色臂作为项目级模式进入主程序：
+
+- `/agent` 查看当前模式，`/agent composition-ab` 启用角色模式，`/agent single` 切回默认单 Agent；
+- 模式保存在 `project.json`，旧项目缺少字段时按 `single` 加载；
+- 角色模式只处理完整曲目，要求项目配置目标时长，并将现有工作/当前乐谱作为后续修改上下文；
+- 成功结果通过项目 Alda、乐器、时长和 WAV 门禁，保存为唯一完整工作候选；
+- Composer、Worker 和 Reviewer 仍不能写 Project 或接受版本，用户继续通过试听和 `/project accept` 决定。
+
+以下 A/B 命令、指标与产物路径保留为历史运行证据，不再代表当前 CLI 入口。
 
 ## 当前实现
 
@@ -122,5 +135,5 @@ Reviewer 批准了 roles 产物，同时保留两个非阻断观察：第二段�
 - `alda-agent/target/composition-ab-20260818-v7/baseline/score.wav`
 - `alda-agent/target/composition-ab-20260818-v7/roles/score.wav`
 
-下一步由用户完整试听并记录偏好；在讨论接入正式流程前，还必须用不同曲式或拍号的另一项长篇任务验证没有
-针对首题过拟合。若完整试听与后续运行没有可测收益，应撤回角色入口，只保留独立有价值的 Alda 校验改进。
+角色路径现已作为显式可选模式接入，但一次 A/B 仍不证明听感或稳定成本优势。后续仍应完整试听，并用不同
+曲式或拍号的长篇任务复验；若没有可测收益，可直接切回默认 `single`，不影响已有项目候选和版本语义。

@@ -4,6 +4,8 @@ pub mod application;
 pub mod audio;
 pub mod command;
 pub mod composition;
+#[path = "bin/composition-ab/main.rs"]
+pub mod composition_ab;
 pub mod config;
 pub mod control;
 pub mod conversation;
